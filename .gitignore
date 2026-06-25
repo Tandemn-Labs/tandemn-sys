@@ -1,31 +1,23 @@
 # Python
 __pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# uv / venv
 .venv/
+uv.lock
 
-temp/
-files/
+# Tooling caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Env / secrets
 .env
+*.env
 
-# input/output data
-*jsonl
-!examples/workloads/demo_batch.jsonl
-*.log
-solver.log
-outputs/*
-!outputs/.gitkeep
-
-# Audit/planning docs (local only)
-AUDIT.md
-RCA_replica_completion.md
-docs/throughput-measurement.md
-
-# Editor
-*.code-workspace
-.claude/
-.codex
-.vscode/
-.cursor/
-
-# Builds
-dist/*
-.tar.gz
+# OS
+.DS_Store
