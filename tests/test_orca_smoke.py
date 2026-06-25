@@ -1,0 +1,190 @@
+"""Smoke test for the Orca apply-plan loop (place + swap).
+
+No Postgres: fake JobStore/PlanStore record the calls the loop makes, so
+we can assert each action type drives the right transition, chain
+launches, teardown, and that plans get marked applied once.
+"""
+
+from __future__ import annotations
+
+from tandemn_system_data.models.chain import Chain
+from tandemn_system_data.models.enums import (
+    ActionType,
+    ChainRole,
+    ChainStatus,
+    JobKind,
+    JobStatus,
+)
+from tandemn_system_data.models.job import ChainAllocation, Job, RunningJob
+from tandemn_system_data.models.plan import Plan, PlanAction
+
+import tandemn_orca.orca as orca_mod
+from tandemn_orca.orca import Orca, ladder_to_chains
+
+PD_LADDER = [
+    {"prefill": {"gpu": "H100", "count": 8, "chains": 2}},
+    {"decode": {"gpu": "A100", "count": 8, "chains": 1}},
+]
+
+
+class FakeJobStore:
+    def __init__(self, running: list[RunningJob] | None = None) -> None:
+        self.transitions: list[tuple[str, JobStatus, list[JobStatus]]] = []
+        self.launched: list[Chain] = []
+        self.chain_status: list[tuple[str, ChainStatus, list[ChainStatus]]] = []
+        self._running = running or []
+
+    def transition(self, job_id, to, expected, *, finish_reason=None):
+        self.transitions.append((job_id, to, list(expected)))
+        return True
+
+    def launch_chains(self, chains):
+        self.launched.extend(chains)
+        return chains
+
+    def running_jobs(self, user_id):
+        return list(self._running)
+
+    def set_chain_status(self, chain_id, to, expected):
+        self.chain_status.append((chain_id, to, list(expected)))
+        return True
+
+
+class FakePlanStore:
+    def __init__(self, plans: list[Plan]) -> None:
+        self._plans = plans
+        self.applied: list[str] = []
+
+    def unapplied(self, user_id):
+        return list(self._plans)
+
+    def mark_applied(self, plan_id):
+        self.applied.append(plan_id)
+        return True
+
+
+class FakeLauncher:
+    def __init__(self) -> None:
+        self.launched: list[Chain] = []
+        self.torn_down: list[str] = []
+
+    def launch(self, chains):
+        self.launched.extend(chains)
+
+    def teardown(self, chain_ids):
+        self.torn_down.extend(chain_ids)
+
+
+def _build_orca(monkeypatch, plans, running=None):
+    monkeypatch.setattr(orca_mod, "JobStore", lambda client: FakeJobStore(running))
+    monkeypatch.setattr(orca_mod, "PlanStore", lambda client: FakePlanStore(plans))
+    return Orca(client=object(), launcher=FakeLauncher())
+
+
+# ----- ladder_to_chains ------------------------------------------------------
+
+
+def test_ladder_to_chains_expands_replicas():
+    chains = ladder_to_chains(PD_LADDER, job_id="job_B", plan_id="plan_1")
+    assert len(chains) == 3  # 2 prefill + 1 decode
+    roles = [c.role for c in chains]
+    assert roles == [ChainRole.PREFILL, ChainRole.PREFILL, ChainRole.DECODE]
+    # `chains` is consumed, not persisted on the shape; `count` survives.
+    assert chains[0].shape_json == {"gpu": "H100", "count": 8}
+    assert all(c.job_id == "job_B" and c.plan_id == "plan_1" for c in chains)
+
+
+def test_ladder_to_chains_skips_malformed():
+    ladder = [
+        {"prefill": {"gpu": "H100", "count": 8}},  # ok
+        {"prefill": {"gpu": "H100"}},  # no count -> skip
+        {"prefill": {"count": 0}},  # non-positive -> skip
+        {"bogus": {"count": 4}},  # bad role -> skip
+        "not-a-dict",  # skip
+    ]
+    chains = ladder_to_chains(ladder, job_id="j", plan_id="p")
+    assert len(chains) == 1
+    assert chains[0].role == ChainRole.PREFILL
+
+
+def test_ladder_to_chains_none():
+    assert ladder_to_chains(None, job_id="j", plan_id="p") == []
+
+
+# ----- apply loop ------------------------------------------------------------
+
+
+def test_place_transitions_and_launches(monkeypatch):
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_B", type=ActionType.PLACE, ladder=PD_LADDER)],
+    )
+    orca = _build_orca(monkeypatch, [plan])
+
+    assert orca.apply_pending("user_1") == 1
+    assert orca._plans.applied == [plan.plan_id]
+    assert orca._jobs.transitions == [
+        ("job_B", JobStatus.RUNNING, [JobStatus.WAITING, JobStatus.PAUSED]),
+    ]
+    # rows recorded in the store AND workers brought up via the launcher
+    assert len(orca._jobs.launched) == 3
+    assert len(orca._launcher.launched) == 3
+
+
+def test_swap_launches_new_and_tears_down_old(monkeypatch):
+    job = Job(job_id="job_F", user_id="user_1", kind=JobKind.ONLINE, status=JobStatus.RUNNING)
+    old_chain = ChainAllocation(
+        chain_id="chain_old",
+        plan_id="plan_prev",
+        role=ChainRole.PREFILL,
+        status=ChainStatus.RUNNING,
+        shape_json={"gpu": "H100", "count": 8},
+    )
+    running = [RunningJob(job=job, chains=[old_chain])]
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_F", type=ActionType.SWAP, ladder=PD_LADDER)],
+    )
+    orca = _build_orca(monkeypatch, [plan], running=running)
+
+    assert orca.apply_pending("user_1") == 1
+    # swap does not transition the job (stays running)
+    assert orca._jobs.transitions == []
+    # new ladder launched (rows + workers)
+    assert len(orca._jobs.launched) == 3
+    assert len(orca._launcher.launched) == 3
+    # old chain torn down (workers stopped + row marked stopped)
+    assert orca._launcher.torn_down == ["chain_old"]
+    assert orca._jobs.chain_status == [
+        ("chain_old", ChainStatus.STOPPED, [ChainStatus.LAUNCHING, ChainStatus.RUNNING]),
+    ]
+
+
+def test_keep_defer_preempt_are_noops_for_now(monkeypatch):
+    plan = Plan(
+        user_id="user_1",
+        actions=[
+            PlanAction(job_id="job_C", type=ActionType.KEEP),
+            PlanAction(job_id="job_D", type=ActionType.DEFER),
+            PlanAction(job_id="job_E", type=ActionType.PREEMPT),
+        ],
+    )
+    orca = _build_orca(monkeypatch, [plan])
+
+    assert orca.apply_pending("user_1") == 1
+    assert orca._jobs.transitions == []
+    assert orca._jobs.launched == []
+    assert orca._jobs.chain_status == []
+
+
+def test_apply_pending_no_plans(monkeypatch):
+    orca = _build_orca(monkeypatch, [])
+    assert orca.apply_pending("user_1") == 0
+    assert orca._jobs.transitions == []
+
+
+def test_default_launcher_is_noop(monkeypatch):
+    monkeypatch.setattr(orca_mod, "JobStore", lambda client: FakeJobStore())
+    monkeypatch.setattr(orca_mod, "PlanStore", lambda client: FakePlanStore([]))
+    orca = Orca(client=object())
+    assert isinstance(orca._launcher, orca_mod.NoopLauncher)
