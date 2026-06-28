@@ -21,9 +21,21 @@ from tandemn_system_data.models.plan import Plan, PlanAction
 import tandemn_orca.orca as orca_mod
 from tandemn_orca.orca import Orca, ladder_to_chains
 
-PD_LADDER = [
-    {"prefill": {"gpu": "H100", "count": 8, "chains": 2}},
-    {"decode": {"gpu": "A100", "count": 8, "chains": 1}},
+EXPLICIT_LADDER = [
+    {
+        "role": "aggregate",
+        "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
+        "config": {
+            "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+            "engine_name": "vllm",
+            "instance_type": "g6e.12xlarge",
+            "gpu_type": "L40S",
+            "gpu_count": 1,
+            "tp": 1,
+        },
+        "n_replicas": 3,
+        "mechanism_id": "queueing_under_burst",
+    }
 ]
 
 
@@ -85,26 +97,43 @@ def _build_orca(monkeypatch, plans, running=None):
 
 
 def test_ladder_to_chains_expands_replicas():
-    chains = ladder_to_chains(PD_LADDER, job_id="job_B", plan_id="plan_1")
-    assert len(chains) == 3  # 2 prefill + 1 decode
+    chains = ladder_to_chains(EXPLICIT_LADDER, job_id="job_B", plan_id="plan_1")
+    assert len(chains) == 3
     roles = [c.role for c in chains]
-    assert roles == [ChainRole.PREFILL, ChainRole.PREFILL, ChainRole.DECODE]
-    # `chains` is consumed, not persisted on the shape; `count` survives.
-    assert chains[0].shape_json == {"gpu": "H100", "count": 8}
+    assert roles == [ChainRole.AGGREGATE, ChainRole.AGGREGATE, ChainRole.AGGREGATE]
     assert all(c.job_id == "job_B" and c.plan_id == "plan_1" for c in chains)
+
+
+def test_ladder_to_chains_accepts_explicit_koi_rank():
+    chains = ladder_to_chains(EXPLICIT_LADDER, job_id="job_online_001", plan_id="plan_1")
+
+    assert len(chains) == 3
+    assert all(c.role == ChainRole.AGGREGATE for c in chains)
+    assert chains[0].shape_json == {
+        "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+        "engine_name": "vllm",
+        "instance_type": "g6e.12xlarge",
+        "gpu_type": "L40S",
+        "gpu_count": 1,
+        "tp": 1,
+        "count": 1,
+        "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
+        "mechanism_id": "queueing_under_burst",
+    }
 
 
 def test_ladder_to_chains_skips_malformed():
     ladder = [
-        {"prefill": {"gpu": "H100", "count": 8}},  # ok
-        {"prefill": {"gpu": "H100"}},  # no count -> skip
-        {"prefill": {"count": 0}},  # non-positive -> skip
-        {"bogus": {"count": 4}},  # bad role -> skip
+        {"role": "aggregate", "config": {"gpu_count": 1}},  # ok
+        {"role": "aggregate", "config": {}},  # no gpu_count -> skip
+        {"role": "aggregate", "config": {"gpu_count": 0}},  # non-positive -> skip
+        {"role": "bogus", "config": {"gpu_count": 1}},  # bad role -> skip
+        {"role": "aggregate", "config": {"gpu_count": 1}, "n_replicas": 0},  # bad replicas
         "not-a-dict",  # skip
     ]
     chains = ladder_to_chains(ladder, job_id="j", plan_id="p")
     assert len(chains) == 1
-    assert chains[0].role == ChainRole.PREFILL
+    assert chains[0].role == ChainRole.AGGREGATE
 
 
 def test_ladder_to_chains_none():
@@ -117,7 +146,7 @@ def test_ladder_to_chains_none():
 def test_place_transitions_and_launches(monkeypatch):
     plan = Plan(
         user_id="user_1",
-        actions=[PlanAction(job_id="job_B", type=ActionType.PLACE, ladder=PD_LADDER)],
+        actions=[PlanAction(job_id="job_B", type=ActionType.PLACE, ladder=EXPLICIT_LADDER)],
     )
     orca = _build_orca(monkeypatch, [plan])
 
@@ -143,7 +172,7 @@ def test_swap_launches_new_and_tears_down_old(monkeypatch):
     running = [RunningJob(job=job, chains=[old_chain])]
     plan = Plan(
         user_id="user_1",
-        actions=[PlanAction(job_id="job_F", type=ActionType.SWAP, ladder=PD_LADDER)],
+        actions=[PlanAction(job_id="job_F", type=ActionType.SWAP, ladder=EXPLICIT_LADDER)],
     )
     orca = _build_orca(monkeypatch, [plan], running=running)
 
