@@ -11,11 +11,9 @@ Action semantics (DATA_ARCHITECTURE.md §6):
     swap     running                     relaunch on a new ladder
 
 Ladder shape (opaque JSONB; Koi <-> Orca contract):
-    [{"prefill": {"gpu": "H100", "count": 8, "chains": 2}},
-     {"decode":  {"gpu": "A100", "count": 8, "chains": 1}}]
-Each entry is {role: shape}. ``count`` is the GPU count per chain
-(required, positive int). ``chains`` is how many chains of that role to
-launch (default 1) and is not part of the persisted shape.
+    [{"role": "aggregate", "env": [...], "config": {...}, "n_replicas": 3}]
+``count`` / ``gpu_count`` is the GPU count per chain (required, positive int).
+``chains`` / ``n_replicas`` is how many chain rows to record for max capacity.
 """
 
 from __future__ import annotations
@@ -43,30 +41,36 @@ def ladder_to_chains(
 ) -> list[Chain]:
     """Translate a ladder into Chain rows, skipping malformed entries.
 
-    Each entry maps one role to a shape dict. ``chains`` (how many of that
-    role) is consumed here; the rest of the shape is stored on each chain.
-    A missing/invalid role or a non-positive int ``count`` skips the entry.
+    A missing/invalid role, config, replica count, or GPU count skips the entry.
     """
     chains: list[Chain] = []
     for entry in ladder or []:
         if not isinstance(entry, dict):
             logger.warning("skipping non-dict ladder entry: %r", entry)
             continue
-        for role_name, shape in entry.items():
-            role = _parse_role(role_name)
-            if role is None or not isinstance(shape, dict):
-                logger.warning("skipping ladder entry with bad role/shape: %r", entry)
-                continue
-            count = shape.get("count")
-            if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
-                logger.warning("skipping ladder entry without positive int count: %r", shape)
-                continue
-            replicas = shape.get("chains", 1)
-            shape_json = {k: v for k, v in shape.items() if k != "chains"}
-            for _ in range(replicas):
-                chains.append(
-                    Chain(job_id=job_id, plan_id=plan_id, role=role, shape_json=dict(shape_json))
-                )
+
+        role = _parse_role(entry.get("role"))
+        config = entry.get("config")
+        if role is None or not isinstance(config, dict):
+            logger.warning("skipping malformed ladder entry: %r", entry)
+            continue
+        count = config.get("gpu_count", config.get("count"))
+        replicas = entry.get("n_replicas", entry.get("chains", 1))
+        if type(count) is not int or count <= 0:
+            logger.warning("skipping ladder entry without positive int gpu_count: %r", entry)
+            continue
+        if type(replicas) is not int or replicas <= 0:
+            logger.warning("skipping ladder entry without positive int n_replicas: %r", entry)
+            continue
+        shape_json = dict(config)
+        shape_json["count"] = count
+        if entry.get("env") is not None:
+            env = entry["env"]
+            shape_json["env"] = list(env) if isinstance(env, (list, tuple)) else env
+        if entry.get("mechanism_id") is not None:
+            shape_json["mechanism_id"] = entry["mechanism_id"]
+        for _ in range(replicas):
+            chains.append(Chain(job_id=job_id, plan_id=plan_id, role=role, shape_json=dict(shape_json)))
     return chains
 
 
