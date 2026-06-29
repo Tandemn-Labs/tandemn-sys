@@ -119,7 +119,7 @@ class Orca:
                 self._place(plan, action)
             case ActionType.SWAP:
                 self._swap(plan, action)
-            case ActionType.PREEMPT | ActionType.KEEP | ActionType.DEFER:
+            case ActionType.KEEP | ActionType.DEFER | ActionType.PREEMPT:
                 pass
 
     # ----- per-action handlers --------------------------------------------
@@ -141,11 +141,12 @@ class Orca:
     def _swap(self, plan: Plan, action: PlanAction) -> None:
         """running: relaunch on a new ladder.
 
-        Cold-start (launch the new ladder) and teardown (stop the old
-        chains) are independent — the new launch does not wait on teardown.
+        Dynamo reconciliation deletes stale DGDs by diff. Orca only marks the
+        old Chain rows stopped after writing the new desired rows.
         """
+        old_chain_ids = self._active_chain_ids(plan.user_id, action.job_id)
         self._launch_ladder(plan, action)
-        self._teardown_chains(plan.user_id, action.job_id)
+        self._stop_chains(old_chain_ids)
         logger.info("swapped job %s (plan %s)", action.job_id, plan.plan_id)
 
     # ----- launcher seam ---------------------------------------------------
@@ -164,20 +165,26 @@ class Orca:
         # Record canonical rows (status=LAUNCHING) first, then bring up the
         # real workers behind the launcher seam.
         recorded = self._jobs.launch_chains(chains)
-        self._launcher.launch(recorded)
+        self._launcher.reconcile(action.job_id, recorded)
         return recorded
 
     def _teardown_chains(self, user_id: str, job_id: str) -> None:
+        chain_ids = self._active_chain_ids(user_id, job_id)
+        self._launcher.teardown_job(job_id)
+        self._stop_chains(chain_ids)
+
+    def _active_chain_ids(self, user_id: str, job_id: str) -> list[str]:
         for running in self._jobs.running_jobs(user_id):
             if running.job.job_id != job_id:
                 continue
-            chain_ids = [c.chain_id for c in running.chains]
-            self._launcher.teardown(chain_ids)
-            for chain_id in chain_ids:
-                self._jobs.set_chain_status(
-                    chain_id, ChainStatus.STOPPED, list(ACTIVE_CHAIN_STATUSES)
-                )
-            return
+            return [c.chain_id for c in running.chains]
+        return []
+
+    def _stop_chains(self, chain_ids: list[str]) -> None:
+        for chain_id in chain_ids:
+            self._jobs.set_chain_status(
+                chain_id, ChainStatus.STOPPED, list(ACTIVE_CHAIN_STATUSES)
+            )
 
 
 def main() -> None:
