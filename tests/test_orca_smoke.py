@@ -105,7 +105,13 @@ def test_ladder_to_chains_expands_replicas():
 
 
 def test_ladder_to_chains_accepts_explicit_koi_rank():
-    chains = ladder_to_chains(EXPLICIT_LADDER, job_id="job_online_001", plan_id="plan_1")
+    chains = ladder_to_chains(
+        EXPLICIT_LADDER,
+        job_id="job_online_001",
+        plan_id="plan_1",
+        target_p99_ttft_ms=500.0,
+        target_p99_tpot_ms=50.0,
+    )
 
     assert len(chains) == 3
     assert all(c.role == ChainRole.AGGREGATE for c in chains)
@@ -119,6 +125,8 @@ def test_ladder_to_chains_accepts_explicit_koi_rank():
         "count": 1,
         "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
         "mechanism_id": "queueing_under_burst",
+        "target_p99_ttft_ms": 500.0,
+        "target_p99_tpot_ms": 50.0,
     }
 
 
@@ -146,7 +154,15 @@ def test_ladder_to_chains_none():
 def test_place_transitions_and_launches(monkeypatch):
     plan = Plan(
         user_id="user_1",
-        actions=[PlanAction(job_id="job_B", type=ActionType.PLACE, ladder=EXPLICIT_LADDER)],
+        actions=[
+            PlanAction(
+                job_id="job_B",
+                type=ActionType.PLACE,
+                ladder=EXPLICIT_LADDER,
+                target_p99_ttft_ms=500.0,
+                target_p99_tpot_ms=50.0,
+            )
+        ],
     )
     orca = _build_orca(monkeypatch, [plan])
 
@@ -158,6 +174,8 @@ def test_place_transitions_and_launches(monkeypatch):
     # rows recorded in the store AND workers brought up via the launcher
     assert len(orca._jobs.launched) == 3
     assert len(orca._launcher.launched) == 3
+    assert orca._jobs.launched[0].shape_json["target_p99_ttft_ms"] == 500.0
+    assert orca._jobs.launched[0].shape_json["target_p99_tpot_ms"] == 50.0
 
 
 def test_swap_launches_new_and_tears_down_old(monkeypatch):
