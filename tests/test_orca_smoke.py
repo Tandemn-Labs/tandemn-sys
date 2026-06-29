@@ -77,14 +77,14 @@ class FakePlanStore:
 
 class FakeLauncher:
     def __init__(self) -> None:
-        self.launched: list[Chain] = []
-        self.torn_down: list[str] = []
+        self.reconciled: list[tuple[str, list[Chain]]] = []
+        self.torn_down_jobs: list[str] = []
 
-    def launch(self, chains):
-        self.launched.extend(chains)
+    def reconcile(self, job_id, chains):
+        self.reconciled.append((job_id, list(chains)))
 
-    def teardown(self, chain_ids):
-        self.torn_down.extend(chain_ids)
+    def teardown_job(self, job_id):
+        self.torn_down_jobs.append(job_id)
 
 
 def _build_orca(monkeypatch, plans, running=None):
@@ -173,7 +173,9 @@ def test_place_transitions_and_launches(monkeypatch):
     ]
     # rows recorded in the store AND workers brought up via the launcher
     assert len(orca._jobs.launched) == 3
-    assert len(orca._launcher.launched) == 3
+    assert len(orca._launcher.reconciled) == 1
+    assert orca._launcher.reconciled[0][0] == "job_B"
+    assert len(orca._launcher.reconciled[0][1]) == 3
     assert orca._jobs.launched[0].shape_json["target_p99_ttft_ms"] == 500.0
     assert orca._jobs.launched[0].shape_json["target_p99_tpot_ms"] == 50.0
 
@@ -199,9 +201,9 @@ def test_swap_launches_new_and_tears_down_old(monkeypatch):
     assert orca._jobs.transitions == []
     # new ladder launched (rows + workers)
     assert len(orca._jobs.launched) == 3
-    assert len(orca._launcher.launched) == 3
-    # old chain torn down (workers stopped + row marked stopped)
-    assert orca._launcher.torn_down == ["chain_old"]
+    assert len(orca._launcher.reconciled[0][1]) == 3
+    # stale DGDs are deleted by reconcile diff; swap only marks old rows stopped.
+    assert orca._launcher.torn_down_jobs == []
     assert orca._jobs.chain_status == [
         ("chain_old", ChainStatus.STOPPED, [ChainStatus.LAUNCHING, ChainStatus.RUNNING]),
     ]
@@ -222,6 +224,7 @@ def test_keep_defer_preempt_are_noops_for_now(monkeypatch):
     assert orca._jobs.transitions == []
     assert orca._jobs.launched == []
     assert orca._jobs.chain_status == []
+    assert orca._launcher.torn_down_jobs == []
 
 
 def test_apply_pending_no_plans(monkeypatch):
