@@ -38,6 +38,8 @@ def ladder_to_chains(
     *,
     job_id: str,
     plan_id: str,
+    target_p99_ttft_ms: float | None = None,
+    target_p99_tpot_ms: float | None = None,
 ) -> list[Chain]:
     """Translate a ladder into Chain rows, skipping malformed entries.
 
@@ -69,6 +71,10 @@ def ladder_to_chains(
             shape_json["env"] = list(env) if isinstance(env, (list, tuple)) else env
         if entry.get("mechanism_id") is not None:
             shape_json["mechanism_id"] = entry["mechanism_id"]
+        if target_p99_ttft_ms is not None:
+            shape_json["target_p99_ttft_ms"] = target_p99_ttft_ms
+        if target_p99_tpot_ms is not None:
+            shape_json["target_p99_tpot_ms"] = target_p99_tpot_ms
         for _ in range(replicas):
             chains.append(Chain(job_id=job_id, plan_id=plan_id, role=role, shape_json=dict(shape_json)))
     return chains
@@ -145,7 +151,13 @@ class Orca:
     # ----- launcher seam ---------------------------------------------------
 
     def _launch_ladder(self, plan: Plan, action: PlanAction) -> list[Chain]:
-        chains = ladder_to_chains(action.ladder, job_id=action.job_id, plan_id=plan.plan_id)
+        chains = ladder_to_chains(
+            action.ladder,
+            job_id=action.job_id,
+            plan_id=plan.plan_id,
+            target_p99_ttft_ms=action.target_p99_ttft_ms,
+            target_p99_tpot_ms=action.target_p99_tpot_ms,
+        )
         if not chains:
             logger.warning("no launchable chains for job %s (plan %s)", action.job_id, plan.plan_id)
             return []
