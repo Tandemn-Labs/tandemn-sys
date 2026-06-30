@@ -17,6 +17,7 @@ PRICING_REGION = "us-east-1"
 _AWS_CONFIG = Config(connect_timeout=5, read_timeout=20, retries={"max_attempts": 2})
 NA = "NA"
 
+#TODO - Remove these hardcoded fields
 GPU_SPEC_FIELDS = (
     "canonical_gpu_name",
     "gpu_bandwidth_gbps",
@@ -29,6 +30,7 @@ GPU_SPEC_FIELDS = (
 )
 UNKNOWN_GPU_SPEC = dict.fromkeys(GPU_SPEC_FIELDS, NA)
 
+# TODO - Remove these hardcoded fields and replce with some stable API
 # ponytail: AWS has no public GPU perf API; keep this tiny source-checked overlay.
 GPU_SPECS_BY_KEY: dict[str, JsonDict] = {
     "T4": {
