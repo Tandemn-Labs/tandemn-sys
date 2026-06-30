@@ -119,6 +119,14 @@ def test_build_catalog_uses_boto3_clients(monkeypatch):
     assert catalog["region"] == "us-east-2"
     assert instance["instance_type"] == "g6e.12xlarge"
     assert instance["accelerators"][0]["name"] == "L40S"
+    assert instance["accelerators"][0]["canonical_gpu_name"] == "L40S"
+    assert instance["accelerators"][0]["gpu_tflops_fp16"] == 362.05
     assert instance["pricing"]["capacity_reservation_usd_per_hour"] == 3.21
     assert instance["offerings"][0]["zone_id"] == "use2-az1"
     assert instance["offerings"][0]["spot_usd_per_hour"] == 1.23
+
+
+def test_gpu_specs_split_a100_memory_and_use_na_for_unknown():
+    assert mod.gpu_spec("A100", 40960)["canonical_gpu_name"] == "A100-40GB"
+    assert mod.gpu_spec("A100", 81920)["canonical_gpu_name"] == "A100-80GB"
+    assert mod.gpu_spec("Mystery GPU", None)["gpu_bandwidth_gbps"] == "NA"

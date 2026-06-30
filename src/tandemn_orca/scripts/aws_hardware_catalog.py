@@ -15,6 +15,161 @@ JsonDict = dict[str, Any]
 DEFAULT_US_REGIONS = ("us-east-1", "us-east-2", "us-west-1", "us-west-2")
 PRICING_REGION = "us-east-1"
 _AWS_CONFIG = Config(connect_timeout=5, read_timeout=20, retries={"max_attempts": 2})
+NA = "NA"
+
+GPU_SPEC_FIELDS = (
+    "canonical_gpu_name",
+    "gpu_bandwidth_gbps",
+    "gpu_tflops_fp16",
+    "cuda_compute_capability",
+    "gpu_generation",
+    "nvlink_bandwidth_gbps",
+    "pcie_bandwidth_gbps",
+    "gpu_watts",
+)
+UNKNOWN_GPU_SPEC = dict.fromkeys(GPU_SPEC_FIELDS, NA)
+
+# ponytail: AWS has no public GPU perf API; keep this tiny source-checked overlay.
+GPU_SPECS_BY_KEY: dict[str, JsonDict] = {
+    "T4": {
+        "canonical_gpu_name": "T4",
+        "gpu_generation": "Turing",
+        "cuda_compute_capability": "7.5",
+        "gpu_bandwidth_gbps": 320,
+        "gpu_tflops_fp16": 65,
+        "nvlink_bandwidth_gbps": 0,
+        "pcie_bandwidth_gbps": 32,
+        "gpu_watts": 70,
+    },
+    "A10G": {
+        "canonical_gpu_name": "A10G",
+        "gpu_generation": "Ampere",
+        "cuda_compute_capability": "8.6",
+        "gpu_bandwidth_gbps": 600,
+        "gpu_tflops_fp16": 125,
+        "nvlink_bandwidth_gbps": 0,
+        "pcie_bandwidth_gbps": 64,
+        "gpu_watts": 150,
+    },
+    "L4": {
+        "canonical_gpu_name": "L4",
+        "gpu_generation": "Ada Lovelace",
+        "cuda_compute_capability": "8.9",
+        "gpu_bandwidth_gbps": 300,
+        "gpu_tflops_fp16": 121,
+        "nvlink_bandwidth_gbps": 0,
+        "pcie_bandwidth_gbps": 64,
+        "gpu_watts": 72,
+    },
+    "L40S": {
+        "canonical_gpu_name": "L40S",
+        "gpu_generation": "Ada Lovelace",
+        "cuda_compute_capability": "8.9",
+        "gpu_bandwidth_gbps": 864,
+        "gpu_tflops_fp16": 362.05,
+        "nvlink_bandwidth_gbps": 0,
+        "pcie_bandwidth_gbps": 64,
+        "gpu_watts": 350,
+    },
+    "A100-40GB": {
+        "canonical_gpu_name": "A100-40GB",
+        "gpu_generation": "Ampere",
+        "cuda_compute_capability": "8.0",
+        "gpu_bandwidth_gbps": 1555,
+        "gpu_tflops_fp16": 312,
+        "nvlink_bandwidth_gbps": 600,
+        "pcie_bandwidth_gbps": 64,
+        "gpu_watts": 400,
+    },
+    "A100-80GB": {
+        "canonical_gpu_name": "A100-80GB",
+        "gpu_generation": "Ampere",
+        "cuda_compute_capability": "8.0",
+        "gpu_bandwidth_gbps": 2039,
+        "gpu_tflops_fp16": 312,
+        "nvlink_bandwidth_gbps": 600,
+        "pcie_bandwidth_gbps": 64,
+        "gpu_watts": 400,
+    },
+    "H100": {
+        "canonical_gpu_name": "H100",
+        "gpu_generation": "Hopper",
+        "cuda_compute_capability": "9.0",
+        "gpu_bandwidth_gbps": 3350,
+        "gpu_tflops_fp16": 989.5,
+        "nvlink_bandwidth_gbps": 900,
+        "pcie_bandwidth_gbps": 128,
+        "gpu_watts": 700,
+    },
+    "H200": {
+        "canonical_gpu_name": "H200",
+        "gpu_generation": "Hopper",
+        "cuda_compute_capability": "9.0",
+        "gpu_bandwidth_gbps": 4800,
+        "gpu_tflops_fp16": 989.5,
+        "nvlink_bandwidth_gbps": 900,
+        "pcie_bandwidth_gbps": 128,
+        "gpu_watts": 700,
+    },
+    "B200": {
+        "canonical_gpu_name": "B200",
+        "gpu_generation": "Blackwell",
+        "cuda_compute_capability": "10.0",
+        "gpu_bandwidth_gbps": NA,
+        "gpu_tflops_fp16": 2250,
+        "nvlink_bandwidth_gbps": 1800,
+        "pcie_bandwidth_gbps": NA,
+        "gpu_watts": NA,
+    },
+    "B300": {
+        "canonical_gpu_name": "B300",
+        "gpu_generation": "Blackwell Ultra",
+        "cuda_compute_capability": "10.3",
+        "gpu_bandwidth_gbps": NA,
+        "gpu_tflops_fp16": 2250,
+        "nvlink_bandwidth_gbps": 1800,
+        "pcie_bandwidth_gbps": NA,
+        "gpu_watts": NA,
+    },
+    "RTX-PRO-4500-BSE": {
+        "canonical_gpu_name": "RTX-PRO-4500-BSE",
+        "gpu_generation": "Blackwell",
+        "cuda_compute_capability": "12.0",
+        "gpu_bandwidth_gbps": 800,
+        "gpu_tflops_fp16": 406,
+        "nvlink_bandwidth_gbps": 0,
+        "pcie_bandwidth_gbps": 128,
+        "gpu_watts": 165,
+    },
+    "RTX-PRO-6000-BSE": {
+        "canonical_gpu_name": "RTX-PRO-6000-BSE",
+        "gpu_generation": "Blackwell",
+        "cuda_compute_capability": "12.0",
+        "gpu_bandwidth_gbps": 1597,
+        "gpu_tflops_fp16": 1000,
+        "nvlink_bandwidth_gbps": 0,
+        "pcie_bandwidth_gbps": 128,
+        "gpu_watts": 600,
+    },
+    "V100": {
+        **UNKNOWN_GPU_SPEC,
+        "canonical_gpu_name": "V100",
+        "gpu_generation": "Volta",
+        "cuda_compute_capability": "7.0",
+    },
+    "M60": {
+        **UNKNOWN_GPU_SPEC,
+        "canonical_gpu_name": "M60",
+        "gpu_generation": "Maxwell",
+        "cuda_compute_capability": "5.2",
+    },
+    "K80": {
+        **UNKNOWN_GPU_SPEC,
+        "canonical_gpu_name": "K80",
+        "gpu_generation": "Kepler",
+        "cuda_compute_capability": "3.7",
+    },
+}
 
 
 def warn_skipped_aws_call(action: str, error: Exception) -> None:
@@ -167,6 +322,45 @@ def accelerator_resource_name(kind: str, vendor: str | None) -> str | None:
     return None
 
 
+def gpu_spec_key(name: object, memory_mib_each: int | None) -> str | None:
+    compact = "".join(ch for ch in str(name or "").lower() if ch.isalnum())
+    if "a100" in compact:
+        if memory_mib_each is not None and memory_mib_each >= 70 * 1024:
+            return "A100-80GB"
+        return "A100-40GB"
+
+    for fragment, key in (
+        ("rtxpro4500", "RTX-PRO-4500-BSE"),
+        ("rtxproserver6000", "RTX-PRO-6000-BSE"),
+        ("rtxpro6000", "RTX-PRO-6000-BSE"),
+        ("gb300", "B300"),
+        ("b300", "B300"),
+        ("gb200", "B200"),
+        ("b200", "B200"),
+        ("h200", "H200"),
+        ("h100", "H100"),
+        ("l40s", "L40S"),
+        ("a10g", "A10G"),
+        ("t4g", "T4"),
+        ("t4", "T4"),
+        ("l4", "L4"),
+        ("v100", "V100"),
+        ("m60", "M60"),
+        ("k80", "K80"),
+    ):
+        if fragment in compact:
+            return key
+
+    return None
+
+
+def gpu_spec(name: object, memory_mib_each: int | None) -> JsonDict:
+    key = gpu_spec_key(name, memory_mib_each)
+    if key is None:
+        return dict(UNKNOWN_GPU_SPEC)
+    return dict(GPU_SPECS_BY_KEY.get(key, UNKNOWN_GPU_SPEC))
+
+
 def normalize_gpu_accelerators(instance_type: JsonDict) -> list[JsonDict]:
     gpu_info = cast(JsonDict, instance_type.get("GpuInfo", {}))
     total_memory = gpu_info.get("TotalGpuMemoryInMiB")
@@ -186,6 +380,7 @@ def normalize_gpu_accelerators(instance_type: JsonDict) -> list[JsonDict]:
                 "memory_mib_each": memory_each,
                 "memory_mib_total": total_memory,
                 "k8s_resource_name": accelerator_resource_name("gpu", vendor),
+                **gpu_spec(gpu.get("Name"), memory_each),
             }
         )
 
