@@ -18,7 +18,10 @@ Ladder shape (opaque JSONB; Koi <-> Orca contract):
 
 from __future__ import annotations
 
+import argparse
 import logging
+import os
+import time
 from typing import Any
 
 from tandemn_system_data.clients import JobStore, PlanStore, PostgresClient
@@ -26,7 +29,7 @@ from tandemn_system_data.models.chain import Chain
 from tandemn_system_data.models.enums import ActionType, ChainRole, ChainStatus, JobStatus
 from tandemn_system_data.models.plan import Plan, PlanAction
 
-from tandemn_orca.launcher import Launcher, NoopLauncher
+from tandemn_orca.launcher import DynamoLauncher, Launcher, NoopLauncher
 
 logger = logging.getLogger(__name__)
 
@@ -187,9 +190,35 @@ class Orca:
             )
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run Orca against Tandemn Store plans.")
+    parser.add_argument("--user-id", default=os.getenv("TANDEMN_USER_ID"))
+    parser.add_argument("--namespace", default=os.getenv("TANDEMN_K8S_NAMESPACE", "default"))
+    parser.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=float(os.getenv("TANDEMN_ORCA_POLL_SECONDS", "5")),
+    )
+    parser.add_argument("--once", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO)
-    raise SystemExit("orca.main: wire a user_id and run loop before using")
+    args = parse_args(argv)
+    if not args.user_id:
+        raise SystemExit("--user-id or TANDEMN_USER_ID is required")
+
+    orca = Orca(PostgresClient(), launcher=DynamoLauncher(namespace=args.namespace))
+    while True:
+        try:
+            applied = orca.apply_pending(args.user_id)
+            logger.info("applied %s plan(s) for user %s", applied, args.user_id)
+        except Exception:
+            logger.exception("orca apply loop failed")
+        if args.once:
+            return
+        time.sleep(args.interval_seconds)
 
 
 if __name__ == "__main__":
