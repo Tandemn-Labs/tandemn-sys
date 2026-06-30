@@ -30,6 +30,7 @@ from tandemn_system_data.models.enums import ActionType, ChainRole, ChainStatus,
 from tandemn_system_data.models.plan import Plan, PlanAction
 
 from tandemn_orca.launcher import DynamoLauncher, Launcher, NoopLauncher
+from tandemn_orca.scripts.resource_map_from_aws import CapacityRefresher, parse_region_csv
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +196,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--user-id", default=os.getenv("TANDEMN_USER_ID"))
     parser.add_argument("--namespace", default=os.getenv("TANDEMN_K8S_NAMESPACE", "default"))
     parser.add_argument(
+        "--aws-regions",
+        default=os.getenv("TANDEMN_AWS_REGIONS", "us-east-1,us-east-2,us-west-1,us-west-2"),
+    )
+    parser.add_argument(
+        "--capacity-refresh-seconds",
+        type=float,
+        default=float(os.getenv("TANDEMN_CAPACITY_REFRESH_SECONDS", "86400")),
+    )
+    parser.add_argument(
         "--interval-seconds",
         type=float,
         default=float(os.getenv("TANDEMN_ORCA_POLL_SECONDS", "5")),
@@ -209,8 +219,24 @@ def main(argv: list[str] | None = None) -> None:
     if not args.user_id:
         raise SystemExit("--user-id or TANDEMN_USER_ID is required")
 
-    orca = Orca(PostgresClient(), launcher=DynamoLauncher(namespace=args.namespace))
+    client = PostgresClient()
+    refresher = CapacityRefresher(
+        client,
+        args.user_id,
+        parse_region_csv(args.aws_regions),
+        refresh_seconds=args.capacity_refresh_seconds,
+    )
+    try:
+        refresher.refresh_if_due(force=True)
+    except Exception:
+        logger.exception("capacity refresh failed")
+
+    orca = Orca(client, launcher=DynamoLauncher(namespace=args.namespace))
     while True:
+        try:
+            refresher.refresh_if_due()
+        except Exception:
+            logger.exception("capacity refresh failed")
         try:
             applied = orca.apply_pending(args.user_id)
             logger.info("applied %s plan(s) for user %s", applied, args.user_id)
