@@ -37,12 +37,30 @@ class FakeLauncher:
         FakeLauncher.instances.append(self)
 
 
+class FakeRefresher:
+    instances: ClassVar[list[FakeRefresher]] = []
+
+    def __init__(self, client, user_id, regions, refresh_seconds) -> None:
+        self.client = client
+        self.user_id = user_id
+        self.regions = regions
+        self.refresh_seconds = refresh_seconds
+        self.calls: list[bool] = []
+        FakeRefresher.instances.append(self)
+
+    def refresh_if_due(self, *, force=False):
+        self.calls.append(force)
+        return True
+
+
 def _patch_runner(monkeypatch, orca_cls=FakeOrca):
     FakeOrca.instances.clear()
     FakeLauncher.instances.clear()
+    FakeRefresher.instances.clear()
     sleeps: list[float] = []
     monkeypatch.setattr(mod, "PostgresClient", lambda: "client")
     monkeypatch.setattr(mod, "DynamoLauncher", FakeLauncher)
+    monkeypatch.setattr(mod, "CapacityRefresher", FakeRefresher)
     monkeypatch.setattr(mod, "Orca", orca_cls)
     monkeypatch.setattr(mod.time, "sleep", lambda seconds: sleeps.append(seconds))
     return sleeps
@@ -57,6 +75,9 @@ def test_main_once_uses_dynamo_launcher(monkeypatch):
     assert FakeOrca.instances[0].client == "client"
     assert FakeOrca.instances[0].launcher is FakeLauncher.instances[0]
     assert FakeOrca.instances[0].applied_users == ["default"]
+    assert FakeRefresher.instances[0].client == "client"
+    assert FakeRefresher.instances[0].regions == ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
+    assert FakeRefresher.instances[0].calls == [True, False]
 
 
 def test_main_uses_env_defaults(monkeypatch):
@@ -64,12 +85,16 @@ def test_main_uses_env_defaults(monkeypatch):
     monkeypatch.setenv("TANDEMN_USER_ID", "env-user")
     monkeypatch.setenv("TANDEMN_K8S_NAMESPACE", "env-ns")
     monkeypatch.setenv("TANDEMN_ORCA_POLL_SECONDS", "7")
+    monkeypatch.setenv("TANDEMN_AWS_REGIONS", "us-west-2,us-east-2")
+    monkeypatch.setenv("TANDEMN_CAPACITY_REFRESH_SECONDS", "12")
 
     args = mod.parse_args([])
 
     assert args.user_id == "env-user"
     assert args.namespace == "env-ns"
     assert args.interval_seconds == 7
+    assert args.aws_regions == "us-west-2,us-east-2"
+    assert args.capacity_refresh_seconds == 12
 
 
 def test_main_requires_user_id(monkeypatch):
