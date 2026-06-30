@@ -348,6 +348,6 @@ def required(shape: dict[str, Any], key: str) -> str:
 
 def required_float(shape: dict[str, Any], key: str) -> float:
     value = shape.get(key)
-    if type(value) not in (int, float) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise ValueError(f"shape missing positive number {key!r}")
     return float(value)
