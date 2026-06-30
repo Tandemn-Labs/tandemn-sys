@@ -17,6 +17,9 @@ dependencies = [
     "boto3>=1.34",
 ]
 
+[project.scripts]
+tandemn-orca = "tandemn_orca.orca:main"
+
 [project.optional-dependencies]
 dev = [
     "pre-commit",
