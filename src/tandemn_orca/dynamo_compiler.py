@@ -262,7 +262,7 @@ def render_pool_dgd(
 def node_selector(shape: dict[str, Any]) -> dict[str, str]:
     capacity_type = capacity_type_for(shape)
     selector = {
-        "tandemn.ai/launch-class": "tdm-gpu-cr" if capacity_type == "reserved" else "tdm-gpu-flex",
+        # "tandemn.ai/launch-class": "tdm-gpu-cr" if capacity_type == "reserved" else "tdm-gpu-flex",
         "node.kubernetes.io/instance-type": required(shape, "instance_type"),
     }
     if capacity_type == "reserved":
