@@ -1,6 +1,10 @@
 """Compile Orca Chain rows into Dynamo Kubernetes objects.
 
 No Kubernetes calls live here; this file only returns dicts ready for server-side apply.
+
+ponytail: GlobalRouter/GlobalPlanner (and the router ConfigMap) are currently unused in
+practice -- Koi owns cross-pool GPU budgeting at plan time, and single-pool jobs need no
+cross-pool routing. Kept for when multi-pool SLA routing / fast-loop rebalancing is needed.
 """
 
 from __future__ import annotations
