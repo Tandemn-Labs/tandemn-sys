@@ -24,6 +24,7 @@ from tandemn_orca.orca import Orca, ladder_to_chains
 EXPLICIT_LADDER = [
     {
         "role": "aggregate",
+        "rank_id": "rank_0",
         "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
         "config": {
             "model_id": "meta-llama/Llama-3.1-8B-Instruct",
@@ -49,6 +50,9 @@ class FakeJobStore:
     def transition(self, job_id, to, expected, *, finish_reason=None):
         self.transitions.append((job_id, to, list(expected)))
         return True
+
+    def get(self, job_id):
+        return None
 
     def launch_chains(self, chains):
         self.launched.extend(chains)
@@ -123,6 +127,7 @@ def test_ladder_to_chains_accepts_explicit_koi_rank():
         "gpu_count": 1,
         "tp": 1,
         "count": 1,
+        "rank_id": "rank_0",
         "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
         "mechanism_id": "queueing_under_burst",
         "target_p99_ttft_ms": 500.0,
@@ -131,17 +136,48 @@ def test_ladder_to_chains_accepts_explicit_koi_rank():
 
 
 def test_ladder_to_chains_skips_malformed():
+    ok_config = {"gpu_count": 1, "instance_type": "g6.xlarge", "model_id": "m"}
     ladder = [
-        {"role": "aggregate", "config": {"gpu_count": 1}},  # ok
+        {"role": "aggregate", "env": ["reserved", "aws", "r", "z", "L4"], "config": ok_config},
         {"role": "aggregate", "config": {}},  # no gpu_count -> skip
         {"role": "aggregate", "config": {"gpu_count": 0}},  # non-positive -> skip
-        {"role": "bogus", "config": {"gpu_count": 1}},  # bad role -> skip
-        {"role": "aggregate", "config": {"gpu_count": 1}, "n_replicas": 0},  # bad replicas
+        {"role": "bogus", "config": dict(ok_config)},  # bad role -> skip
+        {"role": "aggregate", "config": dict(ok_config), "n_replicas": 0},  # bad replicas
         "not-a-dict",  # skip
+        # no instance_type -> unlaunchable -> skip
+        {"role": "aggregate", "config": {"gpu_count": 1, "model_id": "m", "gpu_type": "L4"}},
+        {
+            "role": "aggregate",
+            "rank_id": "rank_7",
+            "env": ["reserved", "aws", "r", "z", "L4"],
+            "config": dict(ok_config),
+        },
     ]
     chains = ladder_to_chains(ladder, job_id="j", plan_id="p")
-    assert len(chains) == 1
+    assert len(chains) == 2
     assert chains[0].role == ChainRole.AGGREGATE
+    # rank_id comes from Koi's ladder entry; entries without one carry none.
+    assert "rank_id" not in chains[0].shape_json
+    assert chains[1].shape_json["rank_id"] == "rank_7"
+
+
+def test_ladder_to_chains_backfills_launch_fields():
+    """gpu_type from env[4], model_id from the job spec, engine_name default."""
+    ladder = [
+        {
+            "role": "aggregate",
+            "env": ["on_demand", "aws", "us-east-1", "use1-az1", "L4"],
+            "config": {"gpu_count": 2, "instance_type": "g6.12xlarge", "tp": 2},
+        }
+    ]
+    chains = ladder_to_chains(
+        ladder, job_id="j", plan_id="p", job_spec={"model_id": "Qwen/Qwen3-0.6B"}
+    )
+    assert len(chains) == 1
+    shape = chains[0].shape_json
+    assert shape["gpu_type"] == "L4"
+    assert shape["model_id"] == "Qwen/Qwen3-0.6B"
+    assert shape["engine_name"] == "vllm"
 
 
 def test_ladder_to_chains_none():
@@ -209,13 +245,12 @@ def test_swap_launches_new_and_tears_down_old(monkeypatch):
     ]
 
 
-def test_keep_defer_preempt_are_noops_for_now(monkeypatch):
+def test_keep_and_defer_are_noops(monkeypatch):
     plan = Plan(
         user_id="user_1",
         actions=[
             PlanAction(job_id="job_C", type=ActionType.KEEP),
             PlanAction(job_id="job_D", type=ActionType.DEFER),
-            PlanAction(job_id="job_E", type=ActionType.PREEMPT),
         ],
     )
     orca = _build_orca(monkeypatch, [plan])
@@ -225,6 +260,53 @@ def test_keep_defer_preempt_are_noops_for_now(monkeypatch):
     assert orca._jobs.launched == []
     assert orca._jobs.chain_status == []
     assert orca._launcher.torn_down_jobs == []
+
+
+def test_preempt_tears_down_and_pauses(monkeypatch):
+    job = Job(job_id="job_E", user_id="user_1", kind=JobKind.ONLINE, status=JobStatus.RUNNING)
+    chain = ChainAllocation(
+        chain_id="chain_live",
+        plan_id="plan_prev",
+        role=ChainRole.AGGREGATE,
+        status=ChainStatus.RUNNING,
+        shape_json={"gpu": "L4", "count": 1},
+    )
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_E", type=ActionType.PREEMPT)],
+    )
+    orca = _build_orca(monkeypatch, [plan], running=[RunningJob(job=job, chains=[chain])])
+
+    assert orca.apply_pending("user_1") == 1
+    assert orca._launcher.torn_down_jobs == ["job_E"]
+    assert orca._jobs.chain_status == [
+        ("chain_live", ChainStatus.STOPPED, [ChainStatus.LAUNCHING, ChainStatus.RUNNING]),
+    ]
+    assert orca._jobs.transitions == [("job_E", JobStatus.PAUSED, [JobStatus.RUNNING])]
+
+
+def test_bad_action_does_not_wedge_the_plan(monkeypatch):
+    """An action that raises is logged and skipped; the plan is still applied."""
+    plan = Plan(
+        user_id="user_1",
+        actions=[
+            PlanAction(job_id="job_bad", type=ActionType.PLACE, ladder=EXPLICIT_LADDER),
+            PlanAction(job_id="job_good", type=ActionType.PLACE, ladder=EXPLICIT_LADDER),
+        ],
+    )
+    orca = _build_orca(monkeypatch, [plan])
+    original = orca._launcher.reconcile
+
+    def explode_for_bad_job(job_id, chains):
+        if job_id == "job_bad":
+            raise RuntimeError("boom")
+        original(job_id, chains)
+
+    orca._launcher.reconcile = explode_for_bad_job
+
+    assert orca.apply_pending("user_1") == 1
+    assert orca._plans.applied == [plan.plan_id]
+    assert [job for job, _ in orca._launcher.reconciled] == ["job_good"]
 
 
 def test_apply_pending_no_plans(monkeypatch):
