@@ -1,8 +1,8 @@
 """Launcher seam — make a job's desired chains real.
 
-Orca records canonical chain rows in the store, but bringing up the
-actual GPU workers (SkyPilot today; Dynamo / td_operator k8s later) is a
-swappable implementation. ca and live in Orca, not the store.
+Orca records canonical chain rows in the store; bringing up the actual GPU
+workers is a swappable implementation (DynamoLauncher applies DGDs;
+NoopLauncher records intent only).
 
 A Launcher operates on canonical ``Chain`` rows Orca has produced. Recording
 rows and updating status/events stays in Orca; the launcher only touches
@@ -59,8 +59,8 @@ class ReconcileError(RuntimeError):
 class NoopLauncher:
     """Records intent only — no infrastructure is touched.
 
-    The default in the MVP: Orca persists chain rows but does not yet
-    bring up real workers. Swap in a SkyPilot / Dynamo launcher later.
+    Used when Orca should persist chain rows without touching a cluster
+    (tests, dry runs); production uses DynamoLauncher.
     """
 
     def reconcile(self, job_id: str, chains: list[Chain]) -> None:
