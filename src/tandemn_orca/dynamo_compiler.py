@@ -9,6 +9,7 @@ cross-pool routing. Kept for when multi-pool SLA routing / fast-loop rebalancing
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -17,8 +18,15 @@ from tandemn_system_data.models.chain import Chain
 FRONTEND_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.0.2"
 RUNTIME_IMAGE = "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.2-efa-amd64"
 
+# The Dynamo operator's admission webhook requires len(DGD name) +
+# len(service name) <= 45 for pod naming; our longest service is
+# "VllmDecodeWorker" (16), so DGD names must stay within 29.
+MAX_DGD_NAME = 29
 
-def compile_job(job_id: str, chains: list[Chain], namespace: str = "default") -> list[dict[str, Any]]:
+
+def compile_job(
+    job_id: str, chains: list[Chain], namespace: str = "default"
+) -> list[dict[str, Any]]:
     groups = group_chains(chains)
     if not groups:
         return []
@@ -38,18 +46,42 @@ def group_chains(chains: list[Chain]) -> dict[str, list[Chain]]:
 
 def pool_key(chain: Chain) -> str:
     shape = chain.shape_json
+    # rank_id (Koi's ladder rank id, e.g. "rank_0") pools per rung so the
+    # rung's pods can carry one tandemn.ai/rank-id label; without it,
+    # same-shape rungs merge and rank identity is not attributable.
+    if shape.get("rank_id"):
+        return k8s_name(
+            f"{shape['rank_id']}-{required(shape, 'instance_type')}-{required(shape, 'gpu_type')}"
+        )
     return k8s_name(
         f"{chain.role}-{required(shape, 'instance_type')}-{required(shape, 'gpu_type')}"
     )
 
 
 def dgd_name(job_id: str, suffix: str) -> str:
-    return k8s_name(f"{job_id}-{suffix}")
+    """Short DGD name: ``tdm-{job tag}-{suffix}``, capped at MAX_DGD_NAME.
+
+    The job tag is the ULID tail, not the full job id (a full
+    ``job-01kwwez...`` already busts the operator's 45-char pod-naming
+    budget); the full job_id lives in the tandemn.ai/job-id label. A suffix
+    that would not fit is replaced by an 8-char hash of itself.
+    """
+    tag = k8s_name(job_id).removeprefix("job-")[-10:].strip("-")
+    name = k8s_name(f"tdm-{tag}-{suffix}")
+    if len(name) > MAX_DGD_NAME:
+        digest = hashlib.sha1(suffix.encode()).hexdigest()[:8]
+        name = k8s_name(f"tdm-{tag}-{digest}")
+    return name
 
 
 def k8s_name(value: str) -> str:
     value = value.lower().replace("_", "-").replace(".", "-")
     return "".join(ch for ch in value if ch.isalnum() or ch == "-")[:63].strip("-")
+
+
+def pool_dgd_name(job_id: str, key: str, chains: list[Chain]) -> str:
+    """Pool DGD name, preferring the short rank_id over the descriptive key."""
+    return dgd_name(job_id, str(chains[0].shape_json.get("rank_id") or key))
 
 
 def labels(
@@ -77,7 +109,7 @@ def dynamo_namespace(namespace: str, name: str) -> str:
 def render_router_configmap(
     job_id: str, groups: dict[str, list[Chain]], namespace: str
 ) -> dict[str, Any]:
-    name = dgd_name(job_id, "global-router-config")
+    name = dgd_name(job_id, "grc")
     plan_id = first_chain(groups).plan_id
     return {
         "apiVersion": "v1",
@@ -89,7 +121,8 @@ def render_router_configmap(
 
 def render_router_config(job_id: str, groups: dict[str, list[Chain]], namespace: str) -> str:
     pool_namespaces = [
-        dynamo_namespace(namespace, dgd_name(job_id, key)) for key in groups
+        dynamo_namespace(namespace, pool_dgd_name(job_id, key, group))
+        for key, group in groups.items()
     ]
     shape = first_chain(groups).shape_json
     pool_count = len(pool_namespaces)
@@ -111,13 +144,18 @@ def render_router_config(job_id: str, groups: dict[str, list[Chain]], namespace:
     return json.dumps(config, separators=(",", ":"))
 
 
-def render_control_dgd(job_id: str, groups: dict[str, list[Chain]], namespace: str) -> dict[str, Any]:
+def render_control_dgd(
+    job_id: str, groups: dict[str, list[Chain]], namespace: str
+) -> dict[str, Any]:
     name = dgd_name(job_id, "ctrl")
-    router_config_name = dgd_name(job_id, "global-router-config")
+    router_config_name = dgd_name(job_id, "grc")
     shape = first_chain(groups).shape_json
     model = required(shape, "model_id")
     plan_id = first_chain(groups).plan_id
-    managed_namespaces = [dynamo_namespace(namespace, dgd_name(job_id, key)) for key in groups]
+    managed_namespaces = [
+        dynamo_namespace(namespace, pool_dgd_name(job_id, key, group))
+        for key, group in groups.items()
+    ]
     return {
         "apiVersion": "nvidia.com/v1alpha1",
         "kind": "DynamoGraphDeployment",
@@ -130,12 +168,23 @@ def render_control_dgd(job_id: str, groups: dict[str, list[Chain]], namespace: s
                     "extraPodSpec": {
                         "mainContainer": {
                             "image": FRONTEND_IMAGE,
+                            # Pool DGDs are named {tdm-tag}-{rank}, so the
+                            # {namespace}-{tdm-tag} prefix lets the Frontend
+                            # discover workers in every pool namespace
+                            # (runtime-verified; a plain --namespace only sees
+                            # the ctrl namespace and serves no models).
+                            "env": [
+                                {
+                                    "name": "DYN_NAMESPACE_PREFIX",
+                                    "value": dynamo_namespace(namespace, dgd_name(job_id, "")),
+                                }
+                            ],
                             "command": ["python3", "-m", "dynamo.frontend"],
                             "args": [
                                 "--router-mode",
                                 "round-robin",
-                                "--namespace",
-                                dynamo_namespace(namespace, name),
+                                "--namespace-prefix",
+                                dynamo_namespace(namespace, dgd_name(job_id, "")),
                                 "--model-name",
                                 model,
                             ],
@@ -147,7 +196,10 @@ def render_control_dgd(job_id: str, groups: dict[str, list[Chain]], namespace: s
                     "replicas": 1,
                     "extraPodSpec": {
                         "volumes": [
-                            {"name": "global-router-config", "configMap": {"name": router_config_name}}
+                            {
+                                "name": "global-router-config",
+                                "configMap": {"name": router_config_name},
+                            }
                         ],
                         "mainContainer": {
                             "image": RUNTIME_IMAGE,
@@ -195,10 +247,8 @@ def render_control_dgd(job_id: str, groups: dict[str, list[Chain]], namespace: s
     }
 
 
-def render_pool_dgd(
-    job_id: str, key: str, chains: list[Chain], namespace: str
-) -> dict[str, Any]:
-    name = dgd_name(job_id, key)
+def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) -> dict[str, Any]:
+    name = pool_dgd_name(job_id, key, chains)
     shape = chains[0].shape_json
     plan_id = chains[0].plan_id
     gpu_count = worker_gpu_count(chains)
@@ -228,8 +278,25 @@ def render_pool_dgd(
                 "VllmDecodeWorker": {
                     "componentType": "worker",
                     "subComponentType": "decode",
-                    "replicas": 1,
+                    # No "replicas": the scaling adapter (DGDSA) owns it once
+                    # enabled -- the in-pool Planner scales DP width within
+                    # [min_endpoint, max_gpu_budget]. Claiming replicas here
+                    # would make every Orca re-apply fight the adapter (webhook
+                    # rejection or a reset to the initial value).
                     "scalingAdapter": {"enabled": True},
+                    # The gpu-metrics collector lifts these pod labels: job-id
+                    # keys the pod to its job's chain rows, rank-id groups the
+                    # rung's chains/GPUs under one rank in gpu_metrics.
+                    "extraPodMetadata": {
+                        "labels": {
+                            "tandemn.ai/job-id": job_id,
+                            **(
+                                {"tandemn.ai/rank-id": str(shape["rank_id"])}
+                                if shape.get("rank_id")
+                                else {}
+                            ),
+                        }
+                    },
                     "resources": {
                         "requests": {"gpu": str(gpu_count)},
                         "limits": {"gpu": str(gpu_count)},
