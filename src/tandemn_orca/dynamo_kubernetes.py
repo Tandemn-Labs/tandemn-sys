@@ -48,7 +48,7 @@ class DynamoKubernetesClient:
             GROUP, VERSION, self.namespace, DGD_PLURAL, label_selector=selector
         ).get("items", [])
         return {
-            *(('ConfigMap', item.metadata.name) for item in configmaps),
+            *(("ConfigMap", item.metadata.name) for item in configmaps),
             *(("DynamoGraphDeployment", item["metadata"]["name"]) for item in dgds),
         }
 

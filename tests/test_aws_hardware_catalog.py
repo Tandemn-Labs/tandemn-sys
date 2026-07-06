@@ -23,7 +23,11 @@ class FakeEC2:
                 [
                     {
                         "InstanceTypeOfferings": [
-                            {"InstanceType": "g6e.12xlarge", "Location": "us-east-2a", "LocationType": "availability-zone"}
+                            {
+                                "InstanceType": "g6e.12xlarge",
+                                "Location": "us-east-2a",
+                                "LocationType": "availability-zone",
+                            }
                         ]
                     }
                 ]
@@ -69,7 +73,12 @@ def _g6e():
         "GpuInfo": {
             "TotalGpuMemoryInMiB": 196608,
             "Gpus": [
-                {"Manufacturer": "NVIDIA", "Name": "L40S", "Count": 4, "MemoryInfo": {"SizeInMiB": 49152}}
+                {
+                    "Manufacturer": "NVIDIA",
+                    "Name": "L40S",
+                    "Count": 4,
+                    "MemoryInfo": {"SizeInMiB": 49152},
+                }
             ],
         },
         "NetworkInfo": {
@@ -81,7 +90,10 @@ def _g6e():
             "NetworkCards": [{"NetworkCardIndex": 0, "MaximumNetworkInterfaces": 15}],
         },
         "InstanceStorageSupported": True,
-        "InstanceStorageInfo": {"TotalSizeInGB": 3800, "Disks": [{"SizeInGB": 3800, "Count": 1, "Type": "ssd"}]},
+        "InstanceStorageInfo": {
+            "TotalSizeInGB": 3800,
+            "Disks": [{"SizeInGB": 3800, "Count": 1, "Type": "ssd"}],
+        },
         "EbsInfo": {"EbsOptimizedInfo": {"BaselineBandwidthInMbps": 10000}},
         "SupportedUsageClasses": ["on-demand", "spot"],
         "SupportedBootModes": ["uefi"],
@@ -94,9 +106,7 @@ def _price_product():
         "terms": {
             "OnDemand": {
                 "term": {
-                    "priceDimensions": {
-                        "dim": {"unit": "Hrs", "pricePerUnit": {"USD": "3.21"}}
-                    }
+                    "priceDimensions": {"dim": {"unit": "Hrs", "pricePerUnit": {"USD": "3.21"}}}
                 }
             }
         },
