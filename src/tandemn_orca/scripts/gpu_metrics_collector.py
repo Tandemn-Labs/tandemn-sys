@@ -2,8 +2,8 @@
 
 One collector per cluster ("fleet mode"): every Dynamo worker pod in
 ``--namespace`` is tracked, across all DGDs and jobs. Identity is discovered,
-not configured: ``deployment_id`` from the operator's DGD pod label, ``job_id``
-+ ``rank_id`` from the ``tandemn.ai/*`` pod labels Orca stamps, the served
+not configured: ``job_id`` + ``rank_id`` from the ``tandemn.ai/*`` pod labels
+Orca stamps, the served
 model from the worker's ``--model`` arg, the node's instance type from its
 ``node.kubernetes.io/instance-type`` label.
 
@@ -211,7 +211,6 @@ def _gpu_selector(target: dict[str, str]) -> str:
 #   rank  = a ladder rung (rank config), realized by N chains / DP replicas
 #   chain = one serving unit == one worker (a DP replica within the rank)
 #   worker spans N GPUs (its local ranks) under TP/PP.
-_LABEL_DGD = "nvidia.com/dynamo-graph-deployment-name"
 _LABEL_DYN_NS = "nvidia.com/dynamo-namespace"
 _LABEL_COMPONENT = "nvidia.com/dynamo-component-type"
 # PD-disaggregation role of the worker: "prefill" | "decode" (absent = aggregated).
@@ -245,7 +244,6 @@ class WorkerInfo:
         rank_id: str | None,
         chain_id: str | None,
         role: str | None,
-        deployment_id: str | None = None,
         job_id: str | None = None,
         model_name: str | None = None,
         ttft_target_ms: float | None = None,
@@ -256,7 +254,6 @@ class WorkerInfo:
         self.rank_id = rank_id
         self.chain_id = chain_id
         self.role = role
-        self.deployment_id = deployment_id
         self.job_id = job_id
         self.model_name = model_name
         self.ttft_target_ms = ttft_target_ms
@@ -325,7 +322,6 @@ class KubeWorkerIndex:
                 rank_id=labels.get(_LABEL_RANK),
                 chain_id=chain_id,
                 role=labels.get(_LABEL_SUBCOMPONENT),
-                deployment_id=labels.get(_LABEL_DGD),
                 job_id=labels.get(_LABEL_JOB),
                 model_name=_model_from_pod(pod),
             )
@@ -412,7 +408,7 @@ def collect_once(
     chain/worker from ``workers_by_pod``, so inference metrics are scoped to
     that chain rather than summed across the whole deployment. A GPU no worker
     owns still gets a row -- hardware metrics only, identity
-    (``deployment_id``/``rank_id``/``chain_id``/``local_rank``/``role``) and
+    (``job_id``/``rank_id``/``chain_id``/``local_rank``/``role``) and
     inference metrics all None -- so aggregate utilization sees idle capacity.
 
     ``prices_by_instance_type`` holds instance $/hour; a chain's
@@ -476,7 +472,7 @@ def collect_once(
         }
         samples.append(
             GpuMetric(
-                deployment_id=worker.deployment_id if worker else None,
+                job_id=worker.job_id if worker else None,
                 gpu_uuid=target["gpu_uuid"],
                 rank_id=worker.rank_id if worker else None,
                 chain_id=worker.chain_id if worker else None,

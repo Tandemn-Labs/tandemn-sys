@@ -60,13 +60,13 @@ adapters, not in the persisted plan).
 The collector side is live: `gpu_metrics` gets one row per physical GPU per
 10s. Reading contract (clients in `tandemn_system_data`):
 
-- `GpuMetricStore.rows_for_rank(deployment_id, rank_id)` — the rank's rows
+- `GpuMetricStore.rows_for_rank(job_id, rank_id)` — the rank's rows
   across its chains/GPUs. `rank_id` here **is** Koi's ladder `rank_id`
   (`rank_0`, ...): Orca propagates it plan → chain shape → pod label →
   telemetry, so it joins directly to `evidence_rows.rank_id`.
 - `rows_for_chain(chain_id)` — one DP replica. `chain_id` is the canonical
   `chains.chain_id`.
-- `rows_in_window(deployment_id, start, end)` for trajectories.
+- `rows_in_window(job_id, start, end)` for trajectories.
 
 Aggregation rules:
 - **Inference metrics** (`throughput_token_per_sec`, `p99_ttft_ms`,
