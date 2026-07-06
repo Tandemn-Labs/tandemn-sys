@@ -54,7 +54,6 @@ def test_collect_once_attributes_owned_and_unowned_gpus():
         rank_id="rank_0",
         chain_id="chain-1",
         role="decode",
-        deployment_id="job-rank-0-g6-12xlarge-l4",
         job_id="job_1",
         model_name="Qwen/Qwen3-0.6B",
         ttft_target_ms=500.0,
@@ -70,7 +69,7 @@ def test_collect_once_attributes_owned_and_unowned_gpus():
     assert set(by_uuid) == {"GPU-a", "GPU-b", "GPU-idle"}
 
     owned = by_uuid["GPU-a"]
-    assert owned.deployment_id == "job-rank-0-g6-12xlarge-l4"
+    assert owned.job_id == "job_1"
     assert owned.rank_id == "rank_0"
     assert owned.chain_id == "chain-1"
     assert owned.role == "decode"
@@ -88,7 +87,7 @@ def test_collect_once_attributes_owned_and_unowned_gpus():
     assert owned.slo_margin == (500.0 - 1.5) / 500.0
 
     idle = by_uuid["GPU-idle"]
-    assert idle.deployment_id is None
+    assert idle.job_id is None
     assert idle.rank_id is None
     assert idle.chain_id is None
     assert idle.local_rank is None
