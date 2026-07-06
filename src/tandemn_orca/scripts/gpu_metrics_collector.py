@@ -1,5 +1,12 @@
 """Collect GPU/inference telemetry from Prometheus into Tandemn Store.
 
+One collector per cluster ("fleet mode"): every Dynamo worker pod in
+``--namespace`` is tracked, across all DGDs and jobs. Identity is discovered,
+not configured: ``deployment_id`` from the operator's DGD pod label, ``job_id``
++ ``rank_id`` from the ``tandemn.ai/*`` pod labels Orca stamps, the served
+model from the worker's ``--model`` arg, the node's instance type from its
+``node.kubernetes.io/instance-type`` label.
+
 Writes one ``GpuMetric`` row per physical GPU per tick. Granularity:
 
 - GPU hardware metrics (DCGM) are scoped to that one GPU (by ``UUID``).
@@ -9,23 +16,25 @@ Writes one ``GpuMetric`` row per physical GPU per tick. Granularity:
 
 Tandemn job model, coarse -> fine: a ``rank_id`` is a ladder rung (rank config)
 realized by N chains / DP replicas; a ``chain_id`` is one serving unit == one
-worker; a worker spans N GPUs, each with a ``local_rank`` (its index in the
-worker). Each row therefore carries rank > chain > worker > local_rank, plus the
-physical ``gpu_uuid``.
+worker pod; a chain spans N GPUs, each with a ``local_rank`` (its index in the
+chain). ``chain_id`` is the canonical ``chains.chain_id`` from the store:
+chains within a rank are fungible DP replicas, so each job's worker pods are
+mapped onto its chain rows deterministically (both sides sorted). Pods without
+a job label (or beyond the job's chain rows) fall back to the pod name.
 
-Each row also records the PD-disaggregation ``role`` ("prefill"/"decode", from
-the Dynamo ``sub-component-type`` label; ``None`` for an aggregated worker) so
-prefill and decode GPUs can be grouped and compared.
-
-The GPU->chain join uses the Kubernetes API (``KubeWorkerIndex``): dcgm-exporter
-series carry the node but not the worker pod, so the collector lists the
-deployment's worker pods and maps node -> worker, lifting ``rank_id`` /
-``chain_id`` / ``role`` from pod labels when Orca launched the ladder.
+The GPU->chain join uses dcgm-exporter's pod attribution: with
+``DCGM_EXPORTER_KUBERNETES=true`` (cloud-setup/EKS/dcgm-exporter.yaml) each DCGM
+series carries the pod its GPU is allocated to (``exported_pod`` after the
+Prometheus scrape relabels it). A GPU no worker owns still gets a row --
+hardware metrics with all-null identity -- so aggregate utilization sees idle
+capacity on tracked nodes.
 
 Run once (``--once``) or loop on a fixed ``COLLECT_INTERVAL_SECONDS`` cadence.
 Metrics that are topology- or config-gated (NVLink/comm/expert;
 ``sm_utilization``) return no series and are left ``None``. ``cost_per_token``
-and ``slo_margin`` use the ``--price-per-hour`` and ``--ttft-target-ms`` inputs.
+uses the ``--user-id`` resource map's ``price_per_instance_hour`` for the
+worker node's instance type (the resource map is assumed accurate);
+``slo_margin`` uses the chain's ``target_p99_ttft_ms`` from its shape.
 
 Prometheus URL: ``--prometheus-url`` or ``TANDEMN_PROMETHEUS_URL``. Postgres:
 ``TANDEMN_POSTGRES_URL`` (see tandemn-store). Kubernetes config is loaded
@@ -46,8 +55,13 @@ import urllib.request
 from collections.abc import Iterator
 from typing import Any
 
-from tandemn_system_data.clients import GpuMetricStore, PostgresClient
-from tandemn_system_data.models import GpuMetric
+from tandemn_system_data.clients import (
+    GpuMetricStore,
+    JobStore,
+    PostgresClient,
+    ResourceMapStore,
+)
+from tandemn_system_data.models import Chain, GpuMetric, ResourceMap
 
 logger = logging.getLogger(__name__)
 
@@ -171,11 +185,16 @@ class PrometheusClient:
                 {
                     "gpu_uuid": str(uuid),
                     "uuid_label": metric.get("UUID", ""),
-                    "hostname": metric.get("Hostname", ""),
                     "instance": metric.get("instance", ""),
                     # DCGM's node-local GPU index (0,1,2,...) = the GPU's rank
                     # within its chain/worker for TP/PP parallelism.
                     "gpu_index": metric.get("gpu", ""),
+                    # The pod this GPU is allocated to, from dcgm-exporter's
+                    # kubelet PodResources mapping. The exporter emits it as
+                    # "pod"; the scrape's own pod label (the exporter pod)
+                    # wins that name, so the GPU owner arrives as
+                    # "exported_pod". Empty = unallocated GPU or mapping off.
+                    "owner_pod": metric.get("exported_pod", ""),
                 }
             )
         return targets
@@ -198,8 +217,12 @@ _LABEL_COMPONENT = "nvidia.com/dynamo-component-type"
 # PD-disaggregation role of the worker: "prefill" | "decode" (absent = aggregated).
 _LABEL_SUBCOMPONENT = "nvidia.com/dynamo-sub-component-type"
 # Optional tandemn job-model labels (present when Orca launched the ladder).
+_LABEL_JOB = "tandemn.ai/job-id"
 _LABEL_RANK = "tandemn.ai/rank-id"
 _LABEL_CHAIN = "tandemn.ai/chain-id"
+
+# Node label carrying the EC2 instance type (standard on EKS/Karpenter nodes).
+_NODE_LABEL_INSTANCE_TYPE = "node.kubernetes.io/instance-type"
 
 
 class WorkerInfo:
@@ -207,7 +230,9 @@ class WorkerInfo:
 
     Joined to the node it runs on. ``rank_id`` is the ladder rung the chain
     belongs to (shared across the rank's chains); ``chain_id`` is the serving
-    unit; ``worker_id`` is the pod name. Per-GPU local ranks are resolved
+    unit (canonical chains.chain_id after ``assign_canonical_chain_ids``, else
+    the pod name); ``worker_id`` is the pod name, kept internally for the
+    vLLM ``pod=`` selector but not stored. Per-GPU local ranks are resolved
     separately from the DCGM ``gpu`` index.
     """
 
@@ -220,6 +245,10 @@ class WorkerInfo:
         rank_id: str | None,
         chain_id: str | None,
         role: str | None,
+        deployment_id: str | None = None,
+        job_id: str | None = None,
+        model_name: str | None = None,
+        ttft_target_ms: float | None = None,
     ) -> None:
         self.worker_id = worker_id
         self.node_name = node_name
@@ -227,18 +256,32 @@ class WorkerInfo:
         self.rank_id = rank_id
         self.chain_id = chain_id
         self.role = role
+        self.deployment_id = deployment_id
+        self.job_id = job_id
+        self.model_name = model_name
+        self.ttft_target_ms = ttft_target_ms
+
+
+def _model_from_pod(pod: Any) -> str | None:
+    """The worker's served model, from its container ``--model <id>`` arg."""
+    for container in pod.spec.containers or []:
+        args = list(container.args or [])
+        for i, arg in enumerate(args[:-1]):
+            if arg == "--model":
+                return str(args[i + 1])
+    return None
 
 
 class KubeWorkerIndex:
-    """Maps a GPU's node to the Dynamo worker pod (chain) serving a deployment.
+    """Indexes every Dynamo worker pod (chain) in the namespace by pod name.
 
-    dcgm-exporter metrics carry the node (Hostname) but not the worker pod, so
-    the node->worker join happens through the Kubernetes API rather than
-    Prometheus labels. Single worker per node is assumed (one GPU worker per
-    g6.xlarge); with multiple workers per node the first match on the node wins.
+    dcgm-exporter's PodResources mapping names the pod that owns each GPU
+    (``exported_pod``); this index supplies that pod's identity labels. The
+    node maps name the node (dcgm-exporter runs with hostNetwork, so its
+    ``instance`` label carries the node's InternalIP) and its instance type.
     """
 
-    def __init__(self, deployment_id: str, namespace: str = "default", core: Any = None) -> None:
+    def __init__(self, namespace: str = "default", core: Any = None) -> None:
         from kubernetes import client, config
 
         if core is None:
@@ -248,57 +291,84 @@ class KubeWorkerIndex:
                 config.load_kube_config()
             core = client.CoreV1Api()
         self._core = core
-        self._deployment_id = deployment_id
         self._namespace = namespace
 
-    def _node_ips(self) -> dict[str, str]:
-        """node name -> InternalIP, to join DCGM's ``instance`` IP to a node."""
-        ips: dict[str, str] = {}
+    def nodes(self) -> tuple[dict[str, str], dict[str, str]]:
+        """(InternalIP -> node name, node name -> instance type)."""
+        names_by_ip: dict[str, str] = {}
+        instance_types: dict[str, str] = {}
         for node in self._core.list_node().items:
+            name = node.metadata.name
+            instance_type = (node.metadata.labels or {}).get(_NODE_LABEL_INSTANCE_TYPE)
+            if instance_type:
+                instance_types[name] = instance_type
             for addr in node.status.addresses or []:
                 if addr.type == "InternalIP":
-                    ips[node.metadata.name] = addr.address
-        return ips
+                    names_by_ip[addr.address] = name
+        return names_by_ip, instance_types
 
-    def by_node(self) -> dict[str, WorkerInfo]:
-        """Worker pods of this deployment, keyed by node name AND node IP.
-
-        dcgm-exporter runs with hostNetwork so its ``Hostname`` is often
-        ``localhost``; the usable node key is the IP in its ``instance`` label.
-        Registering each worker under both the node name and the node IP lets the
-        collector join on whichever the DCGM series exposes.
-        """
-        selector = f"{_LABEL_DGD}={self._deployment_id},{_LABEL_COMPONENT}=worker"
+    def by_pod(self) -> dict[str, WorkerInfo]:
+        """All Dynamo worker pods in the namespace, keyed by pod name."""
+        selector = f"{_LABEL_COMPONENT}=worker"
         pods = self._core.list_namespaced_pod(self._namespace, label_selector=selector).items
-        node_ips = self._node_ips()
         index: dict[str, WorkerInfo] = {}
         for pod in pods:
-            node_name = pod.spec.node_name
-            if not node_name:
-                continue
             labels = pod.metadata.labels or {}
             # A chain == a worker; fall back to the pod name when Orca did not
-            # stamp an explicit chain-id label. rank_id (the ladder rung) is only
-            # known when Orca launched the ladder, else None.
+            # stamp an explicit chain-id label. rank_id/job_id (the tandemn.ai
+            # labels) are only known when Orca launched the ladder, else None.
             chain_id = labels.get(_LABEL_CHAIN) or pod.metadata.name
-            info = WorkerInfo(
+            index[pod.metadata.name] = WorkerInfo(
                 worker_id=pod.metadata.name,
-                node_name=node_name,
+                node_name=pod.spec.node_name or "",
                 dynamo_namespace=labels.get(_LABEL_DYN_NS),
                 rank_id=labels.get(_LABEL_RANK),
                 chain_id=chain_id,
                 role=labels.get(_LABEL_SUBCOMPONENT),
+                deployment_id=labels.get(_LABEL_DGD),
+                job_id=labels.get(_LABEL_JOB),
+                model_name=_model_from_pod(pod),
             )
-            index[node_name] = info
-            node_ip = node_ips.get(node_name)
-            if node_ip:
-                index[node_ip] = info
         return index
+
+
+def assign_canonical_chain_ids(workers_by_pod: dict[str, WorkerInfo], chains: list[Chain]) -> None:
+    """Overwrite pod-name chain_ids with canonical ``chains.chain_id`` values.
+
+    Chains within a rank are fungible DP replicas, so any pod<->chain bijection
+    is valid; sorting both sides (pods by name, chain rows by chain_id) makes it
+    deterministic. An explicitly labelled chain_id is kept; pods beyond the
+    rank's chain rows keep the pod-name fallback.
+
+    ponytail: the mapping can reshuffle when the pod set changes (a replaced
+    pod may swap chain_ids with a surviving one); fine while chains are
+    fungible, revisit if chain identity ever needs to survive pod churn.
+    """
+    chains_by_id = {chain.chain_id: chain for chain in chains}
+    chain_rows_by_rank: dict[str | None, list[str]] = {}
+    for chain in chains:
+        rank = chain.shape_json.get("rank_id")
+        chain_rows_by_rank.setdefault(rank, []).append(chain.chain_id)
+
+    workers_by_rank: dict[str | None, list[WorkerInfo]] = {}
+    for worker in workers_by_pod.values():
+        # chain_id != pod name means an explicit tandemn.ai/chain-id label.
+        if worker.chain_id == worker.worker_id:
+            workers_by_rank.setdefault(worker.rank_id, []).append(worker)
+
+    for rank, workers in workers_by_rank.items():
+        workers.sort(key=lambda w: w.worker_id)
+        rows = sorted(chain_rows_by_rank.get(rank, []))
+        for worker, chain_id in zip(workers, rows, strict=False):
+            worker.chain_id = chain_id
+            target = chains_by_id[chain_id].shape_json.get("target_p99_ttft_ms")
+            if isinstance(target, (int, float)):
+                worker.ttft_target_ms = float(target)
 
 
 def _worker_inference_values(
     prom: PrometheusClient,
-    worker: WorkerInfo | None,
+    worker: WorkerInfo,
     *,
     price_per_hour: float | None,
     ttft_target_ms: float | None,
@@ -308,7 +378,7 @@ def _worker_inference_values(
     The PodMonitor attaches a ``pod`` label equal to the worker pod name, so
     ``pod="<worker_id>"`` scopes vLLM series to that single worker.
     """
-    selector = f'pod="{worker.worker_id}"' if worker is not None else ""
+    selector = f'pod="{worker.worker_id}"'
     values: dict[str, float | None] = {
         field: prom.query_scalar(query.format(worker=selector))
         for field, query in WORKER_QUERIES.items()
@@ -330,45 +400,75 @@ def _worker_inference_values(
 
 def collect_once(
     prom: PrometheusClient,
-    workers_by_node: dict[str, WorkerInfo],
+    workers_by_pod: dict[str, WorkerInfo],
     *,
-    deployment_id: str,
-    model_name: str | None,
-    instance_type: str | None,
-    price_per_hour: float | None,
-    ttft_target_ms: float | None,
+    node_names_by_ip: dict[str, str] | None = None,
+    instance_types_by_node: dict[str, str] | None = None,
+    prices_by_instance_type: dict[str, float | None] | None = None,
 ) -> list[GpuMetric]:
     """One GpuMetric per GPU: GPU metrics per-GPU, inference metrics per-chain.
 
-    ``workers_by_node`` maps node name -> worker (from KubeWorkerIndex). A GPU's
-    node picks its chain/worker, so inference metrics are scoped to that chain
-    rather than summed across the whole deployment. Identity is nested coarse ->
-    fine: ``rank_id`` (ladder rung, shared across the rank's chains) >
-    ``chain_id`` (== worker) > ``worker_id`` > ``local_rank`` (the GPU's index
-    within its worker, from the DCGM ``gpu`` label).
+    A GPU's ``owner_pod`` (dcgm-exporter PodResources mapping) picks its
+    chain/worker from ``workers_by_pod``, so inference metrics are scoped to
+    that chain rather than summed across the whole deployment. A GPU no worker
+    owns still gets a row -- hardware metrics only, identity
+    (``deployment_id``/``rank_id``/``chain_id``/``local_rank``/``role``) and
+    inference metrics all None -- so aggregate utilization sees idle capacity.
+
+    ``prices_by_instance_type`` holds instance $/hour; a chain's
+    ``cost_per_token`` uses its node's instance price as-is, repeated on each
+    of its GPU rows.
     """
     # Inference metrics are per-worker; cache so GPUs sharing a worker (TP>1)
     # reuse one query pass.
     worker_cache: dict[str, dict[str, float | None]] = {}
+    none_inference: dict[str, float | None] = dict.fromkeys(
+        [*WORKER_QUERIES, "cost_per_token", "slo_margin"]
+    )
+
+    targets = prom.gpu_targets()
+    if targets and workers_by_pod and not any(t.get("owner_pod") for t in targets):
+        logger.warning(
+            "no DCGM series carries exported_pod; is DCGM_EXPORTER_KUBERNETES enabled? "
+            "all GPUs will be recorded as unowned"
+        )
+
+    # local_rank is the GPU's index within its worker. The DCGM ``gpu`` label
+    # is node-local (a packed node numbers a worker's GPUs 2,3), so rank the
+    # worker's owned GPUs by that index instead of using it directly.
+    local_ranks: dict[str, str] = {}
+    owned: dict[str, list[dict[str, str]]] = {}
+    for target in targets:
+        if target.get("owner_pod") in workers_by_pod:
+            owned.setdefault(target["owner_pod"], []).append(target)
+    for pod_targets in owned.values():
+        pod_targets.sort(key=lambda t: (len(t.get("gpu_index", "")), t.get("gpu_index", "")))
+        for rank, target in enumerate(pod_targets):
+            local_ranks[target["gpu_uuid"]] = str(rank)
 
     samples = []
-    for target in prom.gpu_targets():
-        # dcgm-exporter's Hostname is often "localhost" (hostNetwork), so fall
-        # back to the node IP parsed from the DCGM "instance" label.
-        node_key = target.get("hostname", "")
-        worker = workers_by_node.get(node_key)
-        if worker is None:
-            node_ip = target.get("instance", "").split(":", 1)[0]
-            worker = workers_by_node.get(node_ip)
-        # Prefer the worker's real node name over a "localhost" Hostname.
-        node_name = worker.node_name if worker is not None else (node_key or None)
+    for target in targets:
+        worker = workers_by_pod.get(target.get("owner_pod", ""))
 
-        cache_key = worker.worker_id if worker is not None else ""
-        if cache_key not in worker_cache:
-            worker_cache[cache_key] = _worker_inference_values(
-                prom, worker, price_per_hour=price_per_hour, ttft_target_ms=ttft_target_ms
-            )
-        inference_values = worker_cache[cache_key]
+        if worker is not None:
+            node_name: str | None = worker.node_name or None
+            instance_type = (instance_types_by_node or {}).get(node_name or "")
+            if worker.worker_id not in worker_cache:
+                price = (prices_by_instance_type or {}).get(instance_type or "")
+                worker_cache[worker.worker_id] = _worker_inference_values(
+                    prom,
+                    worker,
+                    price_per_hour=price,
+                    ttft_target_ms=worker.ttft_target_ms,
+                )
+            inference_values = worker_cache[worker.worker_id]
+        else:
+            # dcgm-exporter runs with hostNetwork, so the instance IP is the
+            # node's InternalIP.
+            node_ip = target.get("instance", "").split(":", 1)[0]
+            node_name = (node_names_by_ip or {}).get(node_ip)
+            instance_type = (instance_types_by_node or {}).get(node_name or "")
+            inference_values = none_inference
 
         gpu_values = {
             field: prom.query_scalar(query.format(gpu=_gpu_selector(target)))
@@ -376,21 +476,39 @@ def collect_once(
         }
         samples.append(
             GpuMetric(
-                deployment_id=deployment_id,
+                deployment_id=worker.deployment_id if worker else None,
                 gpu_uuid=target["gpu_uuid"],
                 rank_id=worker.rank_id if worker else None,
                 chain_id=worker.chain_id if worker else None,
-                worker_id=worker.worker_id if worker else None,
-                local_rank=target.get("gpu_index") or None,
+                # An idle GPU has no local_rank.
+                local_rank=local_ranks.get(target["gpu_uuid"]) if worker else None,
                 role=worker.role if worker else None,
                 node_name=node_name,
                 instance_type=instance_type,
-                model_name=model_name,
+                model_name=worker.model_name if worker else None,
                 **gpu_values,
                 **inference_values,
             )
         )
     return samples
+
+
+def resolve_instance_price_per_hour(
+    resource_map: ResourceMap, instance_type: str | None
+) -> float | None:
+    """Instance USD/hour for one instance type, from the user's resource map.
+
+    Searches the map's machine pools (Orca fills ``price_per_instance_hour``
+    from the hardware catalog). First priced pool wins; None when the
+    instance type is absent or unpriced.
+    """
+    if instance_type is None:
+        return None
+    for *_head, pool_instance_type, pool in resource_map.iter_machine_pools():
+        if pool_instance_type != instance_type or pool.price_per_instance_hour is None:
+            continue
+        return pool.price_per_instance_hour
+    return None
 
 
 def _ticks(once: bool) -> Iterator[None]:
@@ -410,18 +528,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Prometheus base URL (or TANDEMN_PROMETHEUS_URL)",
     )
     parser.add_argument(
-        "--deployment-id", required=True, help="Dynamo graph deployment name, e.g. qwen3-06b-l4"
-    )
-    parser.add_argument(
         "--namespace", default="default", help="Kubernetes namespace of the worker pods"
     )
-    parser.add_argument("--model-name", default=None, help="Served model name for vLLM queries")
-    parser.add_argument("--instance-type", default=None, help="EC2 instance type for the GPUs")
     parser.add_argument(
-        "--price-per-hour", type=float, default=None, help="Instance $/hour for cost_per_token"
-    )
-    parser.add_argument(
-        "--ttft-target-ms", type=float, default=None, help="TTFT SLO target (ms) for slo_margin"
+        "--user-id",
+        default=os.getenv("TANDEMN_USER_ID"),
+        help="Resource map owner (or TANDEMN_USER_ID); prices instances for cost_per_token",
     )
     parser.add_argument(
         "--once",
@@ -436,25 +548,49 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     prom = PrometheusClient(args.prometheus_url)
-    store = GpuMetricStore(PostgresClient())
-    kube = KubeWorkerIndex(args.deployment_id, namespace=args.namespace)
+    client = PostgresClient()
+    store = GpuMetricStore(client)
+    jobs = JobStore(client)
+    resource_maps = (
+        ResourceMapStore(client, user_id=args.user_id) if args.user_id is not None else None
+    )
+    kube = KubeWorkerIndex(namespace=args.namespace)
 
     for _ in _ticks(args.once):
-        workers_by_node = kube.by_node()
+        workers_by_pod = kube.by_pod()
+        # Canonical chain ids, one job at a time (job ids come from pod labels).
+        job_ids = sorted({w.job_id for w in workers_by_pod.values() if w.job_id})
+        for job_id in job_ids:
+            job_workers = {pod: w for pod, w in workers_by_pod.items() if w.job_id == job_id}
+            assign_canonical_chain_ids(job_workers, jobs.active_chains(job_id))
+
+        node_names_by_ip, instance_types_by_node = kube.nodes()
+        # Re-read per tick: the map is one row and Orca republishes prices.
+        resource_map = resource_maps.get() if resource_maps is not None else None
+        prices_by_instance_type: dict[str, float | None] = {}
+        if resource_map is not None:
+            prices_by_instance_type = {
+                instance_type: resolve_instance_price_per_hour(resource_map, instance_type)
+                for instance_type in set(instance_types_by_node.values())
+            }
+
         samples = collect_once(
             prom,
-            workers_by_node,
-            deployment_id=args.deployment_id,
-            model_name=args.model_name,
-            instance_type=args.instance_type,
-            price_per_hour=args.price_per_hour,
-            ttft_target_ms=args.ttft_target_ms,
+            workers_by_pod,
+            node_names_by_ip=node_names_by_ip,
+            instance_types_by_node=instance_types_by_node,
+            prices_by_instance_type=prices_by_instance_type,
         )
         if samples:
             store.put_many(samples)
-            logger.info("wrote %d gpu_metrics rows for %s", len(samples), args.deployment_id)
+            logger.info(
+                "wrote %d gpu_metrics rows (%d workers, %d jobs)",
+                len(samples),
+                len(workers_by_pod),
+                len(job_ids),
+            )
         else:
-            logger.info("no GPUs found; nothing written for %s", args.deployment_id)
+            logger.info("no GPUs found; nothing written")
     return 0
 
 
