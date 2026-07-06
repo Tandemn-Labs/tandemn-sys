@@ -71,7 +71,10 @@ def test_list_job_objects_reads_configmaps_and_dgds():
     custom = FakeCustom()
     client = DynamoKubernetesClient("ns", core=core, custom=custom)
 
-    assert client.list_job_objects("job_1") == {("ConfigMap", "cm"), ("DynamoGraphDeployment", "dgd")}
+    assert client.list_job_objects("job_1") == {
+        ("ConfigMap", "cm"),
+        ("DynamoGraphDeployment", "dgd"),
+    }
     assert core.selector == ("ns", "tandemn.ai/managed-by=orca,tandemn.ai/job-id=job_1")
     assert custom.selector == (
         (GROUP, VERSION, "ns", DGD_PLURAL),
@@ -90,7 +93,10 @@ def test_apply_many_uses_server_side_apply_for_supported_objects():
     }
 
     assert core.applied == [
-        (("cm", "ns", _configmap("cm")), {"field_manager": FIELD_MANAGER, "force": True, "_content_type": APPLY})
+        (
+            ("cm", "ns", _configmap("cm")),
+            {"field_manager": FIELD_MANAGER, "force": True, "_content_type": APPLY},
+        )
     ]
     assert custom.applied == [
         (

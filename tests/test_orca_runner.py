@@ -76,7 +76,12 @@ def test_main_once_uses_dynamo_launcher(monkeypatch):
     assert FakeOrca.instances[0].launcher is FakeLauncher.instances[0]
     assert FakeOrca.instances[0].applied_users == ["default"]
     assert FakeRefresher.instances[0].client == "client"
-    assert FakeRefresher.instances[0].regions == ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
+    assert FakeRefresher.instances[0].regions == [
+        "us-east-1",
+        "us-east-2",
+        "us-west-1",
+        "us-west-2",
+    ]
     assert FakeRefresher.instances[0].calls == [True, False]
 
 

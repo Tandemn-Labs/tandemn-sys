@@ -203,9 +203,9 @@ def test_main_without_regions_scans_all_enabled(monkeypatch, capsys):
 
     assert scanned == ["us-east-1", "us-west-2"]
     body = json.loads(capsys.readouterr().out)
-    pool = body["clouds"]["aws"]["regions"]["us-west-2"]["zones"]["us-west-2c"][
-        "network_fabrics"
-    ]["default"]["machine_pools"]["p4d.24xlarge"]
+    pool = body["clouds"]["aws"]["regions"]["us-west-2"]["zones"]["us-west-2c"]["network_fabrics"][
+        "default"
+    ]["machine_pools"]["p4d.24xlarge"]
     assert pool["gpu_type"] == "A100"
 
 
@@ -250,7 +250,9 @@ def test_refresh_capacity_stores_enriched_resource_map(monkeypatch):
             return mod.CatalogSnapshot(catalog=catalog, updated_at=datetime.now(UTC))
 
     monkeypatch.setattr(mod, "build_catalogs", lambda regions: _catalog())
-    monkeypatch.setattr(mod, "fetch_reservations", lambda region: [_cr("g6e.12xlarge", "us-east-2a", 2)])
+    monkeypatch.setattr(
+        mod, "fetch_reservations", lambda region: [_cr("g6e.12xlarge", "us-east-2a", 2)]
+    )
     monkeypatch.setattr(mod, "ResourceMapStore", FakeResourceMapStore)
     monkeypatch.setattr(mod, "HardwareCatalogStore", FakeCatalogStore)
 
@@ -280,7 +282,9 @@ def test_refresh_capacity_reuses_fresh_stored_catalog(monkeypatch):
             return mod.CatalogSnapshot(catalog=_catalog(), updated_at=datetime.now(UTC))
 
     monkeypatch.setattr(mod, "build_catalogs", lambda regions: built.append(regions) or _catalog())
-    monkeypatch.setattr(mod, "fetch_reservations", lambda region: [_cr("g6e.12xlarge", "us-east-2a", 2)])
+    monkeypatch.setattr(
+        mod, "fetch_reservations", lambda region: [_cr("g6e.12xlarge", "us-east-2a", 2)]
+    )
     monkeypatch.setattr(mod, "ResourceMapStore", FakeResourceMapStore)
     monkeypatch.setattr(mod, "HardwareCatalogStore", FakeCatalogStore)
 
@@ -296,8 +300,10 @@ def test_capacity_refresher_runs_only_when_due(monkeypatch):
     monkeypatch.setattr(
         mod,
         "refresh_capacity",
-        lambda client, user_id, regions, **kwargs: calls.append((client, user_id, regions, kwargs))
-        or mod.CatalogSnapshot(catalog={}, updated_at=datetime.now(UTC)),
+        lambda client, user_id, regions, **kwargs: (
+            calls.append((client, user_id, regions, kwargs))
+            or mod.CatalogSnapshot(catalog={}, updated_at=datetime.now(UTC))
+        ),
     )
     refresher = CapacityRefresher("client", "user_1", ["us-east-2"], refresh_seconds=10)
     start = datetime(2026, 1, 1, tzinfo=UTC)
