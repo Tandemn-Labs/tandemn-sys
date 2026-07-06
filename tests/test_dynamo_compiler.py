@@ -48,21 +48,19 @@ def test_compile_job_renders_global_topology_for_three_gpu_pools():
     by_name = _objects_by_name(objects)
 
     assert list(by_name) == [
-        "job-online-001-global-router-config",
-        "job-online-001-ctrl",
-        "job-online-001-aggregate-p5-48xlarge-h100",
-        "job-online-001-aggregate-g6e-12xlarge-l40s",
-        "job-online-001-aggregate-g5-4xlarge-a10",
+        "tdm-online-001-grc",
+        "tdm-online-001-ctrl",
+        "tdm-online-001-c1c7dc72",
+        "tdm-online-001-0dfb3ae9",
+        "tdm-online-001-9a5f4df3",
     ]
 
-    router_config = json.loads(
-        by_name["job-online-001-global-router-config"]["data"]["global_router_config.json"]
-    )
+    router_config = json.loads(by_name["tdm-online-001-grc"]["data"]["global_router_config.json"])
     assert router_config["mode"] == "agg"
     assert router_config["agg_pool_dynamo_namespaces"] == [
-        "default-job-online-001-aggregate-p5-48xlarge-h100",
-        "default-job-online-001-aggregate-g6e-12xlarge-l40s",
-        "default-job-online-001-aggregate-g5-4xlarge-a10",
+        "default-tdm-online-001-c1c7dc72",
+        "default-tdm-online-001-0dfb3ae9",
+        "default-tdm-online-001-9a5f4df3",
     ]
     router_strategy = router_config["agg_pool_selection_strategy"]
     assert router_strategy["ttft_min"] == 0
@@ -72,7 +70,7 @@ def test_compile_job_renders_global_topology_for_three_gpu_pools():
     assert router_strategy["agg_pool_mapping"] == [[0], [1], [2]]
     assert router_strategy["priority_overrides"] == []
 
-    global_router = by_name["job-online-001-ctrl"]["spec"]["services"]["GlobalRouter"]
+    global_router = by_name["tdm-online-001-ctrl"]["spec"]["services"]["GlobalRouter"]
     assert global_router["extraPodSpec"]["mainContainer"]["args"][-4:] == [
         "--default-ttft-target",
         "500.0",
@@ -80,10 +78,9 @@ def test_compile_job_renders_global_topology_for_three_gpu_pools():
         "50.0",
     ]
 
-    h100 = by_name["job-online-001-aggregate-p5-48xlarge-h100"]
+    h100 = by_name["tdm-online-001-c1c7dc72"]
     worker = h100["spec"]["services"]["VllmDecodeWorker"]
     assert worker["extraPodSpec"]["nodeSelector"] == {
-        "tandemn.ai/launch-class": "tdm-gpu-cr",
         "node.kubernetes.io/instance-type": "p5.48xlarge",
         "karpenter.sh/capacity-type": "reserved",
     }
@@ -108,20 +105,46 @@ def test_duplicate_chains_compile_to_one_pool_with_max_budget():
     by_name = _objects_by_name(objects)
 
     assert list(by_name) == [
-        "job-online-001-global-router-config",
-        "job-online-001-ctrl",
-        "job-online-001-aggregate-g6e-12xlarge-l40s",
+        "tdm-online-001-grc",
+        "tdm-online-001-ctrl",
+        "tdm-online-001-0dfb3ae9",
     ]
-    pool = by_name["job-online-001-aggregate-g6e-12xlarge-l40s"]
+    pool = by_name["tdm-online-001-0dfb3ae9"]
     planner = pool["spec"]["services"]["Planner"]
     planner_config = json.loads(planner["extraPodSpec"]["mainContainer"]["args"][1])
 
-    assert pool["spec"]["services"]["VllmDecodeWorker"]["replicas"] == 1
+    # The DGDSA owns worker replicas (scalingAdapter enabled); Orca must not
+    # claim the field or every re-apply would fight the Planner's scaling.
+    worker = pool["spec"]["services"]["VllmDecodeWorker"]
+    assert "replicas" not in worker
+    assert worker["scalingAdapter"] == {"enabled": True}
     assert planner_config["load_predictor"] == "prophet"
     assert planner_config["ttft"] == 500.0
     assert planner_config["itl"] == 50.0
     assert planner_config["max_gpu_budget"] == 3
     assert planner_config["decode_engine_num_gpu"] == 1
+
+
+def test_rank_id_pools_per_rung_and_labels_worker_pods():
+    first = _chain("g6e.12xlarge", "L40S")
+    second = _chain("g6e.12xlarge", "L40S")
+    first.shape_json["rank_id"] = "rank_0"
+    second.shape_json["rank_id"] = "rank_1"
+
+    objects = compile_job("job_online_001", [first, second])
+    by_name = _objects_by_name(objects)
+
+    # Same-shape rungs stay separate pools when rank_id is present.
+    assert list(by_name) == [
+        "tdm-online-001-grc",
+        "tdm-online-001-ctrl",
+        "tdm-online-001-rank-0",
+        "tdm-online-001-rank-1",
+    ]
+    worker = by_name["tdm-online-001-rank-0"]["spec"]["services"]["VllmDecodeWorker"]
+    assert worker["extraPodMetadata"] == {
+        "labels": {"tandemn.ai/job-id": "job_online_001", "tandemn.ai/rank-id": "rank_0"}
+    }
 
 
 def test_pool_key_and_selector_are_from_chain_shape():
@@ -130,7 +153,6 @@ def test_pool_key_and_selector_are_from_chain_shape():
     assert pool_key(chain) == "aggregate-g5-4xlarge-a10"
     assert list(group_chains([chain])) == ["aggregate-g5-4xlarge-a10"]
     assert node_selector(chain.shape_json) == {
-        "tandemn.ai/launch-class": "tdm-gpu-cr",
         "node.kubernetes.io/instance-type": "g5.4xlarge",
         "karpenter.sh/capacity-type": "reserved",
     }

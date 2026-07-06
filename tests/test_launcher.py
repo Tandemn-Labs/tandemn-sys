@@ -61,7 +61,7 @@ def test_dynamo_launcher_applies_desired_and_deletes_stale():
 
     applied_names = {obj["metadata"]["name"] for obj in k8s.applied[0]}
     assert k8s.job_id == "job_online_001"
-    assert "job-online-001-ctrl" in applied_names
+    assert "tdm-online-001-ctrl" in applied_names
     assert k8s.deleted == [
         {("ConfigMap", "stale-config"), ("DynamoGraphDeployment", "job-online-001-aggregate-old")}
     ]
