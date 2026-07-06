@@ -57,6 +57,7 @@ DEFAULT_FABRIC_TYPE = "default"
 # region) fails fast instead of stalling a full-fleet scan.
 _EC2_CONFIG = Config(connect_timeout=5, read_timeout=10, retries={"max_attempts": 2})
 
+
 @dataclass
 class CatalogSnapshot:
     catalog: dict[str, Any]

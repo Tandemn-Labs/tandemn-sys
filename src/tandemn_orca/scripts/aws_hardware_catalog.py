@@ -17,7 +17,7 @@ PRICING_REGION = "us-east-1"
 _AWS_CONFIG = Config(connect_timeout=5, read_timeout=20, retries={"max_attempts": 2})
 NA = "NA"
 
-#TODO - Remove these hardcoded fields
+# TODO - Remove these hardcoded fields
 GPU_SPEC_FIELDS = (
     "canonical_gpu_name",
     "gpu_bandwidth_gbps",
@@ -231,18 +231,20 @@ def fetch_on_demand_prices(region: str, instance_types: list[str]) -> dict[str, 
         return {}
 
     try:
-        pages = boto3.client("pricing", region_name=PRICING_REGION, config=_AWS_CONFIG).get_paginator(
-            "get_products"
-        ).paginate(
-            ServiceCode="AmazonEC2",
-            Filters=[
-                {"Type": "TERM_MATCH", "Field": "regionCode", "Value": region},
-                {"Type": "TERM_MATCH", "Field": "operatingSystem", "Value": "Linux"},
-                {"Type": "TERM_MATCH", "Field": "tenancy", "Value": "Shared"},
-                {"Type": "TERM_MATCH", "Field": "preInstalledSw", "Value": "NA"},
-                {"Type": "TERM_MATCH", "Field": "capacitystatus", "Value": "Used"},
-                {"Type": "TERM_MATCH", "Field": "licenseModel", "Value": "No License required"},
-            ],
+        pages = (
+            boto3.client("pricing", region_name=PRICING_REGION, config=_AWS_CONFIG)
+            .get_paginator("get_products")
+            .paginate(
+                ServiceCode="AmazonEC2",
+                Filters=[
+                    {"Type": "TERM_MATCH", "Field": "regionCode", "Value": region},
+                    {"Type": "TERM_MATCH", "Field": "operatingSystem", "Value": "Linux"},
+                    {"Type": "TERM_MATCH", "Field": "tenancy", "Value": "Shared"},
+                    {"Type": "TERM_MATCH", "Field": "preInstalledSw", "Value": "NA"},
+                    {"Type": "TERM_MATCH", "Field": "capacitystatus", "Value": "Used"},
+                    {"Type": "TERM_MATCH", "Field": "licenseModel", "Value": "No License required"},
+                ],
+            )
         )
     except (BotoCoreError, ClientError) as error:
         warn_skipped_aws_call(f"on-demand prices for {region}", error)
@@ -270,9 +272,11 @@ def fetch_spot_prices(region: str, instance_types: list[str]) -> dict[str, dict[
         return {}
 
     try:
-        pages = boto3.client("ec2", region_name=region, config=_AWS_CONFIG).get_paginator(
-            "describe_spot_price_history"
-        ).paginate(ProductDescriptions=["Linux/UNIX"], InstanceTypes=instance_types)
+        pages = (
+            boto3.client("ec2", region_name=region, config=_AWS_CONFIG)
+            .get_paginator("describe_spot_price_history")
+            .paginate(ProductDescriptions=["Linux/UNIX"], InstanceTypes=instance_types)
+        )
     except (BotoCoreError, ClientError) as error:
         warn_skipped_aws_call(f"spot prices for {region}", error)
         return {}
