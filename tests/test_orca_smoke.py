@@ -36,6 +36,8 @@ EXPLICIT_LADDER = [
         },
         "n_replicas": 3,
         "mechanism_id": "queueing_under_burst",
+        "predicted_y": {"p99_ttft_ms": 120.0},
+        "predicted_v": {"kv_cache_util": 0.4},
     }
 ]
 
@@ -130,6 +132,8 @@ def test_ladder_to_chains_accepts_explicit_koi_rank():
         "rank_id": "rank_0",
         "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
         "mechanism_id": "queueing_under_burst",
+        "predicted_y": {"p99_ttft_ms": 120.0},
+        "predicted_v": {"kv_cache_util": 0.4},
         "target_p99_ttft_ms": 500.0,
         "target_p99_tpot_ms": 50.0,
     }
