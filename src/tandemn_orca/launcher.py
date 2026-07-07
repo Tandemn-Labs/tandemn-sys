@@ -12,8 +12,8 @@ infrastructure.
 from __future__ import annotations
 
 import logging
-from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Protocol
+from collections.abc import Callable
+from typing import Protocol
 
 from tandemn_system_data.models.chain import Chain
 
@@ -96,20 +96,16 @@ class DynamoLauncher:
         self.k8s.delete_all_for_job(job_id)
 
     def _apply_and_delete(self, desired: list[dict], stale: set[ObjectKey]) -> None:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            apply_future = pool.submit(self.k8s.apply_many, desired)
-            delete_future = pool.submit(self.k8s.delete_many, stale)
 
-            apply_error = _future_error(apply_future)
-            delete_error = _future_error(delete_future)
-
+        apply_error = _call(self.k8s.apply_many, desired)
+        delete_error = _call(self.k8s.delete_many, stale)
         if apply_error or delete_error:
             raise ReconcileError(apply_error, delete_error)
 
 
-def _future_error(future: Future[Any]) -> BaseException | None:
+def _call[T](fn: Callable[[T], object], arg: T) -> BaseException | None:
     try:
-        future.result()
+        fn(arg)
     except BaseException as exc:
         return exc
     return None
