@@ -92,6 +92,9 @@ def ladder_to_chains(
             shape_json["env"] = list(env) if isinstance(env, (list, tuple)) else env
         if entry.get("mechanism_id") is not None:
             shape_json["mechanism_id"] = entry["mechanism_id"]
+        for key in ("predicted_y", "predicted_v"):
+            if isinstance(entry.get(key), dict):
+                shape_json[key] = dict(entry[key])
         if target_p99_ttft_ms is not None:
             shape_json["target_p99_ttft_ms"] = target_p99_ttft_ms
         if target_p99_tpot_ms is not None:
