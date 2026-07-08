@@ -347,6 +347,7 @@ def worker_args(shape: dict[str, Any]) -> list[str]:
     args = ["--model", required(shape, "model_id")]
     optional = {
         "tp": "--tensor-parallel-size",
+        "pp": "--pipeline-parallel-size",
         "max_num_seq": "--max-num-seqs",
         "max_num_batched_tokens": "--max-num-batched-tokens",
         "gpu_mem_util": "--gpu-memory-utilization",
