@@ -351,13 +351,43 @@ def worker_args(shape: dict[str, Any]) -> list[str]:
         "max_num_seq": "--max-num-seqs",
         "max_num_batched_tokens": "--max-num-batched-tokens",
         "gpu_mem_util": "--gpu-memory-utilization",
+        "max_model_len": "--max-model-len",
+        "block_size": "--block-size",
+        "kvcache_dtype": "--kv-cache-dtype",
+        "scheduling_policy": "--scheduling-policy",
     }
     for key, flag in optional.items():
         if key in shape:
             args.extend([flag, str(shape[key])])
     if shape.get("prefix_cache_enabled") is True:
         args.append("--enable-prefix-caching")
+    if shape.get("chunked_prefill_enable") is True:
+        args.append("--enable-chunked-prefill")
+    dtype = _vllm_dtype(shape)
+    if dtype:
+        args.extend(["--dtype", dtype])
+    quantization = shape.get("weight_quantization_method")
+    if quantization and str(quantization).lower() != "none":
+        args.extend(["--quantization", str(quantization)])
+    if shape.get("spec_decoding_enabled") is True:
+        spec_method = shape.get("spec_decoding_method")
+        draft_model = shape.get("draft_model_id")
+        spec_tokens = shape.get("num_speculative_tokens")
+        if spec_method and str(spec_method).lower() != "none":
+            args.extend(["--spec-method", str(spec_method)])
+        if draft_model:
+            args.extend(["--spec-model", str(draft_model)])
+        if spec_tokens:
+            args.extend(["--spec-tokens", str(spec_tokens)])
     return args
+
+
+def _vllm_dtype(shape: dict[str, Any]) -> str | None:
+    weight = shape.get("weight_dtype")
+    activation = shape.get("activation_dtype")
+    if weight and activation and str(weight) != str(activation):
+        raise ValueError("weight_dtype and activation_dtype must match for vLLM --dtype")
+    return str(weight or activation) if weight or activation else None
 
 
 def planner_config(job_id: str, key: str, chains: list[Chain], namespace: str) -> str:
