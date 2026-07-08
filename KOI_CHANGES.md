@@ -93,6 +93,45 @@ smoke tests). The FSM must be constructed with it, using the **same user id**
 Orca runs with (`TANDEMN_USER_ID`) — Orca polls `plans.unapplied(user_id)`
 and a mismatched id means plans are never picked up.
 
+## 8. Design question: plan backlog can carry stale, conflicting decisions
+
+Orca applies **every** unapplied plan for a user in one poll pass
+(`orca.py:apply_pending`), oldest first, each one fully (all its per-job
+actions) — not just the newest. This is intentional: plans are meant to be an
+append-only decision log (like `events`/`evidence_rows`), so every plan Koi
+writes gets executed, in order, exactly once. In steady state this is a
+non-issue: Koi's default `tick_interval_sec` is 300s and Orca polls every 5s,
+so Orca always drains the single pending plan long before the next tick
+exists.
+
+The gap: Koi's `S0 ENTER_TICK` snapshot (`snapshot_cluster_state`) reads job
+state as Orca has already applied it. If Orca ever falls behind (down or slow
+for multiple tick intervals), Koi's next tick doesn't know a plan is still
+sitting unapplied for job X — it can produce a *second*, possibly conflicting
+decision for the same job from the same stale snapshot (e.g. tick N says
+`place`, tick N+1 also says `place` or now says `swap`, neither aware the
+other is unapplied). Orca then executes both back-to-back: real chains
+launched + DGDs applied for the older plan, immediately superseded by the
+newer one. Not a correctness bug — the launcher's diff-based reconcile always
+converges to whatever was applied last — but it is wasted GPU-provisioning
+churn exactly when the cluster is already stressed (which is usually *why*
+Orca fell behind).
+
+**This can't be fixed from Orca's side alone**: throttling how many queued
+plans Orca applies per tick doesn't help — the conflicting decisions are
+already committed to Postgres by the time Orca sees them; spacing their
+application out in time doesn't change what gets applied, only when.
+Skipping straight to the newest plan and discarding older unapplied ones
+*would* fix the churn, but breaks the "every plan is applied" audit guarantee
+that the evidence/learning loop may depend on (unconfirmed — needs your
+input).
+
+**Ask:** does Koi's tick loop need to know "is there still an unapplied plan
+for this user?" before deciding again — e.g. skip S6_DEPLOY / hold at S0 if
+`plans.unapplied(user_id)` is non-empty? Or is a plan backlog of >1 an
+accepted, rare condition whose resulting churn is fine? Either answer is
+workable; we just want it to be a decision rather than an accident.
+
 ## Reference: what Orca guarantees back
 
 - Jobs are created via `tandemn-submit-job` (spec_json carries `model_id`);
