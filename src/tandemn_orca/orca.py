@@ -83,6 +83,9 @@ def ladder_to_chains(
             continue
         shape_json = dict(config)
         shape_json["count"] = count
+        shape_json.setdefault("sp", 1)
+        shape_json.setdefault("ep", 1)
+        shape_json.setdefault("cp", 1)
         # Koi's logical rank id; preserved so DGDs/pods/telemetry group the
         # rank's chains under the same key Koi uses in its evidence rows.
         if entry.get("rank_id") is not None:

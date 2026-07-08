@@ -31,8 +31,16 @@ def _chain(instance_type: str, gpu_type: str, plan_id: str = "plan_1") -> Chain:
             "tp": 1,
             "max_num_seq": 64,
             "max_num_batched_tokens": 32768,
+            "max_model_len": 8192,
+            "block_size": 16,
+            "kvcache_dtype": "auto",
             "gpu_mem_util": 0.9,
+            "scheduling_policy": "fcfs",
             "prefix_cache_enabled": True,
+            "chunked_prefill_enable": True,
+            "weight_dtype": "bfloat16",
+            "activation_dtype": "bfloat16",
+            "weight_quantization_method": "none",
             "env": ["reserved", "aws", "us-east-2", "use2-az3", gpu_type],
         },
     )
@@ -102,7 +110,18 @@ def test_compile_job_renders_global_topology_for_three_gpu_pools():
         "32768",
         "--gpu-memory-utilization",
         "0.9",
+        "--max-model-len",
+        "8192",
+        "--block-size",
+        "16",
+        "--kv-cache-dtype",
+        "auto",
+        "--scheduling-policy",
+        "fcfs",
         "--enable-prefix-caching",
+        "--enable-chunked-prefill",
+        "--dtype",
+        "bfloat16",
     ]
 
 
@@ -176,3 +195,25 @@ def test_pool_key_and_selector_are_from_chain_shape():
         "node.kubernetes.io/instance-type": "g5.4xlarge",
         "karpenter.sh/capacity-type": "reserved",
     }
+
+
+def test_worker_args_adds_quantization_and_spec_decoding_flags():
+    shape = dict(_chain("p5.48xlarge", "H100").shape_json)
+    shape.update(
+        {
+            "weight_quantization_method": "awq",
+            "spec_decoding_enabled": True,
+            "spec_decoding_method": "draft_model",
+            "draft_model_id": "draft/model",
+            "num_speculative_tokens": 4,
+        }
+    )
+
+    args = worker_args(shape)
+
+    assert "--quantization" in args
+    assert args[args.index("--quantization") + 1] == "awq"
+    assert "--spec-method" in args
+    assert args[args.index("--spec-method") + 1] == "draft_model"
+    assert args[args.index("--spec-model") + 1] == "draft/model"
+    assert args[args.index("--spec-tokens") + 1] == "4"
