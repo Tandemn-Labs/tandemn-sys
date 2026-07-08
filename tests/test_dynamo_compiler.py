@@ -5,7 +5,13 @@ import json
 from tandemn_system_data.models.chain import Chain
 from tandemn_system_data.models.enums import ChainRole
 
-from tandemn_orca.dynamo_compiler import compile_job, group_chains, node_selector, pool_key
+from tandemn_orca.dynamo_compiler import (
+    compile_job,
+    group_chains,
+    node_selector,
+    pool_key,
+    worker_args,
+)
 
 
 def _chain(instance_type: str, gpu_type: str, plan_id: str = "plan_1") -> Chain:
@@ -145,6 +151,20 @@ def test_rank_id_pools_per_rung_and_labels_worker_pods():
     assert worker["extraPodMetadata"] == {
         "labels": {"tandemn.ai/job-id": "job_online_001", "tandemn.ai/rank-id": "rank_0"}
     }
+
+
+def test_worker_args_maps_tp_and_pp():
+    shape = {"model_id": "m", "tp": 2, "pp": 4}
+    args = worker_args(shape)
+    assert "--tensor-parallel-size" in args
+    assert args[args.index("--tensor-parallel-size") + 1] == "2"
+    assert "--pipeline-parallel-size" in args
+    assert args[args.index("--pipeline-parallel-size") + 1] == "4"
+
+
+def test_worker_args_omits_pp_when_absent():
+    args = worker_args({"model_id": "m", "tp": 1})
+    assert "--pipeline-parallel-size" not in args
 
 
 def test_pool_key_and_selector_are_from_chain_shape():
