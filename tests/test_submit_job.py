@@ -61,6 +61,44 @@ def test_nested_job_features_override_defaults():
     assert spec["job_features"]["isl_token_avg"] == 2000
 
 
+def test_runtime_policy_invalid_values_are_forced(capsys):
+    spec = submit_job.normalize_job_spec(
+        {
+            "model_id": "m",
+            "target_p99_ttft_ms": 800,
+            "target_p99_tpot_ms": 80,
+            "preemption_policy": "recompute",
+            "router_policy": "kv_aware",
+        },
+        JobKind.ONLINE,
+    )
+
+    features = spec["job_features"]
+    assert features["preemption_policy"] == "lifo"
+    assert features["router_policy"] == "kv_router"
+    err = capsys.readouterr().err
+    assert "preemption_policy='recompute'" in err
+    assert "router_policy='kv_aware'" in err
+
+
+def test_runtime_policy_valid_values_are_kept(capsys):
+    spec = submit_job.normalize_job_spec(
+        {
+            "model_id": "m",
+            "target_p99_ttft_ms": 800,
+            "target_p99_tpot_ms": 80,
+            "preemption_policy": "fifo",
+            "router_policy": "kv_router",
+        },
+        JobKind.ONLINE,
+    )
+
+    features = spec["job_features"]
+    assert features["preemption_policy"] == "fifo"
+    assert features["router_policy"] == "kv_router"
+    assert capsys.readouterr().err == ""
+
+
 def test_invalid_priority_is_rejected():
     with pytest.raises(SystemExit, match="priority_class"):
         submit_job.normalize_job_spec(
