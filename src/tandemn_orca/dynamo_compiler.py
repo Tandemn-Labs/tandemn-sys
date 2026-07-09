@@ -2,6 +2,11 @@
 
 No Kubernetes calls live here; this file only returns dicts ready for server-side apply.
 
+``shape_json["count"]`` is always the chain's world size (total GPUs across
+tp/pp); ``shape_json["node_count"]`` (default 1) splits that world size across
+N physical nodes for multinode TP/PP, requiring Grove or LWS+Volcano installed
+-- the operator hard-rejects multinode DGDs without one.
+
 ponytail: GlobalRouter/GlobalPlanner (and the router ConfigMap) are currently unused in
 practice -- Koi owns cross-pool GPU budgeting at plan time, and single-pool jobs need no
 cross-pool routing. Kept for when multi-pool SLA routing / fast-loop rebalancing is needed.
@@ -251,7 +256,17 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
     name = pool_dgd_name(job_id, key, chains)
     shape = chains[0].shape_json
     plan_id = chains[0].plan_id
+    # gpu_count is the chain's world size (tp * pp, ... total GPUs); split
+    # across node_count physical nodes for multinode TP/PP (default: one node,
+    # gpus_per_node == gpu_count, byte-identical to the single-node DGD).
     gpu_count = worker_gpu_count(chains)
+    node_count = chain_node_count(chains)
+    if gpu_count % node_count != 0:
+        raise ValueError(
+            f"chain {chains[0].chain_id}: count={gpu_count} does not divide "
+            f"evenly across node_count={node_count}"
+        )
+    gpus_per_node = gpu_count // node_count
     return {
         "apiVersion": "nvidia.com/v1alpha1",
         "kind": "DynamoGraphDeployment",
@@ -298,9 +313,13 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
                         }
                     },
                     "resources": {
-                        "requests": {"gpu": str(gpu_count)},
-                        "limits": {"gpu": str(gpu_count)},
+                        "requests": {"gpu": str(gpus_per_node)},
+                        "limits": {"gpu": str(gpus_per_node)},
                     },
+                    # Only present for multinode chains; the operator rejects
+                    # multinode without Grove/LWS installed and asks LWS/Grove
+                    # to gang-schedule this many pods, one per node.
+                    **({"multinode": {"nodeCount": node_count}} if node_count > 1 else {}),
                     "extraPodSpec": {
                         "nodeSelector": node_selector(shape),
                         "tolerations": [
@@ -321,7 +340,7 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
                         "mainContainer": {
                             "image": RUNTIME_IMAGE,
                             "command": ["python3", "-m", "dynamo.planner"],
-                            "args": ["--config", planner_config(job_id, key, chains, namespace)],
+                            "args": ["--config", planner_config(chains)],
                         }
                     },
                 },
@@ -390,26 +409,37 @@ def _vllm_dtype(shape: dict[str, Any]) -> str | None:
     return str(weight or activation) if weight or activation else None
 
 
-def planner_config(job_id: str, key: str, chains: list[Chain], namespace: str) -> str:
+def planner_config(chains: list[Chain]) -> str:
+    """PlannerConfig for one pool's standalone (non-hierarchical) Planner.
+
+    Field names/values match the documented PlannerConfig reference
+    (docs/components/planner/planner-guide.md) -- a previous version of this
+    function used several fields that do not exist in that schema
+    (``global_planner_namespace``, ``decode_engine_num_gpu``, ``model_name``,
+    ``pool_key``) and the wrong ``environment`` (``global-planner`` is only
+    for the hierarchical GlobalPlanner setup; standalone per-pool Planners use
+    ``kubernetes``, the schema default).
+
+    ponytail: ``ttft_ms``/``itl_ms`` are the Reference-table field names; the
+    guide's own DGDR example uses the shorter ``ttft``/``itl`` for the same
+    fields, which the docs don't reconcile. Runtime-unverified which the
+    installed Planner binary actually accepts.
+    """
     shape = chains[0].shape_json
     config = {
-        "environment": "global-planner",
-        "global_planner_namespace": dynamo_namespace(namespace, dgd_name(job_id, "ctrl")),
-        "backend": required(shape, "engine_name"),
         "mode": "agg",
+        "backend": required(shape, "engine_name"),
+        "environment": "kubernetes",
         "optimization_target": "sla",
-        "ttft": required_float(shape, "target_p99_ttft_ms"),
-        "itl": required_float(shape, "target_p99_tpot_ms"),
         "enable_throughput_scaling": False,
         "enable_load_scaling": True,
         "pre_deployment_sweeping_mode": "none",
         "load_predictor": "prophet",
-        "load_adjustment_interval": 5,
+        "load_adjustment_interval_seconds": 5,
         "min_endpoint": 1,
         "max_gpu_budget": max_gpu_budget(chains),
-        "decode_engine_num_gpu": worker_gpu_count(chains),
-        "model_name": required(shape, "model_id"),
-        "pool_key": key,
+        "ttft_ms": required_float(shape, "target_p99_ttft_ms"),
+        "itl_ms": required_float(shape, "target_p99_tpot_ms"),
     }
     return json.dumps(config, separators=(",", ":"))
 
@@ -425,6 +455,14 @@ def worker_gpu_count(chains: list[Chain]) -> int:
     if type(count) is not int or count <= 0:
         raise ValueError(f"chain {chains[0].chain_id} missing positive int count")
     return count
+
+
+def chain_node_count(chains: list[Chain]) -> int:
+    """Physical nodes the chain's worker pod-group spans; 1 = single node."""
+    node_count = chains[0].shape_json.get("node_count", 1)
+    if type(node_count) is not int or node_count < 1:
+        raise ValueError(f"chain {chains[0].chain_id} node_count must be a positive int")
+    return node_count
 
 
 def max_gpu_budget(chains: list[Chain]) -> int:
