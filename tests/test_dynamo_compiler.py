@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from tandemn_system_data.models.chain import Chain
 from tandemn_system_data.models.enums import ChainRole
 
@@ -10,6 +11,7 @@ from tandemn_orca.dynamo_compiler import (
     group_chains,
     node_selector,
     pool_key,
+    render_pool_dgd,
     worker_args,
 )
 
@@ -143,11 +145,15 @@ def test_duplicate_chains_compile_to_one_pool_with_max_budget():
     worker = pool["spec"]["services"]["VllmDecodeWorker"]
     assert "replicas" not in worker
     assert worker["scalingAdapter"] == {"enabled": True}
+    assert planner_config["environment"] == "kubernetes"
     assert planner_config["load_predictor"] == "prophet"
-    assert planner_config["ttft"] == 500.0
-    assert planner_config["itl"] == 50.0
+    assert planner_config["ttft_ms"] == 500.0
+    assert planner_config["itl_ms"] == 50.0
     assert planner_config["max_gpu_budget"] == 3
-    assert planner_config["decode_engine_num_gpu"] == 1
+    assert "global_planner_namespace" not in planner_config
+    assert "decode_engine_num_gpu" not in planner_config
+    assert "model_name" not in planner_config
+    assert "pool_key" not in planner_config
 
 
 def test_rank_id_pools_per_rung_and_labels_worker_pods():
@@ -217,3 +223,32 @@ def test_worker_args_adds_quantization_and_spec_decoding_flags():
     assert args[args.index("--spec-method") + 1] == "draft_model"
     assert args[args.index("--spec-model") + 1] == "draft/model"
     assert args[args.index("--spec-tokens") + 1] == "4"
+
+
+def test_single_node_chain_has_no_multinode_block():
+    chain = _chain("g6.xlarge", "L4")
+    dgd = render_pool_dgd("job_1", pool_key(chain), [chain], "default")
+    worker = dgd["spec"]["services"]["VllmDecodeWorker"]
+
+    assert "multinode" not in worker
+    assert worker["resources"] == {"requests": {"gpu": "1"}, "limits": {"gpu": "1"}}
+
+
+def test_multinode_chain_splits_gpus_per_node():
+    chain = _chain("g6.xlarge", "L4")
+    chain.shape_json.update({"count": 2, "node_count": 2, "tp": 1, "pp": 2})
+    dgd = render_pool_dgd("job_1", pool_key(chain), [chain], "default")
+    worker = dgd["spec"]["services"]["VllmDecodeWorker"]
+
+    assert worker["multinode"] == {"nodeCount": 2}
+    # 2 total GPUs / 2 nodes = 1 GPU requested per node, not the world size.
+    assert worker["resources"] == {"requests": {"gpu": "1"}, "limits": {"gpu": "1"}}
+    args = worker["extraPodSpec"]["mainContainer"]["args"]
+    assert args[args.index("--pipeline-parallel-size") + 1] == "2"
+
+
+def test_multinode_uneven_gpu_split_raises():
+    chain = _chain("g6.xlarge", "L4")
+    chain.shape_json.update({"count": 3, "node_count": 2})
+    with pytest.raises(ValueError, match="does not divide evenly"):
+        render_pool_dgd("job_1", pool_key(chain), [chain], "default")
