@@ -43,6 +43,8 @@ WORKLOAD_DEFAULTS = {
     "total_token_budget": 1_000_000,
     "priority_class": "STANDARD",
     "max_concurrent_streaming": 10,
+    "preemption_policy": "lifo",
+    "router_policy": "kv_router",
 }
 USER_FEATURE_KEYS = frozenset(
     {
@@ -55,6 +57,8 @@ USER_FEATURE_KEYS = frozenset(
 DIST_TYPES = {"Constant", "Uniform", "Normal", "LogNormal", "Exponential"}
 ARRIVAL_PATTERNS = {"Poisson", "Constant", "Bursty", "Diurnal"}
 PRIORITY_CLASSES = {"HIGH", "STANDARD", "LOW"}
+PREEMPTION_POLICIES = {"lifo", "fifo"}
+ROUTER_POLICIES = {"kv_router"}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -89,6 +93,7 @@ def normalize_job_spec(spec: dict[str, Any], kind: JobKind) -> dict[str, Any]:
     features.update({key: value for key, value in spec.items() if key in USER_FEATURE_KEYS})
     features["model_id"] = model_id
     features["type"] = kind.value
+    _canonicalize_runtime_policy(features)
 
     if kind is JobKind.ONLINE:
         for key in ("target_p99_ttft_ms", "target_p99_tpot_ms"):
@@ -106,6 +111,21 @@ def normalize_job_spec(spec: dict[str, Any], kind: JobKind) -> dict[str, Any]:
     out["model_id"] = model_id
     out["job_features"] = features
     return out
+
+
+def _canonicalize_runtime_policy(features: dict[str, Any]) -> None:
+    _force_allowed(features, "preemption_policy", PREEMPTION_POLICIES, "lifo")
+    _force_allowed(features, "router_policy", ROUTER_POLICIES, "kv_router")
+
+
+def _force_allowed(features: dict[str, Any], key: str, allowed: set[str], default: str) -> None:
+    value = features.get(key)
+    if value in allowed:
+        return
+    message = f"--spec {key}={value!r} is unsupported; using {default!r}"
+    print(f"warning: {message}", file=sys.stderr)
+    logger.warning(message)
+    features[key] = default
 
 
 def _validate_features(features: dict[str, Any]) -> None:
