@@ -7,6 +7,20 @@ start ``waiting``; Koi's next pass may place them.
 ``--spec`` is the job's spec_json. It must carry ``model_id`` -- Koi's ladder
 configs do not, and Orca backfills chain shapes from the job spec.
 
+Online traffic intent is mutually exclusive. A user may submit either:
+
+* ``requestRate`` / ``request_arrival_rate``: peak request arrivals per second.
+  Orca stores this as ``request_arrival_rate`` and derives
+  ``max_concurrent_streaming``. Downstream Koi keeps request-rate mode and the
+  surrogate turns it into DynoSim ``arrival_interval_ms``.
+* ``concurrency`` / ``max_concurrent_streaming``: target active streaming
+  requests. Orca stores this as ``max_concurrent_streaming`` and derives
+  ``request_arrival_rate``. Downstream Koi keeps concurrency mode and the
+  surrogate turns it into DynoSim ``replay_concurrency``.
+
+Do not submit both. The derived field is only for Koi's existing X schema and
+throughput sizing; ``_traffic_mode`` records which user intent is authoritative.
+
 Postgres: ``TANDEMN_POSTGRES_URL`` (see tandemn-store).
 """
 
@@ -15,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from typing import Any
@@ -46,9 +61,21 @@ WORKLOAD_DEFAULTS = {
     "preemption_policy": "lifo",
     "router_policy": "kv_router",
 }
+TRAFFIC_ALIASES = {
+    "requestRate": "request_arrival_rate",
+    "concurrency": "max_concurrent_streaming",
+}
+# Metadata, not a Koi X: tells the surrogate whether the user meant
+# request-rate replay (arrival_interval_ms) or closed-loop replay_concurrency.
+TRAFFIC_MODE_KEY = "_traffic_mode"
+TRAFFIC_MODE_REQUEST_RATE = "request_rate"
+TRAFFIC_MODE_CONCURRENCY = "concurrency"
+REQUEST_RATE_KEYS = frozenset({"requestRate", "request_arrival_rate"})
+CONCURRENCY_KEYS = frozenset({"concurrency", "max_concurrent_streaming"})
 USER_FEATURE_KEYS = frozenset(
     {
         *WORKLOAD_DEFAULTS,
+        *TRAFFIC_ALIASES,
         "deadline_hrs",
         "target_p99_ttft_ms",
         "target_p99_tpot_ms",
@@ -85,12 +112,18 @@ def normalize_job_spec(spec: dict[str, Any], kind: JobKind) -> dict[str, Any]:
     if not model_id:
         raise SystemExit("--spec must include model_id (Orca backfills chain shapes from it)")
 
+    provided_request_rate = _has_any_user_key(spec, REQUEST_RATE_KEYS)
+    provided_concurrency = _has_any_user_key(spec, CONCURRENCY_KEYS)
+    if provided_request_rate and provided_concurrency:
+        raise SystemExit(
+            "--spec must provide only one of requestRate/request_arrival_rate or "
+            "concurrency/max_concurrent_streaming"
+        )
+
     features = dict(WORKLOAD_DEFAULTS)
     if isinstance(spec.get("job_features"), dict):
-        features.update(
-            {key: value for key, value in spec["job_features"].items() if key in USER_FEATURE_KEYS}
-        )
-    features.update({key: value for key, value in spec.items() if key in USER_FEATURE_KEYS})
+        features.update(_canonical_user_features(spec["job_features"]))
+    features.update(_canonical_user_features(spec))
     features["model_id"] = model_id
     features["type"] = kind.value
     _canonicalize_runtime_policy(features)
@@ -100,6 +133,7 @@ def normalize_job_spec(spec: dict[str, Any], kind: JobKind) -> dict[str, Any]:
             if features.get(key) is None:
                 raise SystemExit(f"--spec missing required field {key}")
         features.setdefault("deadline_hrs", 0)
+        _derive_online_traffic(features, provided_request_rate, provided_concurrency)
     else:
         deadline = features.get("deadline_hrs")
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or deadline <= 0:
@@ -111,6 +145,54 @@ def normalize_job_spec(spec: dict[str, Any], kind: JobKind) -> dict[str, Any]:
     out["model_id"] = model_id
     out["job_features"] = features
     return out
+
+
+def _canonical_user_features(source: dict[str, Any]) -> dict[str, Any]:
+    return {
+        TRAFFIC_ALIASES.get(key, key): value
+        for key, value in source.items()
+        if key in USER_FEATURE_KEYS
+    }
+
+
+def _has_any_user_key(spec: dict[str, Any], keys: frozenset[str]) -> bool:
+    if any(key in spec for key in keys):
+        return True
+    nested = spec.get("job_features")
+    return isinstance(nested, dict) and any(key in nested for key in keys)
+
+
+def _derive_online_traffic(
+    features: dict[str, Any], provided_request_rate: bool, provided_concurrency: bool
+) -> None:
+    if not provided_request_rate and not provided_concurrency:
+        features[TRAFFIC_MODE_KEY] = TRAFFIC_MODE_REQUEST_RATE
+        return
+    service_time_s = _target_service_time_seconds(features)
+    if provided_request_rate:
+        features[TRAFFIC_MODE_KEY] = TRAFFIC_MODE_REQUEST_RATE
+        request_rate = _positive_float(features, "request_arrival_rate")
+        features["request_arrival_rate"] = request_rate
+        features["max_concurrent_streaming"] = max(1, math.ceil(request_rate * service_time_s))
+        return
+    features[TRAFFIC_MODE_KEY] = TRAFFIC_MODE_CONCURRENCY
+    concurrency = max(1, math.ceil(_positive_float(features, "max_concurrent_streaming")))
+    features["max_concurrent_streaming"] = concurrency
+    features["request_arrival_rate"] = concurrency / service_time_s
+
+
+def _target_service_time_seconds(features: dict[str, Any]) -> float:
+    ttft_ms = _positive_float(features, "target_p99_ttft_ms")
+    tpot_ms = _positive_float(features, "target_p99_tpot_ms")
+    osl = _positive_float(features, "osl_token_avg")
+    return (ttft_ms + tpot_ms * osl) / 1000.0
+
+
+def _positive_float(features: dict[str, Any], key: str) -> float:
+    value = features.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise SystemExit(f"--spec field {key} must be a positive number")
+    return float(value)
 
 
 def _canonicalize_runtime_policy(features: dict[str, Any]) -> None:
@@ -137,10 +219,9 @@ def _validate_features(features: dict[str, Any]) -> None:
         "osl_token_min",
         "osl_token_max",
         "request_arrival_rate",
+        "max_concurrent_streaming",
     ):
-        value = features.get(key)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-            raise SystemExit(f"--spec field {key} must be a positive number")
+        _positive_float(features, key)
     for key, allowed in (
         ("isl_distribution_type", DIST_TYPES),
         ("osl_distribution_type", DIST_TYPES),
