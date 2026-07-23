@@ -24,6 +24,57 @@ def test_online_spec_gets_defaults_and_requires_latency_targets():
     assert features["pd_ratio"] == 4.0
     assert features["priority_class"] == "STANDARD"
     assert features["max_concurrent_streaming"] == 10
+    assert features["_traffic_mode"] == "request_rate"
+
+
+def test_request_rate_alias_derives_concurrency():
+    spec = submit_job.normalize_job_spec(
+        {
+            "model_id": "m",
+            "requestRate": 3,
+            "osl_token_avg": 10,
+            "target_p99_ttft_ms": 1000,
+            "target_p99_tpot_ms": 100,
+        },
+        JobKind.ONLINE,
+    )
+
+    features = spec["job_features"]
+    assert features["request_arrival_rate"] == 3.0
+    assert features["max_concurrent_streaming"] == 6
+    assert features["_traffic_mode"] == "request_rate"
+
+
+def test_concurrency_alias_derives_request_rate():
+    spec = submit_job.normalize_job_spec(
+        {
+            "model_id": "m",
+            "concurrency": 20,
+            "osl_token_avg": 10,
+            "target_p99_ttft_ms": 1000,
+            "target_p99_tpot_ms": 100,
+        },
+        JobKind.ONLINE,
+    )
+
+    features = spec["job_features"]
+    assert features["max_concurrent_streaming"] == 20
+    assert features["request_arrival_rate"] == 10.0
+    assert features["_traffic_mode"] == "concurrency"
+
+
+def test_request_rate_and_concurrency_are_mutually_exclusive():
+    with pytest.raises(SystemExit, match="only one"):
+        submit_job.normalize_job_spec(
+            {
+                "model_id": "m",
+                "requestRate": 3,
+                "concurrency": 20,
+                "target_p99_ttft_ms": 1000,
+                "target_p99_tpot_ms": 100,
+            },
+            JobKind.ONLINE,
+        )
 
 
 def test_online_requires_latency_targets():
