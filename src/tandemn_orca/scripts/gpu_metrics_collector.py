@@ -306,7 +306,7 @@ class KubeWorkerIndex:
 
     def by_pod(self) -> dict[str, WorkerInfo]:
         """All Dynamo worker pods in the namespace, keyed by pod name."""
-        selector = f"{_LABEL_COMPONENT}=worker"
+        selector = f"{_LABEL_COMPONENT} in (worker,decode,prefill)"
         pods = self._core.list_namespaced_pod(self._namespace, label_selector=selector).items
         index: dict[str, WorkerInfo] = {}
         for pod in pods:
