@@ -112,19 +112,6 @@ def dynamo_namespace(namespace: str, name: str) -> str:
     return f"{namespace}-{name}"
 
 
-# def render_router_configmap(
-#     job_id: str, groups: dict[str, list[Chain]], namespace: str
-# ) -> dict[str, Any]:
-#     name = dgd_name(job_id, "grc")
-#     plan_id = first_chain(groups).plan_id
-#     return {
-#         "apiVersion": "v1",
-#         "kind": "ConfigMap",
-#         "metadata": {"name": name, "labels": labels(job_id, plan_id, "control")},
-#         "data": {"global_router_config.json": render_router_config(job_id, groups, namespace)},
-#     }
-
-
 def render_router_config(job_id: str, groups: dict[str, list[Chain]], namespace: str) -> str:
     pool_namespaces = [
         dynamo_namespace(namespace, pool_dgd_name(job_id, key, group))
@@ -197,57 +184,6 @@ def render_control_dgd(
                         }
                     },
                 },
-                # "GlobalRouter": {
-                #     "componentType": "default",
-                #     "replicas": 1,
-                #     "extraPodSpec": {
-                #         "volumes": [
-                #             {
-                #                 "name": "global-router-config",
-                #                 "configMap": {"name": router_config_name},
-                #             }
-                #         ],
-                #         "mainContainer": {
-                #             "image": RUNTIME_IMAGE,
-                #             "command": ["python3", "-m", "dynamo.global_router"],
-                #             "args": [
-                #                 "--config",
-                #                 "/config/global_router_config.json",
-                #                 "--model-name",
-                #                 model,
-                #                 "--namespace",
-                #                 dynamo_namespace(namespace, name),
-                #                 "--default-ttft-target",
-                #                 str(required_float(shape, "target_p99_ttft_ms")),
-                #                 "--default-itl-target",
-                #                 str(required_float(shape, "target_p99_tpot_ms")),
-                #             ],
-                #             "volumeMounts": [
-                #                 {
-                #                     "name": "global-router-config",
-                #                     "mountPath": "/config",
-                #                     "readOnly": True,
-                #                 }
-                #             ],
-                #         },
-                #     },
-                # },
-                # "GlobalPlanner": {
-                #     "componentType": "planner",
-                #     "replicas": 1,
-                #     "extraPodSpec": {
-                #         "mainContainer": {
-                #             "image": RUNTIME_IMAGE,
-                #             "command": ["python3", "-m", "dynamo.global_planner"],
-                #             "args": [
-                #                 "--managed-namespaces",
-                #                 *managed_namespaces,
-                #                 "--max-total-gpus",
-                #                 str(sum(max_gpu_budget(group) for group in groups.values())),
-                #             ],
-                #         }
-                #     },
-                # },
             }
         },
     }
