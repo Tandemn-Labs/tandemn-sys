@@ -20,8 +20,9 @@ from typing import Any
 
 from tandemn_system_data.models.chain import Chain
 
-FRONTEND_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.0.2"
-RUNTIME_IMAGE = "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.2-efa-amd64"
+FRONTEND_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.2.1"
+RUNTIME_IMAGE = "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1"
+PLANNER_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.1"
 
 # The Dynamo operator's admission webhook requires len(DGD name) +
 # len(service name) <= 45 for pod naming; our longest service is
@@ -36,7 +37,7 @@ def compile_job(
     if not groups:
         return []
     return [
-        render_router_configmap(job_id, groups, namespace),
+        # render_router_configmap(job_id, groups, namespace),
         render_control_dgd(job_id, groups, namespace),
         *(render_pool_dgd(job_id, key, group, namespace) for key, group in groups.items()),
     ]
@@ -111,17 +112,17 @@ def dynamo_namespace(namespace: str, name: str) -> str:
     return f"{namespace}-{name}"
 
 
-def render_router_configmap(
-    job_id: str, groups: dict[str, list[Chain]], namespace: str
-) -> dict[str, Any]:
-    name = dgd_name(job_id, "grc")
-    plan_id = first_chain(groups).plan_id
-    return {
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {"name": name, "labels": labels(job_id, plan_id, "control")},
-        "data": {"global_router_config.json": render_router_config(job_id, groups, namespace)},
-    }
+# def render_router_configmap(
+#     job_id: str, groups: dict[str, list[Chain]], namespace: str
+# ) -> dict[str, Any]:
+#     name = dgd_name(job_id, "grc")
+#     plan_id = first_chain(groups).plan_id
+#     return {
+#         "apiVersion": "v1",
+#         "kind": "ConfigMap",
+#         "metadata": {"name": name, "labels": labels(job_id, plan_id, "control")},
+#         "data": {"global_router_config.json": render_router_config(job_id, groups, namespace)},
+#     }
 
 
 def render_router_config(job_id: str, groups: dict[str, list[Chain]], namespace: str) -> str:
@@ -196,57 +197,57 @@ def render_control_dgd(
                         }
                     },
                 },
-                "GlobalRouter": {
-                    "componentType": "default",
-                    "replicas": 1,
-                    "extraPodSpec": {
-                        "volumes": [
-                            {
-                                "name": "global-router-config",
-                                "configMap": {"name": router_config_name},
-                            }
-                        ],
-                        "mainContainer": {
-                            "image": RUNTIME_IMAGE,
-                            "command": ["python3", "-m", "dynamo.global_router"],
-                            "args": [
-                                "--config",
-                                "/config/global_router_config.json",
-                                "--model-name",
-                                model,
-                                "--namespace",
-                                dynamo_namespace(namespace, name),
-                                "--default-ttft-target",
-                                str(required_float(shape, "target_p99_ttft_ms")),
-                                "--default-itl-target",
-                                str(required_float(shape, "target_p99_tpot_ms")),
-                            ],
-                            "volumeMounts": [
-                                {
-                                    "name": "global-router-config",
-                                    "mountPath": "/config",
-                                    "readOnly": True,
-                                }
-                            ],
-                        },
-                    },
-                },
-                "GlobalPlanner": {
-                    "componentType": "planner",
-                    "replicas": 1,
-                    "extraPodSpec": {
-                        "mainContainer": {
-                            "image": RUNTIME_IMAGE,
-                            "command": ["python3", "-m", "dynamo.global_planner"],
-                            "args": [
-                                "--managed-namespaces",
-                                *managed_namespaces,
-                                "--max-total-gpus",
-                                str(sum(max_gpu_budget(group) for group in groups.values())),
-                            ],
-                        }
-                    },
-                },
+                # "GlobalRouter": {
+                #     "componentType": "default",
+                #     "replicas": 1,
+                #     "extraPodSpec": {
+                #         "volumes": [
+                #             {
+                #                 "name": "global-router-config",
+                #                 "configMap": {"name": router_config_name},
+                #             }
+                #         ],
+                #         "mainContainer": {
+                #             "image": RUNTIME_IMAGE,
+                #             "command": ["python3", "-m", "dynamo.global_router"],
+                #             "args": [
+                #                 "--config",
+                #                 "/config/global_router_config.json",
+                #                 "--model-name",
+                #                 model,
+                #                 "--namespace",
+                #                 dynamo_namespace(namespace, name),
+                #                 "--default-ttft-target",
+                #                 str(required_float(shape, "target_p99_ttft_ms")),
+                #                 "--default-itl-target",
+                #                 str(required_float(shape, "target_p99_tpot_ms")),
+                #             ],
+                #             "volumeMounts": [
+                #                 {
+                #                     "name": "global-router-config",
+                #                     "mountPath": "/config",
+                #                     "readOnly": True,
+                #                 }
+                #             ],
+                #         },
+                #     },
+                # },
+                # "GlobalPlanner": {
+                #     "componentType": "planner",
+                #     "replicas": 1,
+                #     "extraPodSpec": {
+                #         "mainContainer": {
+                #             "image": RUNTIME_IMAGE,
+                #             "command": ["python3", "-m", "dynamo.global_planner"],
+                #             "args": [
+                #                 "--managed-namespaces",
+                #                 *managed_namespaces,
+                #                 "--max-total-gpus",
+                #                 str(sum(max_gpu_budget(group) for group in groups.values())),
+                #             ],
+                #         }
+                #     },
+                # },
             }
         },
     }
@@ -272,6 +273,7 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
         "kind": "DynamoGraphDeployment",
         "metadata": {"name": name, "labels": labels(job_id, plan_id, "pool", key)},
         "spec": {
+            "backendFramework": required(shape, "engine_name"),
             "services": {
                 "LocalRouter": {
                     "componentType": "default",
@@ -338,7 +340,7 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
                     "replicas": 1,
                     "extraPodSpec": {
                         "mainContainer": {
-                            "image": RUNTIME_IMAGE,
+                            "image": PLANNER_IMAGE,
                             "command": ["python3", "-m", "dynamo.planner"],
                             "args": ["--config", planner_config(chains)],
                         }
