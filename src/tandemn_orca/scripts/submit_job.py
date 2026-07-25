@@ -54,6 +54,7 @@ WORKLOAD_DEFAULTS = {
     "workload_prefix_concentration": 0,
     "multi_turn_ratio": 0.5,
     "shared_prefix_length_avg": 500,
+    "sliding_window_attention": 0,
     "is_session_affinity": True,
     "total_token_budget": 1_000_000,
     "priority_class": "STANDARD",

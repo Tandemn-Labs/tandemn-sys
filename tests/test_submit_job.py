@@ -24,6 +24,7 @@ def test_online_spec_gets_defaults_and_requires_latency_targets():
     assert features["pd_ratio"] == 4.0
     assert features["priority_class"] == "STANDARD"
     assert features["max_concurrent_streaming"] == 10
+    assert features["sliding_window_attention"] == 0
     assert features["_traffic_mode"] == "request_rate"
 
 
