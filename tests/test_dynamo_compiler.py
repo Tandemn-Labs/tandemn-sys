@@ -52,7 +52,7 @@ def _objects_by_name(objects: list[dict]) -> dict[str, dict]:
     return {obj["metadata"]["name"]: obj for obj in objects}
 
 
-def test_compile_job_renders_global_topology_for_three_gpu_pools():
+def test_compile_job_renders_self_contained_dgd_for_each_gpu_pool():
     objects = compile_job(
         "job_online_001",
         [
@@ -64,37 +64,25 @@ def test_compile_job_renders_global_topology_for_three_gpu_pools():
     by_name = _objects_by_name(objects)
 
     assert list(by_name) == [
-        "tdm-online-001-grc",
-        "tdm-online-001-ctrl",
         "tdm-online-001-c1c7dc72",
         "tdm-online-001-0dfb3ae9",
         "tdm-online-001-9a5f4df3",
     ]
 
-    router_config = json.loads(by_name["tdm-online-001-grc"]["data"]["global_router_config.json"])
-    assert router_config["mode"] == "agg"
-    assert router_config["agg_pool_dynamo_namespaces"] == [
-        "default-tdm-online-001-c1c7dc72",
-        "default-tdm-online-001-0dfb3ae9",
-        "default-tdm-online-001-9a5f4df3",
-    ]
-    router_strategy = router_config["agg_pool_selection_strategy"]
-    assert router_strategy["ttft_min"] == 0
-    assert router_strategy["ttft_max"] == 500.0
-    assert router_strategy["itl_min"] == 0
-    assert router_strategy["itl_max"] == 50.0
-    assert router_strategy["agg_pool_mapping"] == [[0], [1], [2]]
-    assert router_strategy["priority_overrides"] == []
-
-    global_router = by_name["tdm-online-001-ctrl"]["spec"]["services"]["GlobalRouter"]
-    assert global_router["extraPodSpec"]["mainContainer"]["args"][-4:] == [
-        "--default-ttft-target",
-        "500.0",
-        "--default-itl-target",
-        "50.0",
-    ]
-
     h100 = by_name["tdm-online-001-c1c7dc72"]
+    assert list(h100["spec"]["services"]) == [
+        "Frontend",
+        "LocalRouter",
+        "VllmDecodeWorker",
+        "Planner",
+    ]
+    frontend = h100["spec"]["services"]["Frontend"]
+    assert frontend["extraPodSpec"]["mainContainer"]["args"] == [
+        "--router-mode",
+        "round-robin",
+        "--model-name",
+        "meta-llama/Llama-3.1-8B-Instruct",
+    ]
     worker = h100["spec"]["services"]["VllmDecodeWorker"]
     assert worker["extraPodSpec"]["nodeSelector"] == {
         "node.kubernetes.io/instance-type": "p5.48xlarge",
@@ -132,8 +120,6 @@ def test_duplicate_chains_compile_to_one_pool_with_max_budget():
     by_name = _objects_by_name(objects)
 
     assert list(by_name) == [
-        "tdm-online-001-grc",
-        "tdm-online-001-ctrl",
         "tdm-online-001-0dfb3ae9",
     ]
     pool = by_name["tdm-online-001-0dfb3ae9"]
@@ -167,8 +153,6 @@ def test_rank_id_pools_per_rung_and_labels_worker_pods():
 
     # Same-shape rungs stay separate pools when rank_id is present.
     assert list(by_name) == [
-        "tdm-online-001-grc",
-        "tdm-online-001-ctrl",
         "tdm-online-001-rank-0",
         "tdm-online-001-rank-1",
     ]

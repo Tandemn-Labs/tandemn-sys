@@ -7,9 +7,8 @@ tp/pp); ``shape_json["node_count"]`` (default 1) splits that world size across
 N physical nodes for multinode TP/PP, requiring Grove or LWS+Volcano installed
 -- the operator hard-rejects multinode DGDs without one.
 
-ponytail: GlobalRouter/GlobalPlanner (and the router ConfigMap) are currently unused in
-practice -- Koi owns cross-pool GPU budgeting at plan time, and single-pool jobs need no
-cross-pool routing. Kept for when multi-pool SLA routing / fast-loop rebalancing is needed.
+Each pool is a self-contained DGD with its own Frontend. Cross-pool selection belongs to
+the external Tandemn Router rather than Dynamo's GlobalRouter.
 """
 
 from __future__ import annotations
@@ -37,8 +36,6 @@ def compile_job(
     if not groups:
         return []
     return [
-        # render_router_configmap(job_id, groups, namespace),
-        render_control_dgd(job_id, groups, namespace),
         *(render_pool_dgd(job_id, key, group, namespace) for key, group in groups.items()),
     ]
 
@@ -112,83 +109,6 @@ def dynamo_namespace(namespace: str, name: str) -> str:
     return f"{namespace}-{name}"
 
 
-def render_router_config(job_id: str, groups: dict[str, list[Chain]], namespace: str) -> str:
-    pool_namespaces = [
-        dynamo_namespace(namespace, pool_dgd_name(job_id, key, group))
-        for key, group in groups.items()
-    ]
-    shape = first_chain(groups).shape_json
-    pool_count = len(pool_namespaces)
-    config = {
-        "mode": "agg",
-        "num_agg_pools": pool_count,
-        "agg_pool_dynamo_namespaces": pool_namespaces,
-        "agg_pool_selection_strategy": {
-            "ttft_min": 0,
-            "ttft_max": required_float(shape, "target_p99_ttft_ms"),
-            "ttft_resolution": pool_count,
-            "itl_min": 0,
-            "itl_max": required_float(shape, "target_p99_tpot_ms"),
-            "itl_resolution": 1,
-            "agg_pool_mapping": [[pool] for pool in range(pool_count)],
-            "priority_overrides": [],
-        },
-    }
-    return json.dumps(config, separators=(",", ":"))
-
-
-def render_control_dgd(
-    job_id: str, groups: dict[str, list[Chain]], namespace: str
-) -> dict[str, Any]:
-    name = dgd_name(job_id, "ctrl")
-    router_config_name = dgd_name(job_id, "grc")
-    shape = first_chain(groups).shape_json
-    model = required(shape, "model_id")
-    plan_id = first_chain(groups).plan_id
-    managed_namespaces = [
-        dynamo_namespace(namespace, pool_dgd_name(job_id, key, group))
-        for key, group in groups.items()
-    ]
-    return {
-        "apiVersion": "nvidia.com/v1alpha1",
-        "kind": "DynamoGraphDeployment",
-        "metadata": {"name": name, "labels": labels(job_id, plan_id, "control")},
-        "spec": {
-            "services": {
-                "Frontend": {
-                    "componentType": "frontend",
-                    "replicas": 1,
-                    "extraPodSpec": {
-                        "mainContainer": {
-                            "image": FRONTEND_IMAGE,
-                            # Pool DGDs are named {tdm-tag}-{rank}, so the
-                            # {namespace}-{tdm-tag} prefix lets the Frontend
-                            # discover workers in every pool namespace
-                            # (runtime-verified; a plain --namespace only sees
-                            # the ctrl namespace and serves no models).
-                            "env": [
-                                {
-                                    "name": "DYN_NAMESPACE_PREFIX",
-                                    "value": dynamo_namespace(namespace, dgd_name(job_id, "")),
-                                }
-                            ],
-                            "command": ["python3", "-m", "dynamo.frontend"],
-                            "args": [
-                                "--router-mode",
-                                "round-robin",
-                                "--namespace-prefix",
-                                dynamo_namespace(namespace, dgd_name(job_id, "")),
-                                "--model-name",
-                                model,
-                            ],
-                        }
-                    },
-                },
-            }
-        },
-    }
-
-
 def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) -> dict[str, Any]:
     name = pool_dgd_name(job_id, key, chains)
     shape = chains[0].shape_json
@@ -211,6 +131,22 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
         "spec": {
             "backendFramework": required(shape, "engine_name"),
             "services": {
+                "Frontend": {
+                    "componentType": "frontend",
+                    "replicas": 1,
+                    "extraPodSpec": {
+                        "mainContainer": {
+                            "image": FRONTEND_IMAGE,
+                            "command": ["python3", "-m", "dynamo.frontend"],
+                            "args": [
+                                "--router-mode",
+                                "round-robin",
+                                "--model-name",
+                                required(shape, "model_id"),
+                            ],
+                        }
+                    },
+                },
                 "LocalRouter": {
                     "componentType": "default",
                     "replicas": 1,
@@ -411,10 +347,6 @@ def max_gpu_budget(chains: list[Chain]) -> int:
             raise ValueError(f"chain {chain.chain_id} missing positive int count")
         total += count
     return total
-
-
-def first_chain(groups: dict[str, list[Chain]]) -> Chain:
-    return next(iter(groups.values()))[0]
 
 
 def required(shape: dict[str, Any], key: str) -> str:
