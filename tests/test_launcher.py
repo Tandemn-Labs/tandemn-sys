@@ -19,6 +19,7 @@ def _chain() -> Chain:
             "gpu_type": "L40S",
             "gpu_count": 1,
             "count": 1,
+            "rank_id": "rank_0",
             "target_p99_ttft_ms": 500.0,
             "target_p99_tpot_ms": 50.0,
             "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
@@ -61,7 +62,7 @@ def test_dynamo_launcher_applies_desired_and_deletes_stale():
 
     applied_names = {obj["metadata"]["name"] for obj in k8s.applied[0]}
     assert k8s.job_id == "job_online_001"
-    assert applied_names == {"tdm-online-001-0dfb3ae9"}
+    assert applied_names == {"tdm-online-001-rank-0"}
     assert k8s.deleted == [
         {("ConfigMap", "stale-config"), ("DynamoGraphDeployment", "job-online-001-aggregate-old")}
     ]

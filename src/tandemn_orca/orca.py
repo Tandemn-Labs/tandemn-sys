@@ -86,10 +86,12 @@ def ladder_to_chains(
         shape_json.setdefault("sp", 1)
         shape_json.setdefault("ep", 1)
         shape_json.setdefault("cp", 1)
-        # Koi's logical rank id; preserved so DGDs/pods/telemetry group the
-        # rank's chains under the same key Koi uses in its evidence rows.
-        if entry.get("rank_id") is not None:
-            shape_json["rank_id"] = str(entry["rank_id"])
+        # Koi's logical rank id; required so every DGD and pod has canonical
+        # identity matching Koi's evidence rows.
+        if not entry.get("rank_id"):
+            logger.warning("skipping ladder entry without rank_id: %r", entry)
+            continue
+        shape_json["rank_id"] = str(entry["rank_id"])
         env = entry.get("env")
         if env is not None:
             shape_json["env"] = list(env) if isinstance(env, (list, tuple)) else env

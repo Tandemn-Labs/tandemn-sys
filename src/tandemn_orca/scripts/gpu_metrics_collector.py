@@ -2,7 +2,7 @@
 
 One collector per cluster ("fleet mode"): every Dynamo worker pod in
 ``--namespace`` is tracked, across all DGDs and jobs. Identity is discovered,
-not configured: ``job_id`` + ``rank_id`` from the ``tandemn.ai/*`` pod labels
+not configured: ``job_id`` + ``rank_id`` from the ``tandemn.com/*`` pod labels
 Orca stamps, the served
 model from the worker's ``--model`` arg, the node's instance type from its
 ``node.kubernetes.io/instance-type`` label.
@@ -212,13 +212,12 @@ def _gpu_selector(target: dict[str, str]) -> str:
 #   chain = one serving unit == one worker (a DP replica within the rank)
 #   worker spans N GPUs (its local ranks) under TP/PP.
 _LABEL_DYN_NS = "nvidia.com/dynamo-namespace"
-_LABEL_COMPONENT = "nvidia.com/dynamo-component-type"
 # PD-disaggregation role of the worker: "prefill" | "decode" (absent = aggregated).
 _LABEL_SUBCOMPONENT = "nvidia.com/dynamo-sub-component-type"
-# Optional tandemn job-model labels (present when Orca launched the ladder).
-_LABEL_JOB = "tandemn.ai/job-id"
-_LABEL_RANK = "tandemn.ai/rank-id"
-_LABEL_CHAIN = "tandemn.ai/chain-id"
+_LABEL_DISCOVERY = "tandemn.com/pods-discovery"
+_LABEL_JOB = "tandemn.com/job-id"
+_LABEL_RANK = "tandemn.com/rank-id"
+_LABEL_CHAIN = "tandemn.com/chain-id"
 
 # Node label carrying the EC2 instance type (standard on EKS/Karpenter nodes).
 _NODE_LABEL_INSTANCE_TYPE = "node.kubernetes.io/instance-type"
@@ -306,13 +305,13 @@ class KubeWorkerIndex:
 
     def by_pod(self) -> dict[str, WorkerInfo]:
         """All Dynamo worker pods in the namespace, keyed by pod name."""
-        selector = f"{_LABEL_COMPONENT} in (worker,decode,prefill)"
+        selector = f"{_LABEL_DISCOVERY}=dynamo-worker"
         pods = self._core.list_namespaced_pod(self._namespace, label_selector=selector).items
         index: dict[str, WorkerInfo] = {}
         for pod in pods:
             labels = pod.metadata.labels or {}
             # A chain == a worker; fall back to the pod name when Orca did not
-            # stamp an explicit chain-id label. rank_id/job_id (the tandemn.ai
+            # stamp an explicit chain-id label. rank_id/job_id (the tandemn.com
             # labels) are only known when Orca launched the ladder, else None.
             chain_id = labels.get(_LABEL_CHAIN) or pod.metadata.name
             index[pod.metadata.name] = WorkerInfo(
@@ -348,7 +347,7 @@ def assign_canonical_chain_ids(workers_by_pod: dict[str, WorkerInfo], chains: li
 
     workers_by_rank: dict[str | None, list[WorkerInfo]] = {}
     for worker in workers_by_pod.values():
-        # chain_id != pod name means an explicit tandemn.ai/chain-id label.
+        # chain_id != pod name means an explicit tandemn.com/chain-id label.
         if worker.chain_id == worker.worker_id:
             workers_by_rank.setdefault(worker.rank_id, []).append(worker)
 
