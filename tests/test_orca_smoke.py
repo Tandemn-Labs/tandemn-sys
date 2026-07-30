@@ -161,11 +161,9 @@ def test_ladder_to_chains_skips_malformed():
         },
     ]
     chains = ladder_to_chains(ladder, job_id="j", plan_id="p")
-    assert len(chains) == 2
+    assert len(chains) == 1
     assert chains[0].role == ChainRole.AGGREGATE
-    # rank_id comes from Koi's ladder entry; entries without one carry none.
-    assert "rank_id" not in chains[0].shape_json
-    assert chains[1].shape_json["rank_id"] == "rank_7"
+    assert chains[0].shape_json["rank_id"] == "rank_7"
 
 
 def test_ladder_to_chains_backfills_launch_fields():
@@ -173,6 +171,7 @@ def test_ladder_to_chains_backfills_launch_fields():
     ladder = [
         {
             "role": "aggregate",
+            "rank_id": "rank_0",
             "env": ["on_demand", "aws", "us-east-1", "use1-az1", "L4"],
             "config": {"gpu_count": 2, "instance_type": "g6.12xlarge", "tp": 2},
         }

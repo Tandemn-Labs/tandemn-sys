@@ -2,14 +2,42 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from tandemn_system_data.models import Chain, ChainRole, ResourceMap
 
 from tandemn_orca.scripts.gpu_metrics_collector import (
+    KubeWorkerIndex,
     WorkerInfo,
     assign_canonical_chain_ids,
     collect_once,
     resolve_instance_price_per_hour,
 )
+
+
+def test_worker_index_uses_discovery_and_com_identity_labels():
+    pod = SimpleNamespace(
+        metadata=SimpleNamespace(
+            name="worker-1",
+            labels={
+                "tandemn.com/job-id": "job_1",
+                "tandemn.com/rank-id": "rank_0",
+                "tandemn.com/pods-discovery": "dynamo-worker",
+            },
+        ),
+        spec=SimpleNamespace(node_name="node-1", containers=[]),
+    )
+
+    class Core:
+        def list_namespaced_pod(self, namespace, label_selector):
+            self.query = namespace, label_selector
+            return SimpleNamespace(items=[pod])
+
+    core = Core()
+    worker = KubeWorkerIndex(core=core).by_pod()["worker-1"]
+
+    assert core.query == ("default", "tandemn.com/pods-discovery=dynamo-worker")
+    assert (worker.job_id, worker.rank_id) == ("job_1", "rank_0")
 
 
 class FakeProm:

@@ -63,7 +63,7 @@ class FakeCustom:
 
 def test_object_key_and_selector():
     assert object_key(_dgd("x")) == ("DynamoGraphDeployment", "x")
-    assert job_selector("job_1") == "tandemn.ai/managed-by=orca,tandemn.ai/job-id=job_1"
+    assert job_selector("job_1") == "tandemn.com/managed-by=orca,tandemn.com/job-id=job_1"
 
 
 def test_list_job_objects_reads_configmaps_and_dgds():
@@ -75,10 +75,10 @@ def test_list_job_objects_reads_configmaps_and_dgds():
         ("ConfigMap", "cm"),
         ("DynamoGraphDeployment", "dgd"),
     }
-    assert core.selector == ("ns", "tandemn.ai/managed-by=orca,tandemn.ai/job-id=job_1")
+    assert core.selector == ("ns", "tandemn.com/managed-by=orca,tandemn.com/job-id=job_1")
     assert custom.selector == (
         (GROUP, VERSION, "ns", DGD_PLURAL),
-        {"label_selector": "tandemn.ai/managed-by=orca,tandemn.ai/job-id=job_1"},
+        {"label_selector": "tandemn.com/managed-by=orca,tandemn.com/job-id=job_1"},
     )
 
 

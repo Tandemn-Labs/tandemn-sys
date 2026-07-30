@@ -16,7 +16,9 @@ from tandemn_orca.dynamo_compiler import (
 )
 
 
-def _chain(instance_type: str, gpu_type: str, plan_id: str = "plan_1") -> Chain:
+def _chain(
+    instance_type: str, gpu_type: str, plan_id: str = "plan_1", rank_id: str = "rank_0"
+) -> Chain:
     return Chain(
         job_id="job_online_001",
         plan_id=plan_id,
@@ -28,6 +30,7 @@ def _chain(instance_type: str, gpu_type: str, plan_id: str = "plan_1") -> Chain:
             "gpu_type": gpu_type,
             "gpu_count": 1,
             "count": 1,
+            "rank_id": rank_id,
             "target_p99_ttft_ms": 500.0,
             "target_p99_tpot_ms": 50.0,
             "tp": 1,
@@ -56,20 +59,20 @@ def test_compile_job_renders_self_contained_dgd_for_each_gpu_pool():
     objects = compile_job(
         "job_online_001",
         [
-            _chain("p5.48xlarge", "H100"),
-            _chain("g6e.12xlarge", "L40S"),
-            _chain("g5.4xlarge", "A10"),
+            _chain("p5.48xlarge", "H100", rank_id="rank_0"),
+            _chain("g6e.12xlarge", "L40S", rank_id="rank_1"),
+            _chain("g5.4xlarge", "A10", rank_id="rank_2"),
         ],
     )
     by_name = _objects_by_name(objects)
 
     assert list(by_name) == [
-        "tdm-online-001-c1c7dc72",
-        "tdm-online-001-0dfb3ae9",
-        "tdm-online-001-9a5f4df3",
+        "tdm-online-001-rank-0",
+        "tdm-online-001-rank-1",
+        "tdm-online-001-rank-2",
     ]
 
-    h100 = by_name["tdm-online-001-c1c7dc72"]
+    h100 = by_name["tdm-online-001-rank-0"]
     assert list(h100["spec"]["services"]) == [
         "Frontend",
         "LocalRouter",
@@ -83,6 +86,16 @@ def test_compile_job_renders_self_contained_dgd_for_each_gpu_pool():
         "--model-name",
         "meta-llama/Llama-3.1-8B-Instruct",
     ]
+    assert h100["metadata"]["labels"]["tandemn.com/job-id"] == "job_online_001"
+    assert h100["metadata"]["labels"]["tandemn.com/rank-id"] == "rank_0"
+    for service_name, service in h100["spec"]["services"].items():
+        expected = {
+            "tandemn.com/job-id": "job_online_001",
+            "tandemn.com/rank-id": "rank_0",
+        }
+        if service_name == "VllmDecodeWorker":
+            expected["tandemn.com/pods-discovery"] = "dynamo-worker"
+        assert service["extraPodMetadata"] == {"labels": expected}
     worker = h100["spec"]["services"]["VllmDecodeWorker"]
     assert worker["extraPodSpec"]["nodeSelector"] == {
         "node.kubernetes.io/instance-type": "p5.48xlarge",
@@ -120,9 +133,9 @@ def test_duplicate_chains_compile_to_one_pool_with_max_budget():
     by_name = _objects_by_name(objects)
 
     assert list(by_name) == [
-        "tdm-online-001-0dfb3ae9",
+        "tdm-online-001-rank-0",
     ]
-    pool = by_name["tdm-online-001-0dfb3ae9"]
+    pool = by_name["tdm-online-001-rank-0"]
     planner = pool["spec"]["services"]["Planner"]
     planner_config = json.loads(planner["extraPodSpec"]["mainContainer"]["args"][1])
 
@@ -142,7 +155,7 @@ def test_duplicate_chains_compile_to_one_pool_with_max_budget():
     assert "pool_key" not in planner_config
 
 
-def test_rank_id_pools_per_rung_and_labels_worker_pods():
+def test_rank_id_pools_per_rung():
     first = _chain("g6e.12xlarge", "L40S")
     second = _chain("g6e.12xlarge", "L40S")
     first.shape_json["rank_id"] = "rank_0"
@@ -156,10 +169,14 @@ def test_rank_id_pools_per_rung_and_labels_worker_pods():
         "tdm-online-001-rank-0",
         "tdm-online-001-rank-1",
     ]
-    worker = by_name["tdm-online-001-rank-0"]["spec"]["services"]["VllmDecodeWorker"]
-    assert worker["extraPodMetadata"] == {
-        "labels": {"tandemn.ai/job-id": "job_online_001", "tandemn.ai/rank-id": "rank_0"}
-    }
+
+
+def test_compile_job_requires_rank_id():
+    chain = _chain("g6e.12xlarge", "L40S")
+    del chain.shape_json["rank_id"]
+
+    with pytest.raises(ValueError, match="rank_id"):
+        compile_job("job_online_001", [chain])
 
 
 def test_worker_args_maps_tp_and_pp():
@@ -179,8 +196,8 @@ def test_worker_args_omits_pp_when_absent():
 def test_pool_key_and_selector_are_from_chain_shape():
     chain = _chain("g5.4xlarge", "A10")
 
-    assert pool_key(chain) == "aggregate-g5-4xlarge-a10"
-    assert list(group_chains([chain])) == ["aggregate-g5-4xlarge-a10"]
+    assert pool_key(chain) == "rank-0-g5-4xlarge-a10"
+    assert list(group_chains([chain])) == ["rank-0-g5-4xlarge-a10"]
     assert node_selector(chain.shape_json) == {
         "node.kubernetes.io/instance-type": "g5.4xlarge",
         "karpenter.sh/capacity-type": "reserved",

@@ -49,15 +49,8 @@ def group_chains(chains: list[Chain]) -> dict[str, list[Chain]]:
 
 def pool_key(chain: Chain) -> str:
     shape = chain.shape_json
-    # rank_id (Koi's ladder rank id, e.g. "rank_0") pools per rung so the
-    # rung's pods can carry one tandemn.ai/rank-id label; without it,
-    # same-shape rungs merge and rank identity is not attributable.
-    if shape.get("rank_id"):
-        return k8s_name(
-            f"{shape['rank_id']}-{required(shape, 'instance_type')}-{required(shape, 'gpu_type')}"
-        )
     return k8s_name(
-        f"{chain.role}-{required(shape, 'instance_type')}-{required(shape, 'gpu_type')}"
+        f"{required(shape, 'rank_id')}-{required(shape, 'instance_type')}-{required(shape, 'gpu_type')}"
     )
 
 
@@ -66,7 +59,7 @@ def dgd_name(job_id: str, suffix: str) -> str:
 
     The job tag is the ULID tail, not the full job id (a full
     ``job-01kwwez...`` already busts the operator's 45-char pod-naming
-    budget); the full job_id lives in the tandemn.ai/job-id label. A suffix
+    budget); the full job_id lives in the tandemn.com/job-id label. A suffix
     that would not fit is replaced by an 8-char hash of itself.
     """
     tag = k8s_name(job_id).removeprefix("job-")[-10:].strip("-")
@@ -83,26 +76,38 @@ def k8s_name(value: str) -> str:
 
 
 def pool_dgd_name(job_id: str, key: str, chains: list[Chain]) -> str:
-    """Pool DGD name, preferring the short rank_id over the descriptive key."""
-    return dgd_name(job_id, str(chains[0].shape_json.get("rank_id") or key))
+    """Pool DGD name using the canonical rank ID."""
+    return dgd_name(job_id, required(chains[0].shape_json, "rank_id"))
 
 
 def labels(
     job_id: str,
+    rank_id: str,
     plan_id: str | None,
     resource_kind: str,
     pool: str | None = None,
 ) -> dict[str, str]:
     result = {
-        "tandemn.ai/managed-by": "orca",
-        "tandemn.ai/job-id": job_id,
-        "tandemn.ai/resource-kind": resource_kind,
+        "tandemn.com/managed-by": "orca",
+        "tandemn.com/job-id": job_id,
+        "tandemn.com/rank-id": rank_id,
+        "tandemn.com/resource-kind": resource_kind,
     }
     if plan_id:
-        result["tandemn.ai/plan-id"] = plan_id
+        result["tandemn.com/plan-id"] = plan_id
     if pool:
-        result["tandemn.ai/pool-key"] = pool
+        result["tandemn.com/pool-key"] = pool
     return result
+
+
+def pod_metadata(job_id: str, rank_id: str, *, worker: bool = False) -> dict[str, Any]:
+    pod_labels = {
+        "tandemn.com/job-id": job_id,
+        "tandemn.com/rank-id": rank_id,
+    }
+    if worker:
+        pod_labels["tandemn.com/pods-discovery"] = "dynamo-worker"
+    return {"labels": pod_labels}
 
 
 def dynamo_namespace(namespace: str, name: str) -> str:
@@ -112,6 +117,7 @@ def dynamo_namespace(namespace: str, name: str) -> str:
 def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) -> dict[str, Any]:
     name = pool_dgd_name(job_id, key, chains)
     shape = chains[0].shape_json
+    rank_id = required(shape, "rank_id")
     plan_id = chains[0].plan_id
     # gpu_count is the chain's world size (tp * pp, ... total GPUs); split
     # across node_count physical nodes for multinode TP/PP (default: one node,
@@ -127,13 +133,17 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
     return {
         "apiVersion": "nvidia.com/v1alpha1",
         "kind": "DynamoGraphDeployment",
-        "metadata": {"name": name, "labels": labels(job_id, plan_id, "pool", key)},
+        "metadata": {
+            "name": name,
+            "labels": labels(job_id, rank_id, plan_id, "pool", key),
+        },
         "spec": {
             "backendFramework": required(shape, "engine_name"),
             "services": {
                 "Frontend": {
                     "componentType": "frontend",
                     "replicas": 1,
+                    "extraPodMetadata": pod_metadata(job_id, rank_id),
                     "extraPodSpec": {
                         "mainContainer": {
                             "image": FRONTEND_IMAGE,
@@ -150,6 +160,7 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
                 "LocalRouter": {
                     "componentType": "default",
                     "replicas": 1,
+                    "extraPodMetadata": pod_metadata(job_id, rank_id),
                     "extraPodSpec": {
                         "mainContainer": {
                             "image": RUNTIME_IMAGE,
@@ -173,19 +184,7 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
                     # would make every Orca re-apply fight the adapter (webhook
                     # rejection or a reset to the initial value).
                     "scalingAdapter": {"enabled": True},
-                    # The gpu-metrics collector lifts these pod labels: job-id
-                    # keys the pod to its job's chain rows, rank-id groups the
-                    # rung's chains/GPUs under one rank in gpu_metrics.
-                    "extraPodMetadata": {
-                        "labels": {
-                            "tandemn.ai/job-id": job_id,
-                            **(
-                                {"tandemn.ai/rank-id": str(shape["rank_id"])}
-                                if shape.get("rank_id")
-                                else {}
-                            ),
-                        }
-                    },
+                    "extraPodMetadata": pod_metadata(job_id, rank_id, worker=True),
                     "resources": {
                         "requests": {"gpu": str(gpus_per_node)},
                         "limits": {"gpu": str(gpus_per_node)},
@@ -210,6 +209,7 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
                 "Planner": {
                     "componentType": "planner",
                     "replicas": 1,
+                    "extraPodMetadata": pod_metadata(job_id, rank_id),
                     "extraPodSpec": {
                         "mainContainer": {
                             "image": PLANNER_IMAGE,
@@ -218,7 +218,7 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
                         }
                     },
                 },
-            }
+            },
         },
     }
 
@@ -226,7 +226,7 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
 def node_selector(shape: dict[str, Any]) -> dict[str, str]:
     capacity_type = capacity_type_for(shape)
     selector = {
-        # "tandemn.ai/launch-class": "tdm-gpu-cr" if capacity_type == "reserved" else "tdm-gpu-flex",
+        # "tandemn.com/launch-class": "tdm-gpu-cr" if capacity_type == "reserved" else "tdm-gpu-flex",
         "node.kubernetes.io/instance-type": required(shape, "instance_type"),
     }
     if capacity_type == "reserved":

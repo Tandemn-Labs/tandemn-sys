@@ -30,7 +30,7 @@ def object_key(obj: dict[str, Any]) -> ObjectKey:
 
 
 def job_selector(job_id: str) -> str:
-    return f"tandemn.ai/managed-by=orca,tandemn.ai/job-id={job_id}"
+    return f"tandemn.com/managed-by=orca,tandemn.com/job-id={job_id}"
 
 
 class DynamoKubernetesClient:
