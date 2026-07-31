@@ -92,6 +92,7 @@ def test_compile_job_renders_self_contained_dgd_for_each_gpu_pool():
         expected = {
             "tandemn.com/job-id": "job_online_001",
             "tandemn.com/rank-id": "rank_0",
+            "tandemn.com/plan-id": "plan_1",
         }
         if service_name == "VllmDecodeWorker":
             expected["tandemn.com/pods-discovery"] = "dynamo-worker"

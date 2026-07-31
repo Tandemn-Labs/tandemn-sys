@@ -15,29 +15,44 @@ from tandemn_orca.scripts.gpu_metrics_collector import (
 )
 
 
-def test_worker_index_uses_discovery_and_com_identity_labels():
-    pod = SimpleNamespace(
-        metadata=SimpleNamespace(
-            name="worker-1",
-            labels={
-                "tandemn.com/job-id": "job_1",
-                "tandemn.com/rank-id": "rank_0",
-                "tandemn.com/pods-discovery": "dynamo-worker",
+def test_worker_index_uses_single_and_multinode_grove_indexes():
+    def pod(name, labels):
+        return SimpleNamespace(
+            metadata=SimpleNamespace(
+                name=name,
+                labels={
+                    "tandemn.com/job-id": "job_1",
+                    "tandemn.com/rank-id": "rank_0",
+                    "tandemn.com/plan-id": "plan_1",
+                    "tandemn.com/pods-discovery": "dynamo-worker",
+                    **labels,
+                },
+            ),
+            spec=SimpleNamespace(node_name="node-1", containers=[]),
+        )
+
+    pods = [
+        pod("single", {"grove.io/podclique-pod-index": "1"}),
+        pod(
+            "multi",
+            {
+                "grove.io/podcliquescalinggroup-replica-index": "2",
+                "grove.io/podclique-pod-index": "0",
             },
         ),
-        spec=SimpleNamespace(node_name="node-1", containers=[]),
-    )
+    ]
 
     class Core:
         def list_namespaced_pod(self, namespace, label_selector):
             self.query = namespace, label_selector
-            return SimpleNamespace(items=[pod])
+            return SimpleNamespace(items=pods)
 
     core = Core()
-    worker = KubeWorkerIndex(core=core).by_pod()["worker-1"]
+    workers = KubeWorkerIndex(core=core).by_pod()
 
     assert core.query == ("default", "tandemn.com/pods-discovery=dynamo-worker")
-    assert (worker.job_id, worker.rank_id) == ("job_1", "rank_0")
+    assert (workers["single"].plan_id, workers["single"].replica_index) == ("plan_1", 1)
+    assert (workers["multi"].replica_index, workers["multi"].pod_index) == (2, 0)
 
 
 class FakeProm:
@@ -129,54 +144,76 @@ def test_collect_once_attributes_owned_and_unowned_gpus():
     assert idle.cost_per_token is None
 
 
-def _worker(pod: str, rank_id: str | None, chain_id: str | None = None) -> WorkerInfo:
+def _worker(
+    pod: str,
+    replica_index: int | None,
+    *,
+    rank_id: str = "rank_0",
+    plan_id: str = "plan_1",
+) -> WorkerInfo:
     return WorkerInfo(
         worker_id=pod,
         node_name="node-1",
         dynamo_namespace="ns",
         rank_id=rank_id,
-        chain_id=chain_id or pod,
         role="decode",
+        job_id="job_1",
+        plan_id=plan_id,
+        replica_index=replica_index,
     )
 
 
-def _chain(chain_id: str, rank_id: str | None) -> Chain:
-    shape: dict = {"count": 1, "target_p99_ttft_ms": 500.0}
-    if rank_id is not None:
-        shape["rank_id"] = rank_id
-    return Chain(chain_id=chain_id, job_id="job_1", role=ChainRole.DECODE, shape_json=shape)
+def _chain(
+    chain_id: str,
+    replica_index: int,
+    *,
+    rank_id: str = "rank_0",
+    plan_id: str = "plan_1",
+) -> Chain:
+    return Chain(
+        chain_id=chain_id,
+        job_id="job_1",
+        plan_id=plan_id,
+        role=ChainRole.DECODE,
+        shape_json={
+            "count": 1,
+            "rank_id": rank_id,
+            "replica_index": replica_index,
+            "target_p99_ttft_ms": 500.0,
+        },
+    )
 
 
-def test_assign_canonical_chain_ids_maps_pods_within_rank():
+def test_assign_canonical_chain_ids_maps_exact_grove_slots():
     workers = {
-        "pod-b": _worker("pod-b", "decode-0"),
-        "pod-a": _worker("pod-a", "decode-0"),
-        "pod-c": _worker("pod-c", "decode-1"),
-        # Explicitly labelled chain_id must be kept.
-        "pod-d": _worker("pod-d", "decode-1", chain_id="chain_explicit"),
+        "single-0": _worker("single-0", 0),
+        "single-1": _worker("single-1", 1),
+        "multi-leader": _worker("multi-leader", 2),
+        "multi-worker": _worker("multi-worker", 2),
     }
     chains = [
-        _chain("chain_2", "decode-0"),
-        _chain("chain_1", "decode-0"),
-        _chain("chain_3", "decode-1"),
-        _chain("chain_4", "decode-1"),
+        _chain("chain_2", 2),
+        _chain("chain_0", 0),
+        _chain("chain_1", 1),
     ]
     assign_canonical_chain_ids(workers, chains)
 
-    # Deterministic: sorted pods onto sorted chain ids, per rank.
-    assert workers["pod-a"].chain_id == "chain_1"
-    assert workers["pod-b"].chain_id == "chain_2"
-    assert workers["pod-c"].chain_id == "chain_3"
-    assert workers["pod-d"].chain_id == "chain_explicit"
-    # The chain's SLA target rides along for slo_margin.
-    assert workers["pod-a"].ttft_target_ms == 500.0
+    assert workers["single-0"].chain_id == "chain_0"
+    assert workers["single-1"].chain_id == "chain_1"
+    assert workers["multi-leader"].chain_id == "chain_2"
+    assert workers["multi-worker"].chain_id == "chain_2"
+    assert workers["single-0"].ttft_target_ms == 500.0
 
 
-def test_assign_canonical_chain_ids_keeps_pod_name_when_rows_run_out():
-    workers = {"pod-a": _worker("pod-a", "decode-0"), "pod-b": _worker("pod-b", "decode-0")}
-    assign_canonical_chain_ids(workers, [_chain("chain_1", "decode-0")])
-    assert workers["pod-a"].chain_id == "chain_1"
-    assert workers["pod-b"].chain_id == "pod-b"
+def test_assign_canonical_chain_ids_fails_closed():
+    workers = {
+        "missing": _worker("missing", None),
+        "outside": _worker("outside", 9),
+        "old-plan": _worker("old-plan", 0, plan_id="plan_old"),
+        "duplicate": _worker("duplicate", 0),
+    }
+    assign_canonical_chain_ids(workers, [_chain("chain_0", 0), _chain("chain_dup", 0)])
+    assert all(worker.chain_id is None for worker in workers.values())
 
 
 def test_resolve_instance_price_per_hour_from_resource_map():

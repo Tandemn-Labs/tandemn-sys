@@ -217,7 +217,9 @@ _LABEL_SUBCOMPONENT = "nvidia.com/dynamo-sub-component-type"
 _LABEL_DISCOVERY = "tandemn.com/pods-discovery"
 _LABEL_JOB = "tandemn.com/job-id"
 _LABEL_RANK = "tandemn.com/rank-id"
-_LABEL_CHAIN = "tandemn.com/chain-id"
+_LABEL_PLAN = "tandemn.com/plan-id"
+_LABEL_PCSG_INDEX = "grove.io/podcliquescalinggroup-replica-index"
+_LABEL_POD_INDEX = "grove.io/podclique-pod-index"
 
 # Node label carrying the EC2 instance type (standard on EKS/Karpenter nodes).
 _NODE_LABEL_INSTANCE_TYPE = "node.kubernetes.io/instance-type"
@@ -228,8 +230,8 @@ class WorkerInfo:
 
     Joined to the node it runs on. ``rank_id`` is the ladder rung the chain
     belongs to (shared across the rank's chains); ``chain_id`` is the serving
-    unit (canonical chains.chain_id after ``assign_canonical_chain_ids``, else
-    the pod name); ``worker_id`` is the pod name, kept internally for the
+    unit (canonical chains.chain_id after ``assign_canonical_chain_ids``);
+    ``worker_id`` is the pod name, kept internally for the
     vLLM ``pod=`` selector but not stored. Per-GPU local ranks are resolved
     separately from the DCGM ``gpu`` index.
     """
@@ -241,9 +243,12 @@ class WorkerInfo:
         node_name: str,
         dynamo_namespace: str | None,
         rank_id: str | None,
-        chain_id: str | None,
         role: str | None,
         job_id: str | None = None,
+        plan_id: str | None = None,
+        replica_index: int | None = None,
+        pod_index: int | None = None,
+        chain_id: str | None = None,
         model_name: str | None = None,
         ttft_target_ms: float | None = None,
     ) -> None:
@@ -254,6 +259,9 @@ class WorkerInfo:
         self.chain_id = chain_id
         self.role = role
         self.job_id = job_id
+        self.plan_id = plan_id
+        self.replica_index = replica_index
+        self.pod_index = pod_index
         self.model_name = model_name
         self.ttft_target_ms = ttft_target_ms
 
@@ -266,6 +274,14 @@ def _model_from_pod(pod: Any) -> str | None:
             if arg == "--model":
                 return str(args[i + 1])
     return None
+
+
+def _index(value: str | None) -> int | None:
+    try:
+        parsed = int(value) if value is not None else -1
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
 
 
 class KubeWorkerIndex:
@@ -310,55 +326,56 @@ class KubeWorkerIndex:
         index: dict[str, WorkerInfo] = {}
         for pod in pods:
             labels = pod.metadata.labels or {}
-            # A chain == a worker; fall back to the pod name when Orca did not
-            # stamp an explicit chain-id label. rank_id/job_id (the tandemn.com
-            # labels) are only known when Orca launched the ladder, else None.
-            chain_id = labels.get(_LABEL_CHAIN) or pod.metadata.name
+            pod_index = _index(labels.get(_LABEL_POD_INDEX))
+            replica_index = _index(labels.get(_LABEL_PCSG_INDEX))
+            if replica_index is None:
+                replica_index = pod_index
             index[pod.metadata.name] = WorkerInfo(
                 worker_id=pod.metadata.name,
                 node_name=pod.spec.node_name or "",
                 dynamo_namespace=labels.get(_LABEL_DYN_NS),
                 rank_id=labels.get(_LABEL_RANK),
-                chain_id=chain_id,
                 role=labels.get(_LABEL_SUBCOMPONENT),
                 job_id=labels.get(_LABEL_JOB),
+                plan_id=labels.get(_LABEL_PLAN),
+                replica_index=replica_index,
+                pod_index=pod_index,
                 model_name=_model_from_pod(pod),
             )
         return index
 
 
 def assign_canonical_chain_ids(workers_by_pod: dict[str, WorkerInfo], chains: list[Chain]) -> None:
-    """Overwrite pod-name chain_ids with canonical ``chains.chain_id`` values.
-
-    Chains within a rank are fungible DP replicas, so any pod<->chain bijection
-    is valid; sorting both sides (pods by name, chain rows by chain_id) makes it
-    deterministic. An explicitly labelled chain_id is kept; pods beyond the
-    rank's chain rows keep the pod-name fallback.
-
-    ponytail: the mapping can reshuffle when the pod set changes (a replaced
-    pod may swap chain_ids with a surviving one); fine while chains are
-    fungible, revisit if chain identity ever needs to survive pod churn.
-    """
-    chains_by_id = {chain.chain_id: chain for chain in chains}
-    chain_rows_by_rank: dict[str | None, list[str]] = {}
+    """Resolve canonical chain IDs from plan, rank, and Grove replica index."""
+    by_slot: dict[tuple[str, str, str, int], Chain | None] = {}
     for chain in chains:
-        rank = chain.shape_json.get("rank_id")
-        chain_rows_by_rank.setdefault(rank, []).append(chain.chain_id)
+        rank_id = chain.shape_json.get("rank_id")
+        replica_index = chain.shape_json.get("replica_index")
+        if (
+            not chain.plan_id
+            or not rank_id
+            or not isinstance(replica_index, int)
+            or isinstance(replica_index, bool)
+            or replica_index < 0
+        ):
+            continue
+        key = (chain.job_id, chain.plan_id, str(rank_id), replica_index)
+        by_slot[key] = None if key in by_slot else chain
 
-    workers_by_rank: dict[str | None, list[WorkerInfo]] = {}
     for worker in workers_by_pod.values():
-        # chain_id != pod name means an explicit tandemn.com/chain-id label.
-        if worker.chain_id == worker.worker_id:
-            workers_by_rank.setdefault(worker.rank_id, []).append(worker)
-
-    for rank, workers in workers_by_rank.items():
-        workers.sort(key=lambda w: w.worker_id)
-        rows = sorted(chain_rows_by_rank.get(rank, []))
-        for worker, chain_id in zip(workers, rows, strict=False):
-            worker.chain_id = chain_id
-            target = chains_by_id[chain_id].shape_json.get("target_p99_ttft_ms")
-            if isinstance(target, (int, float)):
-                worker.ttft_target_ms = float(target)
+        worker.chain_id = None
+        if not worker.job_id or not worker.plan_id or not worker.rank_id:
+            continue
+        if worker.replica_index is None:
+            continue
+        key = (worker.job_id, worker.plan_id, worker.rank_id, worker.replica_index)
+        chain = by_slot.get(key)
+        if chain is None:
+            continue
+        worker.chain_id = chain.chain_id
+        target = chain.shape_json.get("target_p99_ttft_ms")
+        if isinstance(target, (int, float)):
+            worker.ttft_target_ms = float(target)
 
 
 def _worker_inference_values(
