@@ -108,6 +108,7 @@ def test_ladder_to_chains_expands_replicas():
     roles = [c.role for c in chains]
     assert roles == [ChainRole.AGGREGATE, ChainRole.AGGREGATE, ChainRole.AGGREGATE]
     assert all(c.job_id == "job_B" and c.plan_id == "plan_1" for c in chains)
+    assert [c.shape_json["replica_index"] for c in chains] == [0, 1, 2]
 
 
 def test_ladder_to_chains_accepts_explicit_koi_rank():
@@ -133,6 +134,7 @@ def test_ladder_to_chains_accepts_explicit_koi_rank():
         "cp": 1,
         "count": 1,
         "rank_id": "rank_0",
+        "replica_index": 0,
         "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
         "mechanism_id": "queueing_under_burst",
         "predicted_y": {"p99_ttft_ms": 120.0},
