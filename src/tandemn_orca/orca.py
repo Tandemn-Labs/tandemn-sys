@@ -118,9 +118,11 @@ def ladder_to_chains(
             logger.warning("skipping unlaunchable ladder entry (missing %s): %r", missing, entry)
             continue
 
-        for _ in range(replicas):
+        for replica_index in range(replicas):
+            replica_shape = dict(shape_json)
+            replica_shape["replica_index"] = replica_index
             chains.append(
-                Chain(job_id=job_id, plan_id=plan_id, role=role, shape_json=dict(shape_json))
+                Chain(job_id=job_id, plan_id=plan_id, role=role, shape_json=replica_shape)
             )
     return chains
 

@@ -100,11 +100,15 @@ def labels(
     return result
 
 
-def pod_metadata(job_id: str, rank_id: str, *, worker: bool = False) -> dict[str, Any]:
+def pod_metadata(
+    job_id: str, rank_id: str, plan_id: str | None, *, worker: bool = False
+) -> dict[str, Any]:
     pod_labels = {
         "tandemn.com/job-id": job_id,
         "tandemn.com/rank-id": rank_id,
     }
+    if plan_id:
+        pod_labels["tandemn.com/plan-id"] = plan_id
     if worker:
         pod_labels["tandemn.com/pods-discovery"] = "dynamo-worker"
     return {"labels": pod_labels}
@@ -143,7 +147,7 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
                 "Frontend": {
                     "componentType": "frontend",
                     "replicas": 1,
-                    "extraPodMetadata": pod_metadata(job_id, rank_id),
+                    "extraPodMetadata": pod_metadata(job_id, rank_id, plan_id),
                     "extraPodSpec": {
                         "mainContainer": {
                             "image": FRONTEND_IMAGE,
@@ -160,7 +164,7 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
                 "LocalRouter": {
                     "componentType": "default",
                     "replicas": 1,
-                    "extraPodMetadata": pod_metadata(job_id, rank_id),
+                    "extraPodMetadata": pod_metadata(job_id, rank_id, plan_id),
                     "extraPodSpec": {
                         "mainContainer": {
                             "image": RUNTIME_IMAGE,
@@ -184,7 +188,7 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
                     # would make every Orca re-apply fight the adapter (webhook
                     # rejection or a reset to the initial value).
                     "scalingAdapter": {"enabled": True},
-                    "extraPodMetadata": pod_metadata(job_id, rank_id, worker=True),
+                    "extraPodMetadata": pod_metadata(job_id, rank_id, plan_id, worker=True),
                     "resources": {
                         "requests": {"gpu": str(gpus_per_node)},
                         "limits": {"gpu": str(gpus_per_node)},
@@ -209,7 +213,7 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
                 "Planner": {
                     "componentType": "planner",
                     "replicas": 1,
-                    "extraPodMetadata": pod_metadata(job_id, rank_id),
+                    "extraPodMetadata": pod_metadata(job_id, rank_id, plan_id),
                     "extraPodSpec": {
                         "mainContainer": {
                             "image": PLANNER_IMAGE,
