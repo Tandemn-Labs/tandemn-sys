@@ -21,8 +21,6 @@ from tandemn_system_data.models.rank import Rank
 from tandemn_orca.dynamo_compiler import (
     compile_job,
     render_router_objects,
-    router_configmap_name,
-    router_name,
 )
 from tandemn_orca.dynamo_kubernetes import (
     DynamoKubernetesClient,
@@ -92,50 +90,36 @@ class DynamoLauncher:
         self,
         namespace: str = "default",
         k8s: DynamoKubernetesClient | None = None,
-        router_k8s: DynamoKubernetesClient | None = None,
         router_image: str | None = None,
         model_catalogs: ModelCatalogStore | None = None,
     ) -> None:
         self.namespace = namespace
         self.k8s = k8s or load_kube_client(namespace)
-        self.router_k8s = router_k8s
         self.router_image = router_image
         self.model_catalogs = model_catalogs
 
     def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
         desired = compile_job(job_id, ranks, self.namespace)
-        router_objects = None
-        if self.router_k8s is not None:
+        if self.router_image:
             max_num_seq = _max_num_seq_by_rank(ranks, self.model_catalogs)
-            router_objects = render_router_objects(
-                job_id,
-                ranks,
-                max_num_seq,
-                self.router_image or "",
-                self.router_k8s.namespace,
+            desired.extend(
+                render_router_objects(
+                    job_id,
+                    ranks,
+                    max_num_seq,
+                    self.router_image,
+                    self.namespace,
+                )
             )
         desired_keys = {object_key(obj) for obj in desired}
         stale = self.k8s.list_job_objects(job_id) - desired_keys
         apply_error = _call(self.k8s.apply_many, desired)
         if apply_error:
             raise ReconcileError(apply_error, None)
-        if self.router_k8s is not None and router_objects is not None:
-            apply_error = _call(self.router_k8s.apply_many, router_objects)
-            if apply_error:
-                raise ReconcileError(apply_error, None)
         self._delete_stale(stale)
 
     def teardown_job(self, job_id: str) -> None:
         self.k8s.delete_all_for_job(job_id)
-        if self.router_k8s is not None:
-            name = router_name(job_id)
-            self.router_k8s.delete_many(
-                {
-                    ("ConfigMap", router_configmap_name(job_id)),
-                    ("Deployment", name),
-                    ("Service", name),
-                }
-            )
 
     def _delete_stale(self, stale: set[ObjectKey]) -> None:
         delete_error = _call(self.k8s.delete_many, stale)
