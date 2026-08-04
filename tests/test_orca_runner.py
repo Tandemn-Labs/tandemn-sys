@@ -32,8 +32,10 @@ class FailingOnceOrca(FakeOrca):
 class FakeLauncher:
     instances: ClassVar[list[FakeLauncher]] = []
 
-    def __init__(self, namespace: str) -> None:
+    def __init__(self, namespace: str, router_k8s=None, router_image=None) -> None:
         self.namespace = namespace
+        self.router_k8s = router_k8s
+        self.router_image = router_image
         FakeLauncher.instances.append(self)
 
 
@@ -60,6 +62,7 @@ def _patch_runner(monkeypatch, orca_cls=FakeOrca):
     sleeps: list[float] = []
     monkeypatch.setattr(mod, "PostgresClient", lambda: "client")
     monkeypatch.setattr(mod, "DynamoLauncher", FakeLauncher)
+    monkeypatch.setattr(mod, "load_kube_client", lambda *args: ("router-k8s", args))
     monkeypatch.setattr(mod, "CapacityRefresher", FakeRefresher)
     monkeypatch.setattr(mod, "Orca", orca_cls)
     monkeypatch.setattr(mod.time, "sleep", lambda seconds: sleeps.append(seconds))
@@ -100,6 +103,32 @@ def test_main_uses_env_defaults(monkeypatch):
     assert args.interval_seconds == 7
     assert args.aws_regions == "us-west-2,us-east-2"
     assert args.capacity_refresh_seconds == 12
+
+
+def test_main_wires_router_control_plane_client(monkeypatch):
+    _patch_runner(monkeypatch)
+
+    mod.main(
+        [
+            "--user-id",
+            "default",
+            "--router-namespace",
+            "routing",
+            "--router-kubeconfig",
+            "/config/control",
+            "--router-context",
+            "control",
+            "--router-image",
+            "registry.example/tandemn-router:test",
+            "--once",
+        ]
+    )
+
+    assert FakeLauncher.instances[0].router_k8s == (
+        "router-k8s",
+        ("routing", "/config/control", "control"),
+    )
+    assert FakeLauncher.instances[0].router_image == "registry.example/tandemn-router:test"
 
 
 def test_main_requires_user_id(monkeypatch):

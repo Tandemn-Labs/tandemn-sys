@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import pytest
-from tandemn_system_data.models.chain import Chain
-from tandemn_system_data.models.enums import ChainRole
+from tandemn_system_data.models.enums import RankRole
+from tandemn_system_data.models.rank import Rank
 
 from tandemn_orca.launcher import DynamoLauncher, ReconcileError
 
+RANK_ID = "rank_01JBM2YQYZ1KQ9C8GZP1XB6V5T"
 
-def _chain() -> Chain:
-    return Chain(
+
+def _rank() -> Rank:
+    return Rank(
+        rank_id=RANK_ID,
         job_id="job_online_001",
         plan_id="plan_1",
-        role=ChainRole.AGGREGATE,
+        role=RankRole.AGGREGATE,
+        n_replicas=1,
         shape_json={
             "model_id": "meta-llama/Llama-3.1-8B-Instruct",
             "engine_name": "vllm",
@@ -19,7 +23,6 @@ def _chain() -> Chain:
             "gpu_type": "L40S",
             "gpu_count": 1,
             "count": 1,
-            "rank_id": "rank_0",
             "target_p99_ttft_ms": 500.0,
             "target_p99_tpot_ms": 50.0,
             "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
@@ -28,7 +31,8 @@ def _chain() -> Chain:
 
 
 class FakeK8s:
-    def __init__(self, *, apply_error=None, delete_error=None) -> None:
+    def __init__(self, *, namespace="default", apply_error=None, delete_error=None) -> None:
+        self.namespace = namespace
         self.apply_error = apply_error
         self.delete_error = delete_error
         self.applied: list[list[dict]] = []
@@ -58,34 +62,35 @@ class FakeK8s:
 
 def test_dynamo_launcher_applies_desired_and_deletes_stale():
     k8s = FakeK8s()
-    DynamoLauncher(k8s=k8s).reconcile("job_online_001", [_chain()])
+    DynamoLauncher(k8s=k8s).reconcile("job_online_001", [_rank()])
 
     applied_names = {obj["metadata"]["name"] for obj in k8s.applied[0]}
     assert k8s.job_id == "job_online_001"
-    assert applied_names == {"tdm-online-001-rank-0"}
+    assert len(applied_names) == 1
     assert k8s.deleted == [
         {("ConfigMap", "stale-config"), ("DynamoGraphDeployment", "job-online-001-aggregate-old")}
     ]
 
 
-def test_dynamo_launcher_deletes_stale_even_when_apply_fails():
+def test_dynamo_launcher_keeps_stale_when_apply_fails():
     k8s = FakeK8s(apply_error=RuntimeError("boom"))
 
     with pytest.raises(ReconcileError) as error:
-        DynamoLauncher(k8s=k8s).reconcile("job_online_001", [_chain()])
+        DynamoLauncher(k8s=k8s).reconcile("job_online_001", [_rank()])
 
     assert isinstance(error.value.apply_error, RuntimeError)
     assert error.value.delete_error is None
-    assert k8s.deleted
+    assert k8s.deleted == []
 
 
-def test_dynamo_launcher_reports_apply_and_delete_errors():
-    k8s = FakeK8s(apply_error=RuntimeError("apply"), delete_error=RuntimeError("delete"))
+def test_dynamo_launcher_reports_delete_error_after_apply():
+    k8s = FakeK8s(delete_error=RuntimeError("delete"))
 
     with pytest.raises(ReconcileError) as error:
-        DynamoLauncher(k8s=k8s).reconcile("job_online_001", [_chain()])
+        DynamoLauncher(k8s=k8s).reconcile("job_online_001", [_rank()])
 
-    assert str(error.value) == "apply failed: apply; delete failed: delete"
+    assert error.value.apply_error is None
+    assert str(error.value) == "delete failed: delete"
 
 
 def test_dynamo_launcher_teardown_deletes_job_objects():
@@ -93,3 +98,52 @@ def test_dynamo_launcher_teardown_deletes_job_objects():
     DynamoLauncher(k8s=k8s).teardown_job("job_online_001")
 
     assert k8s.deleted_jobs == ["job_online_001"]
+
+
+def test_dynamo_launcher_publishes_and_deletes_router_config():
+    workload = FakeK8s()
+    routing = FakeK8s(namespace="routing")
+    rank = _rank()
+    rank.shape_json.update(
+        {"router_endpoint": "https://rank.example.internal", "maximum_requests": 64}
+    )
+    launcher = DynamoLauncher(
+        k8s=workload,
+        router_k8s=routing,
+        router_image="registry.example/tandemn-router:test",
+    )
+
+    launcher.reconcile("job_online_001", [rank])
+    launcher.teardown_job("job_online_001")
+
+    assert [obj["kind"] for obj in routing.applied[0]] == [
+        "ConfigMap",
+        "Deployment",
+        "Service",
+    ]
+    assert all(obj["metadata"]["namespace"] == "routing" for obj in routing.applied[0])
+    assert routing.deleted == [
+        {
+            ("ConfigMap", "tdm-online-001-router-config"),
+            ("Deployment", "tdm-online-001-router"),
+            ("Service", "tdm-online-001-router"),
+        }
+    ]
+
+
+def test_dynamo_launcher_keeps_stale_when_router_publish_fails():
+    workload = FakeK8s()
+    routing = FakeK8s(namespace="routing", apply_error=RuntimeError("publish"))
+    rank = _rank()
+    rank.shape_json.update(
+        {"router_endpoint": "https://rank.example.internal", "maximum_requests": 64}
+    )
+
+    with pytest.raises(ReconcileError, match="publish"):
+        DynamoLauncher(
+            k8s=workload,
+            router_k8s=routing,
+            router_image="registry.example/tandemn-router:test",
+        ).reconcile("job_online_001", [rank])
+
+    assert workload.deleted == []

@@ -4,24 +4,23 @@ One pass: poll the plans Koi has created but not yet applied, apply each
 action, and CAS the plan to ``applied``.
 
 Action semantics (DATA_ARCHITECTURE.md §6):
-    place    waiting|paused -> running   record the ladder's chains + apply DGDs
+    place    waiting|paused -> running   record the ladder's ranks + apply DGDs
     keep     running                     no change
     defer    waiting                     no change
-    preempt  running -> paused           tear down the job's chains
+    preempt  running -> paused           tear down the job's ranks
     swap     running                     relaunch on a new ladder
 
-Chain rows are *authorized* capacity, not launched pods: the pool DGD's worker
+Rank rows are *authorized* capacity, not launched pods: the pool DGD's worker
 replicas are owned by Dynamo's scaling adapter (DGDSA), and the in-pool Planner
 scales DP width within [min_endpoint, max_gpu_budget]. Actual live width per
-rank = distinct chain_ids in recent gpu_metrics rows.
+rank = distinct chain indexes in recent gpu_metrics rows.
 
 Ladder shape (opaque JSONB; Koi <-> Orca contract):
-    [{"role": "aggregate", "rank_id": "rank_0", "env": [...], "config": {...},
+    [{"role": "aggregate", "rank_id": "rank_<ULID>", "env": [...], "config": {...},
       "n_replicas": 3}]
-``count`` / ``gpu_count`` is the GPU count per chain (required, positive int).
-``chains`` / ``n_replicas`` is how many chain rows to record for max capacity.
-``rank_id`` is Koi's logical rank id (unique within the job's action; Koi
-autofills ``rank_{i}``); Orca preserves it into chain shapes, DGDs and pods.
+``count`` / ``gpu_count`` is the GPU count per replica (required, positive int).
+``chains`` / ``n_replicas`` is the rank's maximum runtime replica count.
+``rank_id`` is the canonical Koi-supplied ``rank_<ULID>`` preserved into DGDs and pods.
 """
 
 from __future__ import annotations
@@ -29,23 +28,26 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import time
 from typing import Any
 
 from tandemn_system_data.clients import JobStore, PlanStore, PostgresClient
-from tandemn_system_data.models.chain import Chain
-from tandemn_system_data.models.enums import ActionType, ChainRole, ChainStatus, JobStatus
+from tandemn_system_data.models.enums import ActionType, JobStatus, RankRole, RankStatus, ReasonCode
 from tandemn_system_data.models.plan import Plan, PlanAction
+from tandemn_system_data.models.rank import Rank
 
+from tandemn_orca.dynamo_kubernetes import load_kube_client
 from tandemn_orca.launcher import DynamoLauncher, Launcher, NoopLauncher
 from tandemn_orca.scripts.resource_map_from_aws import CapacityRefresher, parse_region_csv
 
 logger = logging.getLogger(__name__)
 
-ACTIVE_CHAIN_STATUSES = (ChainStatus.LAUNCHING, ChainStatus.RUNNING)
+ACTIVE_RANK_STATUSES = (RankStatus.LAUNCHING, RankStatus.RUNNING)
+RANK_ID_RE = re.compile(r"rank_[0-7][0-9A-HJKMNP-TV-Z]{25}\Z")
 
 
-def ladder_to_chains(
+def ladder_to_ranks(
     ladder: list[dict[str, Any]] | None,
     *,
     job_id: str,
@@ -53,8 +55,8 @@ def ladder_to_chains(
     target_p99_ttft_ms: float | None = None,
     target_p99_tpot_ms: float | None = None,
     job_spec: dict[str, Any] | None = None,
-) -> list[Chain]:
-    """Translate a ladder into Chain rows, skipping malformed entries.
+) -> list[Rank]:
+    """Translate a ladder into Rank rows, skipping malformed entries.
 
     A missing/invalid role, config, replica count, GPU count, or instance type
     skips the entry. Koi keeps some launch fields outside the rank config, so
@@ -62,7 +64,8 @@ def ladder_to_chains(
     the job's ``spec_json``, ``engine_name`` defaulting to ``vllm``.
     """
     job_spec = job_spec or {}
-    chains: list[Chain] = []
+    ranks: list[Rank] = []
+    seen_rank_ids: set[str] = set()
     for entry in ladder or []:
         if not isinstance(entry, dict):
             logger.warning("skipping non-dict ladder entry: %r", entry)
@@ -86,12 +89,13 @@ def ladder_to_chains(
         shape_json.setdefault("sp", 1)
         shape_json.setdefault("ep", 1)
         shape_json.setdefault("cp", 1)
-        # Koi's logical rank id; required so every DGD and pod has canonical
-        # identity matching Koi's evidence rows.
-        if not entry.get("rank_id"):
-            logger.warning("skipping ladder entry without rank_id: %r", entry)
+        rank_id = entry.get("rank_id")
+        if not isinstance(rank_id, str) or RANK_ID_RE.fullmatch(rank_id) is None:
+            logger.warning("skipping ladder entry without canonical rank_<ULID>: %r", entry)
             continue
-        shape_json["rank_id"] = str(entry["rank_id"])
+        if rank_id in seen_rank_ids:
+            raise ValueError(f"duplicate rank_id {rank_id}")
+        seen_rank_ids.add(rank_id)
         env = entry.get("env")
         if env is not None:
             shape_json["env"] = list(env) if isinstance(env, (list, tuple)) else env
@@ -118,18 +122,22 @@ def ladder_to_chains(
             logger.warning("skipping unlaunchable ladder entry (missing %s): %r", missing, entry)
             continue
 
-        for replica_index in range(replicas):
-            replica_shape = dict(shape_json)
-            replica_shape["replica_index"] = replica_index
-            chains.append(
-                Chain(job_id=job_id, plan_id=plan_id, role=role, shape_json=replica_shape)
+        ranks.append(
+            Rank(
+                rank_id=rank_id,
+                job_id=job_id,
+                plan_id=plan_id,
+                role=role,
+                shape_json=shape_json,
+                n_replicas=replicas,
             )
-    return chains
+        )
+    return ranks
 
 
-def _parse_role(role_name: object) -> ChainRole | None:
+def _parse_role(role_name: object) -> RankRole | None:
     try:
-        return ChainRole(role_name)
+        return RankRole(role_name)
     except ValueError:
         return None
 
@@ -184,24 +192,30 @@ class Orca:
     # ----- per-action handlers --------------------------------------------
 
     def _place(self, plan: Plan, action: PlanAction) -> None:
-        """waiting|paused -> running: record the ladder's chains and apply DGDs."""
+        """waiting|paused -> running: record the ladder's ranks and apply DGDs."""
+        job = self._jobs.get(action.job_id)
+        ranks = self._materialize_ranks(plan, action, job.spec_json if job else None)
+        previous_status = (
+            job.status if job and job.status in (JobStatus.WAITING, JobStatus.PAUSED) else None
+        )
         moved = self._jobs.transition(
             action.job_id,
             JobStatus.RUNNING,
             [JobStatus.WAITING, JobStatus.PAUSED],
         )
         if not moved:
-            logger.warning(
-                "place: job %s not in waiting|paused; launching chains anyway", action.job_id
-            )
-        self._launch_ladder(plan, action)
+            raise ValueError(f"place: job {action.job_id} is not waiting or paused")
+        try:
+            self._launch_ranks(action.job_id, ranks)
+        except Exception:
+            if moved and previous_status is not None:
+                self._jobs.transition(action.job_id, previous_status, [JobStatus.RUNNING])
+            raise
         logger.info("placed job %s (plan %s)", action.job_id, plan.plan_id)
 
     def _preempt(self, plan: Plan, action: PlanAction) -> None:
-        """running -> paused: tear down the job's chains, keep the job row."""
-        # Collect + tear down while the job still reads as running; the
-        # chain lookup goes through running_jobs.
-        self._teardown_chains(plan.user_id, action.job_id)
+        """running -> paused: tear down the job's ranks, keep the job row."""
+        self._teardown_ranks(action.job_id)
         moved = self._jobs.transition(action.job_id, JobStatus.PAUSED, [JobStatus.RUNNING])
         if not moved:
             logger.warning("preempt: job %s was not running", action.job_id)
@@ -211,55 +225,96 @@ class Orca:
         """running: relaunch on a new ladder.
 
         Dynamo reconciliation deletes stale DGDs by diff. Orca only marks the
-        old Chain rows stopped after writing the new desired rows.
+        old Rank rows stopped after writing and reconciling the new desired rows.
         """
-        old_chain_ids = self._active_chain_ids(plan.user_id, action.job_id)
-        self._launch_ladder(plan, action)
-        self._stop_chains(old_chain_ids)
+        old_ranks = self._jobs.active_ranks(action.job_id)
+        old_by_id = {rank.rank_id: rank for rank in old_ranks}
+        job = self._jobs.get(action.job_id)
+        if job is None or job.status is not JobStatus.RUNNING:
+            raise ValueError(f"swap: job {action.job_id} is not running")
+        ranks = self._materialize_ranks(plan, action, job.spec_json if job else None)
+        ranks = [
+            rank.model_copy(
+                update={
+                    "status": old_by_id[rank.rank_id].status,
+                    "reason_code": old_by_id[rank.rank_id].reason_code,
+                }
+            )
+            if rank.rank_id in old_by_id
+            else rank
+            for rank in ranks
+        ]
+        recorded = self._launch_ranks(action.job_id, ranks, old_by_id)
+        self._stop_ranks(set(old_by_id) - {rank.rank_id for rank in recorded})
         logger.info("swapped job %s (plan %s)", action.job_id, plan.plan_id)
 
     # ----- launcher seam ---------------------------------------------------
 
-    def _launch_ladder(self, plan: Plan, action: PlanAction) -> list[Chain]:
-        job = self._jobs.get(action.job_id)
-        chains = ladder_to_chains(
+    def _materialize_ranks(
+        self, plan: Plan, action: PlanAction, job_spec: dict[str, Any] | None
+    ) -> list[Rank]:
+        ranks = ladder_to_ranks(
             action.ladder,
             job_id=action.job_id,
             plan_id=plan.plan_id,
             target_p99_ttft_ms=action.target_p99_ttft_ms,
             target_p99_tpot_ms=action.target_p99_tpot_ms,
-            job_spec=job.spec_json if job else None,
+            job_spec=job_spec,
         )
-        if not chains:
-            logger.warning("no launchable chains for job %s (plan %s)", action.job_id, plan.plan_id)
-            return []
-        # Record canonical rows (status=LAUNCHING) first, then bring up the
-        # real workers behind the launcher seam.
-        recorded = self._jobs.launch_chains(chains)
-        self._launcher.reconcile(action.job_id, recorded)
+        if not ranks:
+            raise ValueError(f"no launchable ranks for job {action.job_id} (plan {plan.plan_id})")
+        return ranks
+
+    def _launch_ranks(
+        self,
+        job_id: str,
+        ranks: list[Rank],
+        previous: dict[str, Rank] | None = None,
+    ) -> list[Rank]:
+        previous = previous or {}
+        recorded = self._jobs.launch_ranks(ranks)
+        try:
+            self._launcher.reconcile(job_id, recorded)
+        except Exception:
+            try:
+                reused = [previous[rank.rank_id] for rank in recorded if rank.rank_id in previous]
+                if reused:
+                    self._jobs.launch_ranks(reused)
+            finally:
+                for rank in recorded:
+                    if rank.rank_id not in previous:
+                        self._jobs.set_rank_status(
+                            rank.rank_id,
+                            RankStatus.FAILED,
+                            [RankStatus.LAUNCHING],
+                            reason_code=ReasonCode.LAUNCH_FAILED,
+                        )
+            raise
+        for rank in recorded:
+            self._jobs.set_rank_status(rank.rank_id, RankStatus.RUNNING, [rank.status])
         return recorded
 
-    def _teardown_chains(self, user_id: str, job_id: str) -> None:
-        chain_ids = self._active_chain_ids(user_id, job_id)
+    def _teardown_ranks(self, job_id: str) -> None:
+        rank_ids = self._active_rank_ids(job_id)
         self._launcher.teardown_job(job_id)
-        self._stop_chains(chain_ids)
+        self._stop_ranks(rank_ids)
 
-    def _active_chain_ids(self, user_id: str, job_id: str) -> list[str]:
-        for running in self._jobs.running_jobs(user_id):
-            if running.job.job_id != job_id:
-                continue
-            return [c.chain_id for c in running.chains]
-        return []
+    def _active_rank_ids(self, job_id: str) -> set[str]:
+        return {rank.rank_id for rank in self._jobs.active_ranks(job_id)}
 
-    def _stop_chains(self, chain_ids: list[str]) -> None:
-        for chain_id in chain_ids:
-            self._jobs.set_chain_status(chain_id, ChainStatus.STOPPED, list(ACTIVE_CHAIN_STATUSES))
+    def _stop_ranks(self, rank_ids: set[str]) -> None:
+        for rank_id in rank_ids:
+            self._jobs.set_rank_status(rank_id, RankStatus.STOPPED, list(ACTIVE_RANK_STATUSES))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Orca against Tandemn Store plans.")
     parser.add_argument("--user-id", default=os.getenv("TANDEMN_USER_ID"))
     parser.add_argument("--namespace", default=os.getenv("TANDEMN_K8S_NAMESPACE", "default"))
+    parser.add_argument("--router-namespace", default=os.getenv("TANDEMN_ROUTER_NAMESPACE"))
+    parser.add_argument("--router-kubeconfig", default=os.getenv("TANDEMN_ROUTER_KUBECONFIG"))
+    parser.add_argument("--router-context", default=os.getenv("TANDEMN_ROUTER_CONTEXT"))
+    parser.add_argument("--router-image", default=os.getenv("TANDEMN_ROUTER_IMAGE"))
     parser.add_argument(
         "--aws-regions",
         default=os.getenv("TANDEMN_AWS_REGIONS", "us-east-1,us-east-2,us-west-1,us-west-2"),
@@ -283,6 +338,10 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if not args.user_id:
         raise SystemExit("--user-id or TANDEMN_USER_ID is required")
+    if args.router_namespace and not args.router_image:
+        raise SystemExit(
+            "--router-image or TANDEMN_ROUTER_IMAGE is required with router publishing"
+        )
 
     client = PostgresClient()
     refresher = CapacityRefresher(
@@ -296,7 +355,19 @@ def main(argv: list[str] | None = None) -> None:
     except Exception:
         logger.exception("capacity refresh failed")
 
-    orca = Orca(client, launcher=DynamoLauncher(namespace=args.namespace))
+    router_k8s = (
+        load_kube_client(args.router_namespace, args.router_kubeconfig, args.router_context)
+        if args.router_namespace
+        else None
+    )
+    orca = Orca(
+        client,
+        launcher=DynamoLauncher(
+            namespace=args.namespace,
+            router_k8s=router_k8s,
+            router_image=args.router_image,
+        ),
+    )
     while True:
         try:
             refresher.refresh_if_due()

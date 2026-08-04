@@ -1,4 +1,4 @@
-"""Compile Orca Chain rows into Dynamo Kubernetes objects.
+"""Compile Orca Rank rows into Dynamo Kubernetes objects.
 
 No Kubernetes calls live here; this file only returns dicts ready for server-side apply.
 
@@ -17,7 +17,7 @@ import hashlib
 import json
 from typing import Any
 
-from tandemn_system_data.models.chain import Chain
+from tandemn_system_data.models.rank import Rank
 
 FRONTEND_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.2.1"
 RUNTIME_IMAGE = "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1"
@@ -29,28 +29,156 @@ PLANNER_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.1"
 MAX_DGD_NAME = 29
 
 
-def compile_job(
-    job_id: str, chains: list[Chain], namespace: str = "default"
+def compile_job(job_id: str, ranks: list[Rank], namespace: str = "default") -> list[dict[str, Any]]:
+    if len({rank.rank_id for rank in ranks}) != len(ranks):
+        raise ValueError("duplicate rank_id")
+    return [render_rank_dgd(job_id, rank, namespace) for rank in ranks]
+
+
+def render_router_configmap(
+    job_id: str, ranks: list[Rank], namespace: str = "default"
+) -> dict[str, Any]:
+    """Render the per-job router's global deployment registry."""
+    plan_ids = {rank.plan_id for rank in ranks if rank.plan_id}
+    if len(plan_ids) != 1 or len(ranks) == 0:
+        raise ValueError("router config requires ranks from exactly one plan")
+
+    deployments = []
+    for rank in sorted(ranks, key=lambda item: item.rank_id):
+        shape = rank.shape_json
+        env = shape.get("env")
+        if not isinstance(env, (list, tuple)) or len(env) != 5 or not all(env):
+            raise ValueError(f"rank {rank.rank_id}: router config requires a five-part env")
+        endpoint = shape.get("router_endpoint")
+        if not isinstance(endpoint, str) or not endpoint:
+            raise ValueError(f"rank {rank.rank_id}: router_endpoint is required")
+        maximum = shape.get("maximum_requests")
+        if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
+            raise ValueError(f"rank {rank.rank_id}: maximum_requests must be a positive int")
+        deployments.append(
+            {
+                "id": pool_dgd_name(job_id, rank),
+                "endpoint": endpoint,
+                "env": list(env),
+                "enabled": True,
+                "maximum_requests": maximum,
+            }
+        )
+
+    plan_id = plan_ids.pop()
+    name = dgd_name(job_id, "router-config")
+    return {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {
+                "tandemn.com/managed-by": "orca",
+                "tandemn.com/job-id": job_id,
+                "tandemn.com/plan-id": plan_id,
+                "tandemn.com/resource-kind": "router-config",
+            },
+        },
+        "data": {
+            "router.json": json.dumps(
+                {
+                    "version": plan_id,
+                    "job_id": job_id,
+                    "overflow_threshold": 0.8,
+                    "deployments": deployments,
+                },
+                separators=(",", ":"),
+            )
+        },
+    }
+
+
+def router_configmap_name(job_id: str) -> str:
+    return dgd_name(job_id, "router-config")
+
+
+def render_router_objects(
+    job_id: str,
+    ranks: list[Rank],
+    image: str,
+    namespace: str = "default",
 ) -> list[dict[str, Any]]:
-    groups = group_chains(chains)
-    if not groups:
-        return []
+    """Render the ConfigMap, Deployment, and Service for one job router."""
+    if not image:
+        raise ValueError("router image is required")
+    name = router_name(job_id)
+    configmap = render_router_configmap(job_id, ranks, namespace)
+    resource_labels = {
+        "app.kubernetes.io/name": "tandemn-router",
+        "tandemn.com/managed-by": "orca",
+        "tandemn.com/job-id": job_id,
+    }
+    pod_labels = {**resource_labels, "tandemn.com/resource-kind": "router"}
     return [
-        *(render_pool_dgd(job_id, key, group, namespace) for key, group in groups.items()),
+        configmap,
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": name, "namespace": namespace, "labels": pod_labels},
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": resource_labels},
+                "template": {
+                    "metadata": {"labels": pod_labels},
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "router",
+                                "image": image,
+                                "args": [
+                                    "-config",
+                                    "/config/router.json",
+                                    "-listen",
+                                    ":8080",
+                                ],
+                                "ports": [{"name": "http", "containerPort": 8080}],
+                                "volumeMounts": [
+                                    {"name": "config", "mountPath": "/config", "readOnly": True}
+                                ],
+                                "readinessProbe": {"httpGet": {"path": "/healthz", "port": "http"}},
+                                "livenessProbe": {"httpGet": {"path": "/healthz", "port": "http"}},
+                                "resources": {
+                                    "requests": {"cpu": "50m", "memory": "64Mi"},
+                                    "limits": {"memory": "128Mi"},
+                                },
+                            }
+                        ],
+                        "volumes": [
+                            {
+                                "name": "config",
+                                "configMap": {"name": router_configmap_name(job_id)},
+                            }
+                        ],
+                    },
+                },
+            },
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": name, "namespace": namespace, "labels": pod_labels},
+            "spec": {
+                "selector": resource_labels,
+                "ports": [{"name": "http", "port": 80, "targetPort": "http"}],
+            },
+        },
     ]
 
 
-def group_chains(chains: list[Chain]) -> dict[str, list[Chain]]:
-    grouped: dict[str, list[Chain]] = {}
-    for chain in chains:
-        grouped.setdefault(pool_key(chain), []).append(chain)
-    return dict(grouped)
+def router_name(job_id: str) -> str:
+    return dgd_name(job_id, "router")
 
 
-def pool_key(chain: Chain) -> str:
-    shape = chain.shape_json
+def pool_key(rank: Rank) -> str:
+    shape = rank.shape_json
     return k8s_name(
-        f"{required(shape, 'rank_id')}-{required(shape, 'instance_type')}-{required(shape, 'gpu_type')}"
+        f"{rank.rank_id}-{required(shape, 'instance_type')}-{required(shape, 'gpu_type')}"
     )
 
 
@@ -75,9 +203,9 @@ def k8s_name(value: str) -> str:
     return "".join(ch for ch in value if ch.isalnum() or ch == "-")[:63].strip("-")
 
 
-def pool_dgd_name(job_id: str, key: str, chains: list[Chain]) -> str:
+def pool_dgd_name(job_id: str, rank: Rank) -> str:
     """Pool DGD name using the canonical rank ID."""
-    return dgd_name(job_id, required(chains[0].shape_json, "rank_id"))
+    return dgd_name(job_id, rank.rank_id)
 
 
 def labels(
@@ -118,19 +246,20 @@ def dynamo_namespace(namespace: str, name: str) -> str:
     return f"{namespace}-{name}"
 
 
-def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) -> dict[str, Any]:
-    name = pool_dgd_name(job_id, key, chains)
-    shape = chains[0].shape_json
-    rank_id = required(shape, "rank_id")
-    plan_id = chains[0].plan_id
-    # gpu_count is the chain's world size (tp * pp, ... total GPUs); split
+def render_rank_dgd(job_id: str, rank: Rank, namespace: str) -> dict[str, Any]:
+    key = pool_key(rank)
+    name = pool_dgd_name(job_id, rank)
+    shape = rank.shape_json
+    rank_id = rank.rank_id
+    plan_id = rank.plan_id
+    # gpu_count is one replica's world size (tp * pp, ... total GPUs); split
     # across node_count physical nodes for multinode TP/PP (default: one node,
     # gpus_per_node == gpu_count, byte-identical to the single-node DGD).
-    gpu_count = worker_gpu_count(chains)
-    node_count = chain_node_count(chains)
+    gpu_count = worker_gpu_count(rank)
+    node_count = rank_node_count(rank)
     if gpu_count % node_count != 0:
         raise ValueError(
-            f"chain {chains[0].chain_id}: count={gpu_count} does not divide "
+            f"rank {rank.rank_id}: count={gpu_count} does not divide "
             f"evenly across node_count={node_count}"
         )
     gpus_per_node = gpu_count // node_count
@@ -193,7 +322,7 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
                         "requests": {"gpu": str(gpus_per_node)},
                         "limits": {"gpu": str(gpus_per_node)},
                     },
-                    # Only present for multinode chains; the operator rejects
+                    # Only present for multinode replicas; the operator rejects
                     # multinode without Grove/LWS installed and asks LWS/Grove
                     # to gang-schedule this many pods, one per node.
                     **({"multinode": {"nodeCount": node_count}} if node_count > 1 else {}),
@@ -218,7 +347,7 @@ def render_pool_dgd(job_id: str, key: str, chains: list[Chain], namespace: str) 
                         "mainContainer": {
                             "image": PLANNER_IMAGE,
                             "command": ["python3", "-m", "dynamo.planner"],
-                            "args": ["--config", planner_config(chains)],
+                            "args": ["--config", planner_config(rank)],
                         }
                     },
                 },
@@ -287,7 +416,7 @@ def _vllm_dtype(shape: dict[str, Any]) -> str | None:
     return str(weight or activation) if weight or activation else None
 
 
-def planner_config(chains: list[Chain]) -> str:
+def planner_config(rank: Rank) -> str:
     """PlannerConfig for one pool's standalone (non-hierarchical) Planner.
 
     Field names/values match the documented PlannerConfig reference
@@ -303,7 +432,7 @@ def planner_config(chains: list[Chain]) -> str:
     fields, which the docs don't reconcile. Runtime-unverified which the
     installed Planner binary actually accepts.
     """
-    shape = chains[0].shape_json
+    shape = rank.shape_json
     config = {
         "mode": "agg",
         "backend": required(shape, "engine_name"),
@@ -315,7 +444,7 @@ def planner_config(chains: list[Chain]) -> str:
         "load_predictor": "prophet",
         "load_adjustment_interval_seconds": 5,
         "min_endpoint": 1,
-        "max_gpu_budget": max_gpu_budget(chains),
+        "max_gpu_budget": max_gpu_budget(rank),
         "ttft_ms": required_float(shape, "target_p99_ttft_ms"),
         "itl_ms": required_float(shape, "target_p99_tpot_ms"),
     }
@@ -328,29 +457,23 @@ def capacity_type_for(shape: dict[str, Any]) -> str:
     return {"reserved": "reserved", "on_demand": "on-demand"}.get(str(market), str(market))
 
 
-def worker_gpu_count(chains: list[Chain]) -> int:
-    count = chains[0].shape_json.get("count")
+def worker_gpu_count(rank: Rank) -> int:
+    count = rank.shape_json.get("count")
     if type(count) is not int or count <= 0:
-        raise ValueError(f"chain {chains[0].chain_id} missing positive int count")
+        raise ValueError(f"rank {rank.rank_id} missing positive int count")
     return count
 
 
-def chain_node_count(chains: list[Chain]) -> int:
-    """Physical nodes the chain's worker pod-group spans; 1 = single node."""
-    node_count = chains[0].shape_json.get("node_count", 1)
+def rank_node_count(rank: Rank) -> int:
+    """Physical nodes one replica's worker pod-group spans; 1 = single node."""
+    node_count = rank.shape_json.get("node_count", 1)
     if type(node_count) is not int or node_count < 1:
-        raise ValueError(f"chain {chains[0].chain_id} node_count must be a positive int")
+        raise ValueError(f"rank {rank.rank_id} node_count must be a positive int")
     return node_count
 
 
-def max_gpu_budget(chains: list[Chain]) -> int:
-    total = 0
-    for chain in chains:
-        count = chain.shape_json.get("count")
-        if type(count) is not int or count <= 0:
-            raise ValueError(f"chain {chain.chain_id} missing positive int count")
-        total += count
-    return total
+def max_gpu_budget(rank: Rank) -> int:
+    return worker_gpu_count(rank) * rank.n_replicas
 
 
 def required(shape: dict[str, Any], key: str) -> str:
