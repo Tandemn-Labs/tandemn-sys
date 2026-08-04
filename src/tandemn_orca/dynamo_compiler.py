@@ -36,7 +36,10 @@ def compile_job(job_id: str, ranks: list[Rank], namespace: str = "default") -> l
 
 
 def render_router_configmap(
-    job_id: str, ranks: list[Rank], namespace: str = "default"
+    job_id: str,
+    ranks: list[Rank],
+    max_num_seq_by_rank: dict[str, int],
+    namespace: str = "default",
 ) -> dict[str, Any]:
     """Render the per-job router's global deployment registry."""
     plan_ids = {rank.plan_id for rank in ranks if rank.plan_id}
@@ -52,16 +55,17 @@ def render_router_configmap(
         endpoint = shape.get("router_endpoint")
         if not isinstance(endpoint, str) or not endpoint:
             raise ValueError(f"rank {rank.rank_id}: router_endpoint is required")
-        maximum = shape.get("maximum_requests")
-        if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
-            raise ValueError(f"rank {rank.rank_id}: maximum_requests must be a positive int")
+        max_num_seq = max_num_seq_by_rank.get(rank.rank_id)
+        if not max_num_seq:
+            raise ValueError(f"rank {rank.rank_id}: max_num_seq must be a positive int")
         deployments.append(
             {
                 "id": pool_dgd_name(job_id, rank),
                 "endpoint": endpoint,
                 "env": list(env),
                 "enabled": True,
-                "maximum_requests": maximum,
+                "max_num_seq": max_num_seq,
+                "maximum_requests": rank.n_replicas * max_num_seq,
             }
         )
 
@@ -101,6 +105,7 @@ def router_configmap_name(job_id: str) -> str:
 def render_router_objects(
     job_id: str,
     ranks: list[Rank],
+    max_num_seq_by_rank: dict[str, int],
     image: str,
     namespace: str = "default",
 ) -> list[dict[str, Any]]:
@@ -108,7 +113,7 @@ def render_router_objects(
     if not image:
         raise ValueError("router image is required")
     name = router_name(job_id)
-    configmap = render_router_configmap(job_id, ranks, namespace)
+    configmap = render_router_configmap(job_id, ranks, max_num_seq_by_rank, namespace)
     resource_labels = {
         "app.kubernetes.io/name": "tandemn-router",
         "tandemn.com/managed-by": "orca",
