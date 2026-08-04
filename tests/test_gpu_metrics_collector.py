@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from tandemn_system_data.models import Rank, RankRole, ResourceMap
 
 from tandemn_orca.scripts.gpu_metrics_collector import (
     KubeWorkerIndex,
+    RankTelemetrySnapshot,
+    RouterTelemetryClient,
     WorkerInfo,
     collect_once,
+    collect_rank_telemetry,
     resolve_instance_price_per_hour,
     validate_rank_identity,
 )
@@ -257,6 +262,71 @@ def test_validate_rank_identity_accepts_grove_slots_in_replica_range():
     assert workers["multi-leader"].chain_index == 2
     assert workers["multi-worker"].chain_index == 2
     assert workers["single-0"].ttft_target_ms == 500.0
+
+
+def test_collect_rank_telemetry_deduplicates_multinode_members():
+    class Prom:
+        def query_scalar(self, query):
+            return 3.0 if "num_requests_running" in query else 1.0
+
+    workers = {}
+    for chain_index in range(3):
+        for member_index in range(2):
+            worker = _worker(f"chain-{chain_index}-member-{member_index}", chain_index)
+            worker.member_index = member_index
+            worker.node_count = 2
+            worker.ready = chain_index < 2 or member_index == 0
+            workers[worker.worker_id] = worker
+    rank = _rank(3)
+    observed_at = datetime(2026, 8, 4, tzinfo=UTC)
+
+    snapshots = collect_rank_telemetry(Prom(), workers, [rank], observed_at)
+
+    assert snapshots == [
+        RankTelemetrySnapshot(
+            job_id="job_1",
+            rank_id="rank_0",
+            active_requests=6,
+            pending_requests=2,
+            ready_replicas=2,
+            observed_at=observed_at,
+        )
+    ]
+
+
+def test_router_telemetry_client_posts_authenticated_json(monkeypatch):
+    requests = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    def urlopen(request, timeout):
+        requests.append((request, timeout))
+        return Response()
+
+    monkeypatch.setattr(
+        "tandemn_orca.scripts.gpu_metrics_collector.urllib.request.urlopen", urlopen
+    )
+    snapshot = RankTelemetrySnapshot(
+        job_id="job_1",
+        rank_id="rank_0",
+        active_requests=2,
+        pending_requests=1,
+        ready_replicas=1,
+        observed_at=datetime(2026, 8, 4, tzinfo=UTC),
+    )
+
+    RouterTelemetryClient("http://{router_name}.routing.svc", "secret").push(snapshot)
+
+    request, timeout = requests[0]
+    assert request.full_url == "http://tdm-1-router.routing.svc/internal/telemetry"
+    assert request.headers["Authorization"] == "Bearer secret"
+    assert json.loads(request.data)["pending_requests"] == 1
+    assert timeout == 5.0
 
 
 def test_validate_rank_identity_fails_closed():
