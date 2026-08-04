@@ -8,7 +8,7 @@ field, or an integration Koi has not built yet.
 ## 1. Required: `instance_type` in every rank config
 
 Orca cannot invent placement. A ladder entry whose `config` lacks
-`instance_type` is **silently skipped** by `ladder_to_chains` (logged, not
+`instance_type` is **silently skipped** by `ladder_to_ranks` (logged, not
 fatal) — the rank simply never launches. Today the S4 prompt only *asks* the
 LLM for it and `validation/validator.py` does not check it.
 
@@ -40,7 +40,7 @@ place/swap without them fails to compile — the action is logged and skipped
 inside Koi at S6, and the **whole plan** fails to persist.
 
 **Ask (pick one):**
-- map `TERMINATE` → store `preempt` (Orca now implements preempt: chains torn
+- map `TERMINATE` → store `preempt` (Orca now implements preempt: ranks torn
   down, job → paused) and keep `DIAGNOSE` out of persisted plans, or
 - coordinate a store enum addition first (schema-owner decision).
 
@@ -48,41 +48,34 @@ inside Koi at S6, and the **whole plan** fails to persist.
 
 The executor persists only rank-level `mechanism_id`; the action-level one is
 dropped. Ranks that rely on inheriting the action's mechanism lose
-attribution in `chains.shape_json`.
+attribution in `ranks.shape_json`.
 
 **Ask:** stamp `mechanism_id` explicitly on every rank dict when building the
 ladder (the inheritance currently happens only in the EIG/switch-cost
 adapters, not in the persisted plan).
 
-## 5. Build: telemetry adapter over `GpuMetricStore`
+## 5. Telemetry adapter over `GpuMetricStore`
 
-`src/infra/telemetry.py` is a stub, so S7 evidence rows have no real data.
-The collector side is live: `gpu_metrics` gets one row per physical GPU per
-10s. Reading contract (clients in `tandemn_system_data`):
-
-- `GpuMetricStore.rows_for_rank(job_id, rank_id)` — the rank's rows
-  across its chains/GPUs. `rank_id` here **is** Koi's ladder `rank_id`
-  (`rank_0`, ...): Orca propagates it plan → chain shape → pod label →
-  telemetry, so it joins directly to `evidence_rows.rank_id`.
-- `rows_for_chain(chain_id)` — one DP replica. `chain_id` is the canonical
-  `chains.chain_id`.
-- `rows_in_window(job_id, start, end)` for trajectories.
+`src/infra/telemetry.py` reads one raw row per physical GPU and aggregates it
+to persistent `rank_<ULID>` evidence. The runtime identity is
+`(job_id, rank_id, chain_index)`, where `chain_index` is Grove's zero-based
+replica index. `rows_for_rank` and window reads expose the raw samples.
 
 Aggregation rules:
 - **Inference metrics** (`throughput_token_per_sec`, `p99_ttft_ms`,
   `cost_per_token`, ...) are chain-scoped and **repeat on every GPU row of a
-  TP>1 chain** — aggregate one value per distinct `chain_id`, never per row.
+  TP>1 replica** — aggregate one value per distinct `chain_index`, never per row.
 - **GPU hardware metrics** (`gpu_mem_used_fraction`, `sm_utilization`, ...)
   are genuinely per-row.
-- Rows with `chain_id IS NULL` are idle GPUs on tracked nodes (stranded
-  capacity) — they belong to no chain but count toward cluster utilization.
+- Rows with `chain_index IS NULL` are idle GPUs on tracked nodes (stranded
+  capacity) and still count toward cluster utilization.
 
 ## 6. Semantics: `n_replicas` is a ceiling, not a floor
 
 Orca compiles `n_replicas` into the Dynamo pool Planner's `max_gpu_budget`;
 the Planner scales DP width within `[1, n_replicas]` on its own SLA loop.
-Chain rows in the store are *authorized* capacity, not live pods — live width
-per rank = distinct `chain_id`s in recent `gpu_metrics`. If a plan ever means
+Rank rows store the authorized `n_replicas` ceiling, not live pods — live width
+is the distinct `chain_index` count in recent `gpu_metrics`. If a plan ever means
 "at least K replicas", say so — plumbing a `min_endpoint` through is a
 one-line Orca change once the contract carries it.
 

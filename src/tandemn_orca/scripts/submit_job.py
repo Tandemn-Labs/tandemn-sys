@@ -5,7 +5,7 @@ existing jobs and Orca transitions them, but neither creates them. New jobs
 start ``waiting``; Koi's next pass may place them.
 
 ``--spec`` is the job's spec_json. It must carry ``model_id`` -- Koi's ladder
-configs do not, and Orca backfills chain shapes from the job spec.
+configs do not, and Orca backfills rank shapes from the job spec.
 
 Online traffic intent is mutually exclusive. A user may submit either:
 
@@ -111,7 +111,7 @@ def normalize_job_spec(spec: dict[str, Any], kind: JobKind) -> dict[str, Any]:
     """Return canonical spec_json with Koi's user-owned X defaults."""
     model_id = spec.get("model_id")
     if not model_id:
-        raise SystemExit("--spec must include model_id (Orca backfills chain shapes from it)")
+        raise SystemExit("--spec must include model_id (Orca backfills rank shapes from it)")
 
     provided_request_rate = _has_any_user_key(spec, REQUEST_RATE_KEYS)
     provided_concurrency = _has_any_user_key(spec, CONCURRENCY_KEYS)
@@ -121,7 +121,7 @@ def normalize_job_spec(spec: dict[str, Any], kind: JobKind) -> dict[str, Any]:
             "concurrency/max_concurrent_streaming"
         )
 
-    features = dict(WORKLOAD_DEFAULTS)
+    features: dict[str, Any] = dict(WORKLOAD_DEFAULTS)
     if isinstance(spec.get("job_features"), dict):
         features.update(_canonical_user_features(spec["job_features"]))
     features.update(_canonical_user_features(spec))

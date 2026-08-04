@@ -1,30 +1,36 @@
 """Smoke test for the Orca apply-plan loop (place + swap).
 
 No Postgres: fake JobStore/PlanStore record the calls the loop makes, so
-we can assert each action type drives the right transition, chain
+we can assert each action type drives the right transition, rank
 launches, teardown, and that plans get marked applied once.
 """
 
 from __future__ import annotations
 
-from tandemn_system_data.models.chain import Chain
+from types import SimpleNamespace
+
+import pytest
 from tandemn_system_data.models.enums import (
     ActionType,
-    ChainRole,
-    ChainStatus,
-    JobKind,
     JobStatus,
+    RankRole,
+    RankStatus,
+    ReasonCode,
 )
-from tandemn_system_data.models.job import ChainAllocation, Job, RunningJob
 from tandemn_system_data.models.plan import Plan, PlanAction
+from tandemn_system_data.models.rank import Rank
 
 import tandemn_orca.orca as orca_mod
-from tandemn_orca.orca import Orca, ladder_to_chains
+from tandemn_orca.orca import Orca, ladder_to_ranks
+
+RANK_ID = "rank_01JBM2YQYZ1KQ9C8GZP1XB6V5T"
+OLD_RANK_ID = "rank_01JBM30YQ7X3WQAR6HF8C2Q9T8"
+NEW_RANK_ID = "rank_01JBM31YQ7X3WQAR6HF8C2Q9T8"
 
 EXPLICIT_LADDER = [
     {
         "role": "aggregate",
-        "rank_id": "rank_0",
+        "rank_id": RANK_ID,
         "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
         "config": {
             "model_id": "meta-llama/Llama-3.1-8B-Instruct",
@@ -43,28 +49,53 @@ EXPLICIT_LADDER = [
 
 
 class FakeJobStore:
-    def __init__(self, running: list[RunningJob] | None = None) -> None:
+    def __init__(
+        self,
+        active: list[Rank] | None = None,
+        job_statuses: dict[str, JobStatus] | None = None,
+    ) -> None:
         self.transitions: list[tuple[str, JobStatus, list[JobStatus]]] = []
-        self.launched: list[Chain] = []
-        self.chain_status: list[tuple[str, ChainStatus, list[ChainStatus]]] = []
-        self._running = running or []
+        self.launched: list[Rank] = []
+        self.rank_status: list[tuple[str, RankStatus, list[RankStatus], str | None]] = []
+        self.rows = {rank.rank_id: rank.model_copy(deep=True) for rank in active or []}
+        self.job_statuses = dict(job_statuses or {})
 
     def transition(self, job_id, to, expected, *, finish_reason=None):
         self.transitions.append((job_id, to, list(expected)))
+        if self.job_statuses.get(job_id) not in expected:
+            return False
+        self.job_statuses[job_id] = to
         return True
 
     def get(self, job_id):
-        return None
+        status = self.job_statuses.get(job_id)
+        return SimpleNamespace(spec_json={}, status=status) if status else None
 
-    def launch_chains(self, chains):
-        self.launched.extend(chains)
-        return chains
+    def launch_ranks(self, ranks):
+        self.launched.extend(ranks)
+        for rank in ranks:
+            existing = self.rows.get(rank.rank_id)
+            if existing and existing.job_id != rank.job_id:
+                raise ValueError(f"rank {rank.rank_id} already belongs to another job")
+            self.rows[rank.rank_id] = rank.model_copy(
+                deep=True,
+                update={"created_at": existing.created_at} if existing else {},
+            )
+        return ranks
 
-    def running_jobs(self, user_id):
-        return list(self._running)
+    def active_ranks(self, job_id):
+        return [
+            rank.model_copy(deep=True)
+            for rank in self.rows.values()
+            if rank.job_id == job_id and rank.status in (RankStatus.LAUNCHING, RankStatus.RUNNING)
+        ]
 
-    def set_chain_status(self, chain_id, to, expected):
-        self.chain_status.append((chain_id, to, list(expected)))
+    def set_rank_status(self, rank_id, to, expected, *, reason_code=None):
+        self.rank_status.append((rank_id, to, list(expected), reason_code))
+        rank = self.rows.get(rank_id)
+        if rank is None or rank.status not in expected:
+            return False
+        self.rows[rank_id] = rank.model_copy(update={"status": to, "reason_code": reason_code})
         return True
 
 
@@ -83,36 +114,48 @@ class FakePlanStore:
 
 class FakeLauncher:
     def __init__(self) -> None:
-        self.reconciled: list[tuple[str, list[Chain]]] = []
+        self.reconciled: list[tuple[str, list[Rank]]] = []
         self.torn_down_jobs: list[str] = []
 
-    def reconcile(self, job_id, chains):
-        self.reconciled.append((job_id, list(chains)))
+    def reconcile(self, job_id, ranks):
+        self.reconciled.append((job_id, list(ranks)))
 
     def teardown_job(self, job_id):
         self.torn_down_jobs.append(job_id)
 
 
-def _build_orca(monkeypatch, plans, running=None):
-    monkeypatch.setattr(orca_mod, "JobStore", lambda client: FakeJobStore(running))
+def _build_orca(monkeypatch, plans, active=None, job_statuses=None):
+    inferred_statuses = {
+        action.job_id: (
+            JobStatus.RUNNING
+            if action.type in (ActionType.SWAP, ActionType.PREEMPT)
+            else JobStatus.WAITING
+        )
+        for plan in plans
+        for action in plan.actions
+    }
+    inferred_statuses.update(job_statuses or {})
+    monkeypatch.setattr(
+        orca_mod,
+        "JobStore",
+        lambda client: FakeJobStore(active, inferred_statuses),
+    )
     monkeypatch.setattr(orca_mod, "PlanStore", lambda client: FakePlanStore(plans))
     return Orca(client=object(), launcher=FakeLauncher())
 
 
-# ----- ladder_to_chains ------------------------------------------------------
+# ----- ladder_to_ranks -------------------------------------------------------
 
 
-def test_ladder_to_chains_expands_replicas():
-    chains = ladder_to_chains(EXPLICIT_LADDER, job_id="job_B", plan_id="plan_1")
-    assert len(chains) == 3
-    roles = [c.role for c in chains]
-    assert roles == [ChainRole.AGGREGATE, ChainRole.AGGREGATE, ChainRole.AGGREGATE]
-    assert all(c.job_id == "job_B" and c.plan_id == "plan_1" for c in chains)
-    assert [c.shape_json["replica_index"] for c in chains] == [0, 1, 2]
+def test_ladder_to_ranks_keeps_replicas_on_one_rank():
+    ranks = ladder_to_ranks(EXPLICIT_LADDER, job_id="job_B", plan_id="plan_1")
+    assert len(ranks) == 1
+    assert ranks[0].role == RankRole.AGGREGATE
+    assert (ranks[0].job_id, ranks[0].plan_id, ranks[0].n_replicas) == ("job_B", "plan_1", 3)
 
 
-def test_ladder_to_chains_accepts_explicit_koi_rank():
-    chains = ladder_to_chains(
+def test_ladder_to_ranks_accepts_explicit_koi_rank():
+    ranks = ladder_to_ranks(
         EXPLICIT_LADDER,
         job_id="job_online_001",
         plan_id="plan_1",
@@ -120,9 +163,10 @@ def test_ladder_to_chains_accepts_explicit_koi_rank():
         target_p99_tpot_ms=50.0,
     )
 
-    assert len(chains) == 3
-    assert all(c.role == ChainRole.AGGREGATE for c in chains)
-    assert chains[0].shape_json == {
+    assert len(ranks) == 1
+    assert ranks[0].rank_id == RANK_ID
+    assert ranks[0].role == RankRole.AGGREGATE
+    assert ranks[0].shape_json == {
         "model_id": "meta-llama/Llama-3.1-8B-Instruct",
         "engine_name": "vllm",
         "instance_type": "g6e.12xlarge",
@@ -133,8 +177,6 @@ def test_ladder_to_chains_accepts_explicit_koi_rank():
         "ep": 1,
         "cp": 1,
         "count": 1,
-        "rank_id": "rank_0",
-        "replica_index": 0,
         "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
         "mechanism_id": "queueing_under_burst",
         "predicted_y": {"p99_ttft_ms": 120.0},
@@ -144,7 +186,7 @@ def test_ladder_to_chains_accepts_explicit_koi_rank():
     }
 
 
-def test_ladder_to_chains_skips_malformed():
+def test_ladder_to_ranks_skips_malformed():
     ok_config = {"gpu_count": 1, "instance_type": "g6.xlarge", "model_id": "m"}
     ladder = [
         {"role": "aggregate", "env": ["reserved", "aws", "r", "z", "L4"], "config": ok_config},
@@ -152,44 +194,69 @@ def test_ladder_to_chains_skips_malformed():
         {"role": "aggregate", "config": {"gpu_count": 0}},  # non-positive -> skip
         {"role": "bogus", "config": dict(ok_config)},  # bad role -> skip
         {"role": "aggregate", "config": dict(ok_config), "n_replicas": 0},  # bad replicas
+        {"role": "aggregate", "rank_id": "rank_7", "config": dict(ok_config)},
         "not-a-dict",  # skip
         # no instance_type -> unlaunchable -> skip
         {"role": "aggregate", "config": {"gpu_count": 1, "model_id": "m", "gpu_type": "L4"}},
         {
             "role": "aggregate",
-            "rank_id": "rank_7",
+            "rank_id": RANK_ID,
             "env": ["reserved", "aws", "r", "z", "L4"],
             "config": dict(ok_config),
         },
     ]
-    chains = ladder_to_chains(ladder, job_id="j", plan_id="p")
-    assert len(chains) == 1
-    assert chains[0].role == ChainRole.AGGREGATE
-    assert chains[0].shape_json["rank_id"] == "rank_7"
+    ranks = ladder_to_ranks(ladder, job_id="j", plan_id="p")
+    assert len(ranks) == 1
+    assert ranks[0].role == RankRole.AGGREGATE
+    assert ranks[0].rank_id == RANK_ID
 
 
-def test_ladder_to_chains_backfills_launch_fields():
+def test_ladder_to_ranks_backfills_launch_fields():
     """gpu_type from env[4], model_id from the job spec, engine_name default."""
     ladder = [
         {
             "role": "aggregate",
-            "rank_id": "rank_0",
+            "rank_id": RANK_ID,
             "env": ["on_demand", "aws", "us-east-1", "use1-az1", "L4"],
             "config": {"gpu_count": 2, "instance_type": "g6.12xlarge", "tp": 2},
         }
     ]
-    chains = ladder_to_chains(
+    ranks = ladder_to_ranks(
         ladder, job_id="j", plan_id="p", job_spec={"model_id": "Qwen/Qwen3-0.6B"}
     )
-    assert len(chains) == 1
-    shape = chains[0].shape_json
+    assert len(ranks) == 1
+    shape = ranks[0].shape_json
     assert shape["gpu_type"] == "L4"
     assert shape["model_id"] == "Qwen/Qwen3-0.6B"
     assert shape["engine_name"] == "vllm"
 
 
-def test_ladder_to_chains_none():
-    assert ladder_to_chains(None, job_id="j", plan_id="p") == []
+def test_ladder_to_ranks_none():
+    assert ladder_to_ranks(None, job_id="j", plan_id="p") == []
+
+
+def test_ladder_to_ranks_rejects_duplicate_rank_ids():
+    with pytest.raises(ValueError, match="duplicate rank_id"):
+        ladder_to_ranks([EXPLICIT_LADDER[0], EXPLICIT_LADDER[0]], job_id="j", plan_id="p")
+
+
+def test_duplicate_place_ranks_do_not_transition_or_persist(monkeypatch):
+    plan = Plan(
+        user_id="user_1",
+        actions=[
+            PlanAction(
+                job_id="job_B",
+                type=ActionType.PLACE,
+                ladder=[EXPLICIT_LADDER[0], EXPLICIT_LADDER[0]],
+            )
+        ],
+    )
+    orca = _build_orca(monkeypatch, [plan])
+
+    assert orca.apply_pending("user_1") == 1
+    assert orca._jobs.transitions == []
+    assert orca._jobs.rows == {}
+    assert orca._launcher.reconciled == []
 
 
 # ----- apply loop ------------------------------------------------------------
@@ -216,41 +283,154 @@ def test_place_transitions_and_launches(monkeypatch):
         ("job_B", JobStatus.RUNNING, [JobStatus.WAITING, JobStatus.PAUSED]),
     ]
     # rows recorded in the store AND workers brought up via the launcher
-    assert len(orca._jobs.launched) == 3
+    assert len(orca._jobs.launched) == 1
     assert len(orca._launcher.reconciled) == 1
     assert orca._launcher.reconciled[0][0] == "job_B"
-    assert len(orca._launcher.reconciled[0][1]) == 3
+    assert len(orca._launcher.reconciled[0][1]) == 1
     assert orca._jobs.launched[0].shape_json["target_p99_ttft_ms"] == 500.0
     assert orca._jobs.launched[0].shape_json["target_p99_tpot_ms"] == 50.0
+    assert orca._jobs.rank_status == [(RANK_ID, RankStatus.RUNNING, [RankStatus.LAUNCHING], None)]
 
 
 def test_swap_launches_new_and_tears_down_old(monkeypatch):
-    job = Job(job_id="job_F", user_id="user_1", kind=JobKind.ONLINE, status=JobStatus.RUNNING)
-    old_chain = ChainAllocation(
-        chain_id="chain_old",
+    old_rank = Rank(
+        rank_id=OLD_RANK_ID,
+        job_id="job_F",
         plan_id="plan_prev",
-        role=ChainRole.PREFILL,
-        status=ChainStatus.RUNNING,
+        role=RankRole.PREFILL,
+        status=RankStatus.RUNNING,
         shape_json={"gpu": "H100", "count": 8},
+        n_replicas=1,
     )
-    running = [RunningJob(job=job, chains=[old_chain])]
     plan = Plan(
         user_id="user_1",
         actions=[PlanAction(job_id="job_F", type=ActionType.SWAP, ladder=EXPLICIT_LADDER)],
     )
-    orca = _build_orca(monkeypatch, [plan], running=running)
+    orca = _build_orca(monkeypatch, [plan], active=[old_rank])
 
     assert orca.apply_pending("user_1") == 1
     # swap does not transition the job (stays running)
     assert orca._jobs.transitions == []
     # new ladder launched (rows + workers)
-    assert len(orca._jobs.launched) == 3
-    assert len(orca._launcher.reconciled[0][1]) == 3
+    assert len(orca._jobs.launched) == 1
+    assert len(orca._launcher.reconciled[0][1]) == 1
     # stale DGDs are deleted by reconcile diff; swap only marks old rows stopped.
     assert orca._launcher.torn_down_jobs == []
-    assert orca._jobs.chain_status == [
-        ("chain_old", ChainStatus.STOPPED, [ChainStatus.LAUNCHING, ChainStatus.RUNNING]),
+    assert orca._jobs.rank_status == [
+        (RANK_ID, RankStatus.RUNNING, [RankStatus.LAUNCHING], None),
+        (OLD_RANK_ID, RankStatus.STOPPED, [RankStatus.LAUNCHING, RankStatus.RUNNING], None),
     ]
+
+
+def test_swap_failure_restores_reused_rank_and_fails_only_new_rank(monkeypatch):
+    reused_rank = Rank(
+        rank_id=RANK_ID,
+        job_id="job_F",
+        plan_id="plan_prev",
+        role=RankRole.PREFILL,
+        status=RankStatus.RUNNING,
+        shape_json={"count": 2, "old": True},
+        n_replicas=1,
+    )
+    ladder = [
+        EXPLICIT_LADDER[0],
+        {**EXPLICIT_LADDER[0], "rank_id": NEW_RANK_ID},
+    ]
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_F", type=ActionType.SWAP, ladder=ladder)],
+    )
+    orca = _build_orca(monkeypatch, [plan], active=[reused_rank])
+
+    def fail_reconcile(job_id, ranks):
+        raise RuntimeError("boom")
+
+    orca._launcher.reconcile = fail_reconcile
+
+    assert orca.apply_pending("user_1") == 1
+    assert orca._jobs.rows[RANK_ID] == reused_rank
+    assert orca._jobs.rows[NEW_RANK_ID].status is RankStatus.FAILED
+    assert orca._jobs.rank_status == [
+        (NEW_RANK_ID, RankStatus.FAILED, [RankStatus.LAUNCHING], ReasonCode.LAUNCH_FAILED)
+    ]
+
+
+@pytest.mark.parametrize("previous_status", [JobStatus.WAITING, JobStatus.PAUSED])
+def test_place_failure_restores_previous_job_status(monkeypatch, previous_status):
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_B", type=ActionType.PLACE, ladder=EXPLICIT_LADDER)],
+    )
+    orca = _build_orca(monkeypatch, [plan], job_statuses={"job_B": previous_status})
+
+    def fail_reconcile(job_id, ranks):
+        raise RuntimeError("boom")
+
+    orca._launcher.reconcile = fail_reconcile
+
+    assert orca.apply_pending("user_1") == 1
+    assert orca._jobs.job_statuses["job_B"] is previous_status
+    assert orca._jobs.transitions == [
+        ("job_B", JobStatus.RUNNING, [JobStatus.WAITING, JobStatus.PAUSED]),
+        ("job_B", previous_status, [JobStatus.RUNNING]),
+    ]
+    assert orca._jobs.rows[RANK_ID].status is RankStatus.FAILED
+
+
+def test_swap_reuses_rank_with_new_replica_count_and_stops_removed_rank(monkeypatch):
+    reused_rank = Rank(
+        rank_id=RANK_ID,
+        job_id="job_F",
+        plan_id="plan_prev",
+        role=RankRole.AGGREGATE,
+        status=RankStatus.RUNNING,
+        shape_json={"count": 1},
+        n_replicas=1,
+    )
+    removed_rank = Rank(
+        rank_id=OLD_RANK_ID,
+        job_id="job_F",
+        plan_id="plan_prev",
+        role=RankRole.PREFILL,
+        status=RankStatus.RUNNING,
+        shape_json={"count": 2},
+        n_replicas=2,
+    )
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_F", type=ActionType.SWAP, ladder=EXPLICIT_LADDER)],
+    )
+    orca = _build_orca(monkeypatch, [plan], active=[reused_rank, removed_rank])
+
+    assert orca.apply_pending("user_1") == 1
+    assert orca._jobs.launched[0].rank_id == RANK_ID
+    assert orca._jobs.launched[0].n_replicas == 3
+    assert orca._jobs.rows[RANK_ID].n_replicas == 3
+    assert orca._jobs.rows[RANK_ID].status is RankStatus.RUNNING
+    assert orca._jobs.rank_status == [
+        (RANK_ID, RankStatus.RUNNING, [RankStatus.RUNNING], None),
+        (OLD_RANK_ID, RankStatus.STOPPED, [RankStatus.LAUNCHING, RankStatus.RUNNING], None),
+    ]
+
+
+def test_swap_without_launchable_rank_keeps_old_rank(monkeypatch):
+    old_rank = Rank(
+        rank_id=OLD_RANK_ID,
+        job_id="job_F",
+        plan_id="plan_prev",
+        role=RankRole.AGGREGATE,
+        status=RankStatus.RUNNING,
+        shape_json={"count": 1},
+        n_replicas=1,
+    )
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_F", type=ActionType.SWAP, ladder=[])],
+    )
+    orca = _build_orca(monkeypatch, [plan], active=[old_rank])
+
+    assert orca.apply_pending("user_1") == 1
+    assert orca._jobs.rank_status == []
 
 
 def test_keep_and_defer_are_noops(monkeypatch):
@@ -266,55 +446,61 @@ def test_keep_and_defer_are_noops(monkeypatch):
     assert orca.apply_pending("user_1") == 1
     assert orca._jobs.transitions == []
     assert orca._jobs.launched == []
-    assert orca._jobs.chain_status == []
+    assert orca._jobs.rank_status == []
     assert orca._launcher.torn_down_jobs == []
 
 
 def test_preempt_tears_down_and_pauses(monkeypatch):
-    job = Job(job_id="job_E", user_id="user_1", kind=JobKind.ONLINE, status=JobStatus.RUNNING)
-    chain = ChainAllocation(
-        chain_id="chain_live",
+    rank = Rank(
+        rank_id=OLD_RANK_ID,
+        job_id="job_E",
         plan_id="plan_prev",
-        role=ChainRole.AGGREGATE,
-        status=ChainStatus.RUNNING,
+        role=RankRole.AGGREGATE,
+        status=RankStatus.RUNNING,
         shape_json={"gpu": "L4", "count": 1},
+        n_replicas=1,
     )
     plan = Plan(
         user_id="user_1",
         actions=[PlanAction(job_id="job_E", type=ActionType.PREEMPT)],
     )
-    orca = _build_orca(monkeypatch, [plan], running=[RunningJob(job=job, chains=[chain])])
+    orca = _build_orca(monkeypatch, [plan], active=[rank])
 
     assert orca.apply_pending("user_1") == 1
     assert orca._launcher.torn_down_jobs == ["job_E"]
-    assert orca._jobs.chain_status == [
-        ("chain_live", ChainStatus.STOPPED, [ChainStatus.LAUNCHING, ChainStatus.RUNNING]),
+    assert orca._jobs.rank_status == [
+        (OLD_RANK_ID, RankStatus.STOPPED, [RankStatus.LAUNCHING, RankStatus.RUNNING], None),
     ]
     assert orca._jobs.transitions == [("job_E", JobStatus.PAUSED, [JobStatus.RUNNING])]
 
 
 def test_bad_action_does_not_wedge_the_plan(monkeypatch):
     """An action that raises is logged and skipped; the plan is still applied."""
+    good_ladder = [{**EXPLICIT_LADDER[0], "rank_id": NEW_RANK_ID}]
     plan = Plan(
         user_id="user_1",
         actions=[
             PlanAction(job_id="job_bad", type=ActionType.PLACE, ladder=EXPLICIT_LADDER),
-            PlanAction(job_id="job_good", type=ActionType.PLACE, ladder=EXPLICIT_LADDER),
+            PlanAction(job_id="job_good", type=ActionType.PLACE, ladder=good_ladder),
         ],
     )
     orca = _build_orca(monkeypatch, [plan])
     original = orca._launcher.reconcile
 
-    def explode_for_bad_job(job_id, chains):
+    def explode_for_bad_job(job_id, ranks):
         if job_id == "job_bad":
             raise RuntimeError("boom")
-        original(job_id, chains)
+        original(job_id, ranks)
 
     orca._launcher.reconcile = explode_for_bad_job
 
     assert orca.apply_pending("user_1") == 1
     assert orca._plans.applied == [plan.plan_id]
     assert [job for job, _ in orca._launcher.reconciled] == ["job_good"]
+    assert orca._jobs.rank_status == [
+        (RANK_ID, RankStatus.FAILED, [RankStatus.LAUNCHING], ReasonCode.LAUNCH_FAILED),
+        (NEW_RANK_ID, RankStatus.RUNNING, [RankStatus.LAUNCHING], None),
+    ]
 
 
 def test_apply_pending_no_plans(monkeypatch):

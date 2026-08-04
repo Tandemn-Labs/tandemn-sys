@@ -3,26 +3,39 @@ from __future__ import annotations
 import json
 
 import pytest
-from tandemn_system_data.models.chain import Chain
-from tandemn_system_data.models.enums import ChainRole
+from tandemn_system_data.models.enums import RankRole
+from tandemn_system_data.models.rank import Rank
 
 from tandemn_orca.dynamo_compiler import (
     compile_job,
-    group_chains,
     node_selector,
     pool_key,
-    render_pool_dgd,
+    render_rank_dgd,
+    render_router_configmap,
+    render_router_objects,
     worker_args,
 )
 
+RANK_IDS = [
+    "rank_01JBM2YQYZ1KQ9C8GZP1XB6V5T",
+    "rank_01JBM30YQ7X3WQAR6HF8C2Q9T8",
+    "rank_01JBM31YQ7X3WQAR6HF8C2Q9T8",
+]
 
-def _chain(
-    instance_type: str, gpu_type: str, plan_id: str = "plan_1", rank_id: str = "rank_0"
-) -> Chain:
-    return Chain(
+
+def _rank(
+    instance_type: str,
+    gpu_type: str,
+    plan_id: str = "plan_1",
+    rank_id: str = RANK_IDS[0],
+    n_replicas: int = 1,
+) -> Rank:
+    return Rank(
+        rank_id=rank_id,
         job_id="job_online_001",
         plan_id=plan_id,
-        role=ChainRole.AGGREGATE,
+        role=RankRole.AGGREGATE,
+        n_replicas=n_replicas,
         shape_json={
             "model_id": "meta-llama/Llama-3.1-8B-Instruct",
             "engine_name": "vllm",
@@ -30,7 +43,6 @@ def _chain(
             "gpu_type": gpu_type,
             "gpu_count": 1,
             "count": 1,
-            "rank_id": rank_id,
             "target_p99_ttft_ms": 500.0,
             "target_p99_tpot_ms": 50.0,
             "tp": 1,
@@ -59,20 +71,18 @@ def test_compile_job_renders_self_contained_dgd_for_each_gpu_pool():
     objects = compile_job(
         "job_online_001",
         [
-            _chain("p5.48xlarge", "H100", rank_id="rank_0"),
-            _chain("g6e.12xlarge", "L40S", rank_id="rank_1"),
-            _chain("g5.4xlarge", "A10", rank_id="rank_2"),
+            _rank("p5.48xlarge", "H100", rank_id=RANK_IDS[0]),
+            _rank("g6e.12xlarge", "L40S", rank_id=RANK_IDS[1]),
+            _rank("g5.4xlarge", "A10", rank_id=RANK_IDS[2]),
         ],
     )
     by_name = _objects_by_name(objects)
 
-    assert list(by_name) == [
-        "tdm-online-001-rank-0",
-        "tdm-online-001-rank-1",
-        "tdm-online-001-rank-2",
-    ]
+    assert len(by_name) == 3
 
-    h100 = by_name["tdm-online-001-rank-0"]
+    h100 = next(
+        obj for obj in objects if obj["metadata"]["labels"]["tandemn.com/rank-id"] == RANK_IDS[0]
+    )
     assert list(h100["spec"]["services"]) == [
         "Frontend",
         "LocalRouter",
@@ -87,11 +97,11 @@ def test_compile_job_renders_self_contained_dgd_for_each_gpu_pool():
         "meta-llama/Llama-3.1-8B-Instruct",
     ]
     assert h100["metadata"]["labels"]["tandemn.com/job-id"] == "job_online_001"
-    assert h100["metadata"]["labels"]["tandemn.com/rank-id"] == "rank_0"
+    assert h100["metadata"]["labels"]["tandemn.com/rank-id"] == RANK_IDS[0]
     for service_name, service in h100["spec"]["services"].items():
         expected = {
             "tandemn.com/job-id": "job_online_001",
-            "tandemn.com/rank-id": "rank_0",
+            "tandemn.com/rank-id": RANK_IDS[0],
             "tandemn.com/plan-id": "plan_1",
         }
         if service_name == "VllmDecodeWorker":
@@ -129,14 +139,12 @@ def test_compile_job_renders_self_contained_dgd_for_each_gpu_pool():
     ]
 
 
-def test_duplicate_chains_compile_to_one_pool_with_max_budget():
-    objects = compile_job("job_online_001", [_chain("g6e.12xlarge", "L40S") for _ in range(3)])
+def test_one_rank_compiles_to_one_pool_with_replica_budget():
+    objects = compile_job("job_online_001", [_rank("g6e.12xlarge", "L40S", n_replicas=3)])
     by_name = _objects_by_name(objects)
 
-    assert list(by_name) == [
-        "tdm-online-001-rank-0",
-    ]
-    pool = by_name["tdm-online-001-rank-0"]
+    assert len(by_name) == 1
+    pool = next(iter(by_name.values()))
     planner = pool["spec"]["services"]["Planner"]
     planner_config = json.loads(planner["extraPodSpec"]["mainContainer"]["args"][1])
 
@@ -156,28 +164,78 @@ def test_duplicate_chains_compile_to_one_pool_with_max_budget():
     assert "pool_key" not in planner_config
 
 
+def test_router_configmap_matches_router_json_contract():
+    rank = _rank("g6e.12xlarge", "L40S")
+    rank.shape_json.update(
+        {
+            "router_endpoint": "https://rank.example.internal",
+            "maximum_requests": 64,
+        }
+    )
+
+    configmap = render_router_configmap("job_online_001", [rank], "routing")
+    config = json.loads(configmap["data"]["router.json"])
+
+    assert configmap["metadata"]["namespace"] == "routing"
+    assert configmap["metadata"]["labels"]["tandemn.com/job-id"] == "job_online_001"
+    assert config == {
+        "version": "plan_1",
+        "job_id": "job_online_001",
+        "overflow_threshold": 0.8,
+        "deployments": [
+            {
+                "id": "tdm-online-001-03a2a00c",
+                "endpoint": "https://rank.example.internal",
+                "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
+                "enabled": True,
+                "maximum_requests": 64,
+            }
+        ],
+    }
+
+
+def test_router_objects_mount_config_and_expose_service():
+    rank = _rank("g6e.12xlarge", "L40S")
+    rank.shape_json.update(
+        {
+            "router_endpoint": "https://rank.example.internal",
+            "maximum_requests": 64,
+        }
+    )
+
+    configmap, deployment, service = render_router_objects(
+        "job_online_001", [rank], "registry.example/tandemn-router:test", "routing"
+    )
+
+    assert configmap["metadata"]["name"] == "tdm-online-001-router-config"
+    container = deployment["spec"]["template"]["spec"]["containers"][0]
+    assert container["image"] == "registry.example/tandemn-router:test"
+    assert container["volumeMounts"] == [
+        {"name": "config", "mountPath": "/config", "readOnly": True}
+    ]
+    assert deployment["spec"]["template"]["spec"]["volumes"] == [
+        {"name": "config", "configMap": {"name": "tdm-online-001-router-config"}}
+    ]
+    assert service["spec"]["ports"] == [{"name": "http", "port": 80, "targetPort": "http"}]
+
+
 def test_rank_id_pools_per_rung():
-    first = _chain("g6e.12xlarge", "L40S")
-    second = _chain("g6e.12xlarge", "L40S")
-    first.shape_json["rank_id"] = "rank_0"
-    second.shape_json["rank_id"] = "rank_1"
+    first = _rank("g6e.12xlarge", "L40S", rank_id=RANK_IDS[0])
+    second = _rank("g6e.12xlarge", "L40S", rank_id=RANK_IDS[1])
 
     objects = compile_job("job_online_001", [first, second])
     by_name = _objects_by_name(objects)
 
     # Same-shape rungs stay separate pools when rank_id is present.
-    assert list(by_name) == [
-        "tdm-online-001-rank-0",
-        "tdm-online-001-rank-1",
-    ]
+    assert len(by_name) == 2
 
 
-def test_compile_job_requires_rank_id():
-    chain = _chain("g6e.12xlarge", "L40S")
-    del chain.shape_json["rank_id"]
-
-    with pytest.raises(ValueError, match="rank_id"):
-        compile_job("job_online_001", [chain])
+def test_compile_job_rejects_duplicate_rank_ids():
+    with pytest.raises(ValueError, match="duplicate rank_id"):
+        compile_job(
+            "job_online_001",
+            [_rank("g6e.12xlarge", "L40S"), _rank("g6e.12xlarge", "L40S")],
+        )
 
 
 def test_worker_args_maps_tp_and_pp():
@@ -194,19 +252,18 @@ def test_worker_args_omits_pp_when_absent():
     assert "--pipeline-parallel-size" not in args
 
 
-def test_pool_key_and_selector_are_from_chain_shape():
-    chain = _chain("g5.4xlarge", "A10")
+def test_pool_key_and_selector_are_from_rank_shape():
+    rank = _rank("g5.4xlarge", "A10")
 
-    assert pool_key(chain) == "rank-0-g5-4xlarge-a10"
-    assert list(group_chains([chain])) == ["rank-0-g5-4xlarge-a10"]
-    assert node_selector(chain.shape_json) == {
+    assert pool_key(rank) == f"{RANK_IDS[0].replace('_', '-')}-g5-4xlarge-a10".lower()
+    assert node_selector(rank.shape_json) == {
         "node.kubernetes.io/instance-type": "g5.4xlarge",
         "karpenter.sh/capacity-type": "reserved",
     }
 
 
 def test_worker_args_adds_quantization_and_spec_decoding_flags():
-    shape = dict(_chain("p5.48xlarge", "H100").shape_json)
+    shape = dict(_rank("p5.48xlarge", "H100").shape_json)
     shape.update(
         {
             "weight_quantization_method": "awq",
@@ -227,19 +284,19 @@ def test_worker_args_adds_quantization_and_spec_decoding_flags():
     assert args[args.index("--spec-tokens") + 1] == "4"
 
 
-def test_single_node_chain_has_no_multinode_block():
-    chain = _chain("g6.xlarge", "L4")
-    dgd = render_pool_dgd("job_1", pool_key(chain), [chain], "default")
+def test_single_node_rank_has_no_multinode_block():
+    rank = _rank("g6.xlarge", "L4")
+    dgd = render_rank_dgd("job_1", rank, "default")
     worker = dgd["spec"]["services"]["VllmDecodeWorker"]
 
     assert "multinode" not in worker
     assert worker["resources"] == {"requests": {"gpu": "1"}, "limits": {"gpu": "1"}}
 
 
-def test_multinode_chain_splits_gpus_per_node():
-    chain = _chain("g6.xlarge", "L4")
-    chain.shape_json.update({"count": 2, "node_count": 2, "tp": 1, "pp": 2})
-    dgd = render_pool_dgd("job_1", pool_key(chain), [chain], "default")
+def test_multinode_rank_splits_gpus_per_node():
+    rank = _rank("g6.xlarge", "L4")
+    rank.shape_json.update({"count": 2, "node_count": 2, "tp": 1, "pp": 2})
+    dgd = render_rank_dgd("job_1", rank, "default")
     worker = dgd["spec"]["services"]["VllmDecodeWorker"]
 
     assert worker["multinode"] == {"nodeCount": 2}
@@ -250,7 +307,7 @@ def test_multinode_chain_splits_gpus_per_node():
 
 
 def test_multinode_uneven_gpu_split_raises():
-    chain = _chain("g6.xlarge", "L4")
-    chain.shape_json.update({"count": 3, "node_count": 2})
+    rank = _rank("g6.xlarge", "L4")
+    rank.shape_json.update({"count": 3, "node_count": 2})
     with pytest.raises(ValueError, match="does not divide evenly"):
-        render_pool_dgd("job_1", pool_key(chain), [chain], "default")
+        render_rank_dgd("job_1", rank, "default")
