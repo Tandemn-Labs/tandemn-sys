@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -50,6 +51,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from tandemn_system_data.clients import (
@@ -60,12 +63,14 @@ from tandemn_system_data.clients import (
 )
 from tandemn_system_data.models import GpuMetric, Rank, ResourceMap
 
+from tandemn_orca.dynamo_compiler import router_name
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROMETHEUS_URL = "http://localhost:9090"
 
 # Fixed poll cadence for the looping mode (matches the Prometheus scrape rate).
-COLLECT_INTERVAL_SECONDS = 10
+COLLECT_INTERVAL_SECONDS = 5
 
 # Per-GPU instant queries. {gpu} expands to a DCGM label selector pinning one
 # physical GPU. Expressions mirror cloud-setup/EKS/METRICS.md.
@@ -197,6 +202,45 @@ class PrometheusClient:
         return targets
 
 
+@dataclass(frozen=True)
+class RankTelemetrySnapshot:
+    job_id: str
+    rank_id: str
+    active_requests: int
+    pending_requests: int
+    ready_replicas: int
+    observed_at: datetime
+
+
+class RouterTelemetryClient:
+    def __init__(self, url_template: str, token: str, timeout: float = 5.0) -> None:
+        self.url_template = url_template
+        self.token = token
+        self.timeout = timeout
+
+    def push(self, snapshot: RankTelemetrySnapshot) -> None:
+        base_url = self.url_template.format(
+            job_id=snapshot.job_id,
+            router_name=router_name(snapshot.job_id),
+        ).rstrip("/")
+        request = urllib.request.Request(
+            f"{base_url}/internal/telemetry",
+            data=json.dumps(
+                {
+                    **snapshot.__dict__,
+                    "observed_at": snapshot.observed_at.isoformat(),
+                }
+            ).encode(),
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout):
+            pass
+
+
 def _gpu_selector(target: dict[str, str]) -> str:
     """DCGM label selector that pins one GPU; prefer UUID, else instance."""
     if target.get("uuid_label"):
@@ -247,6 +291,7 @@ class WorkerInfo:
         pod_index: int | None = None,
         model_name: str | None = None,
         ttft_target_ms: float | None = None,
+        ready: bool = True,
     ) -> None:
         self.worker_id = worker_id
         self.node_name = node_name
@@ -262,6 +307,7 @@ class WorkerInfo:
         self.gpus_per_node = 1
         self.model_name = model_name
         self.ttft_target_ms = ttft_target_ms
+        self.ready = ready
 
 
 def _model_from_pod(pod: Any) -> str | None:
@@ -327,6 +373,10 @@ class KubeWorkerIndex:
             pod_index = _index(labels.get(_LABEL_POD_INDEX))
             scaling_group_index = _index(labels.get(_LABEL_PCSG_INDEX))
             clique = labels.get(_LABEL_POD_CLIQUE, "")
+            ready = any(
+                condition.type == "Ready" and condition.status == "True"
+                for condition in (getattr(getattr(pod, "status", None), "conditions", None) or [])
+            )
             member_index = None
             if scaling_group_index is not None:
                 if clique.endswith("-ldr"):
@@ -345,6 +395,7 @@ class KubeWorkerIndex:
                 member_index=member_index,
                 pod_index=pod_index,
                 model_name=_model_from_pod(pod),
+                ready=ready,
             )
         return index
 
@@ -419,6 +470,53 @@ def _worker_inference_values(
         else None
     )
     return values
+
+
+def collect_rank_telemetry(
+    prom: PrometheusClient,
+    workers_by_pod: dict[str, WorkerInfo],
+    ranks: list[Rank],
+    observed_at: datetime | None = None,
+) -> list[RankTelemetrySnapshot]:
+    """Aggregate ready runtime replicas into one router snapshot per rank."""
+    observed_at = observed_at or datetime.now(UTC)
+    workers_by_rank: dict[tuple[str, str], list[WorkerInfo]] = {}
+    for worker in workers_by_pod.values():
+        if worker.job_id and worker.rank_id and worker.chain_index is not None:
+            workers_by_rank.setdefault((worker.job_id, worker.rank_id), []).append(worker)
+
+    snapshots = []
+    for rank in ranks:
+        chains: dict[int, list[WorkerInfo]] = {}
+        for worker in workers_by_rank.get((rank.job_id, rank.rank_id), []):
+            assert worker.chain_index is not None
+            chains.setdefault(worker.chain_index, []).append(worker)
+
+        active = pending = ready_replicas = 0
+        for members in chains.values():
+            if len([member for member in members if member.ready]) < members[0].node_count:
+                continue
+            representative = min(members, key=lambda member: member.member_index or 0)
+            selector = f'pod="{representative.worker_id}"'
+            running = prom.query_scalar(WORKER_QUERIES["live_batch_size"].format(worker=selector))
+            waiting = prom.query_scalar(WORKER_QUERIES["depth_req_q"].format(worker=selector))
+            if running is None or waiting is None:
+                continue
+            active += math.ceil(max(0.0, running))
+            pending += math.ceil(max(0.0, waiting))
+            ready_replicas += 1
+
+        snapshots.append(
+            RankTelemetrySnapshot(
+                job_id=rank.job_id,
+                rank_id=rank.rank_id,
+                active_requests=active,
+                pending_requests=pending,
+                ready_replicas=ready_replicas,
+                observed_at=observed_at,
+            )
+        )
+    return snapshots
 
 
 def collect_once(
@@ -582,6 +680,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Prometheus base URL (or TANDEMN_PROMETHEUS_URL)",
     )
     parser.add_argument(
+        "--router-url-template",
+        default=os.getenv("TANDEMN_ROUTER_URL_TEMPLATE"),
+        help="Per-job router URL template with {job_id} and/or {router_name}",
+    )
+    parser.add_argument(
+        "--router-telemetry-token",
+        default=os.getenv("TANDEMN_ROUTER_TELEMETRY_TOKEN"),
+        help="Bearer token shared with job routers",
+    )
+    parser.add_argument(
         "--namespace", default="default", help="Kubernetes namespace of the worker pods"
     )
     parser.add_argument(
@@ -600,6 +708,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     args = parse_args(argv)
+    if args.router_url_template and not args.router_telemetry_token:
+        raise SystemExit("--router-telemetry-token is required with --router-url-template")
 
     prom = PrometheusClient(args.prometheus_url)
     client = PostgresClient()
@@ -609,6 +719,11 @@ def main(argv: list[str] | None = None) -> int:
         ResourceMapStore(client, user_id=args.user_id) if args.user_id is not None else None
     )
     kube = KubeWorkerIndex(namespace=args.namespace)
+    router_telemetry = (
+        RouterTelemetryClient(args.router_url_template, args.router_telemetry_token)
+        if args.router_url_template
+        else None
+    )
 
     for _ in _ticks(args.once):
         workers_by_pod = kube.by_pod()
@@ -617,6 +732,16 @@ def main(argv: list[str] | None = None) -> int:
         job_ids = sorted({w.job_id for w in workers_by_pod.values() if w.job_id})
         ranks = [rank for job_id in job_ids for rank in jobs.active_ranks(job_id)]
         validate_rank_identity(workers_by_pod, ranks)
+        if router_telemetry is not None:
+            for snapshot in collect_rank_telemetry(prom, workers_by_pod, ranks):
+                try:
+                    router_telemetry.push(snapshot)
+                except (urllib.error.URLError, TimeoutError, OSError):
+                    logger.exception(
+                        "router telemetry push failed for job=%s rank=%s",
+                        snapshot.job_id,
+                        snapshot.rank_id,
+                    )
 
         node_names_by_ip, instance_types_by_node = kube.nodes()
         # Re-read per tick: the map is one row and Orca republishes prices.

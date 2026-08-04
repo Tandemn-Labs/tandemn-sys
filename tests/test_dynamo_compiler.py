@@ -180,6 +180,7 @@ def test_router_configmap_matches_router_json_contract():
         "deployments": [
             {
                 "id": "tdm-online-001-03a2a00c",
+                "rank_id": rank.rank_id,
                 "endpoint": "https://rank.example.internal",
                 "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
                 "enabled": True,
@@ -205,6 +206,11 @@ def test_router_objects_mount_config_and_expose_service():
     assert configmap["metadata"]["name"] == "tdm-online-001-router-config"
     container = deployment["spec"]["template"]["spec"]["containers"][0]
     assert container["image"] == "registry.example/tandemn-router:test"
+    assert container["readinessProbe"]["httpGet"]["path"] == "/readyz"
+    assert container["env"][0]["valueFrom"]["secretKeyRef"] == {
+        "name": "tandemn-router-telemetry",
+        "key": "token",
+    }
     assert container["volumeMounts"] == [
         {"name": "config", "mountPath": "/config", "readOnly": True}
     ]
