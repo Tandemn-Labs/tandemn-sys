@@ -43,8 +43,12 @@ class FakeCore:
         self.deleted: list[tuple] = []
 
     def list_namespaced_config_map(self, namespace, label_selector):
-        self.selector = (namespace, label_selector)
+        self.configmap_selector = (namespace, label_selector)
         return SimpleNamespace(items=[SimpleNamespace(metadata=SimpleNamespace(name="cm"))])
+
+    def list_namespaced_service(self, namespace, label_selector):
+        self.service_selector = (namespace, label_selector)
+        return SimpleNamespace(items=[SimpleNamespace(metadata=SimpleNamespace(name="svc"))])
 
     def patch_namespaced_config_map(self, *args, **kwargs):
         self.applied.append((args, kwargs))
@@ -83,6 +87,10 @@ class FakeApps:
     def patch_namespaced_deployment(self, *args, **kwargs):
         self.applied.append((args, kwargs))
 
+    def list_namespaced_deployment(self, namespace, label_selector):
+        self.selector = (namespace, label_selector)
+        return SimpleNamespace(items=[SimpleNamespace(metadata=SimpleNamespace(name="deploy"))])
+
     def delete_namespaced_deployment(self, *args):
         self.deleted.append(args)
 
@@ -92,16 +100,22 @@ def test_object_key_and_selector():
     assert job_selector("job_1") == "tandemn.com/managed-by=orca,tandemn.com/job-id=job_1"
 
 
-def test_list_job_objects_reads_configmaps_and_dgds():
+def test_list_job_objects_reads_all_managed_resources():
     core = FakeCore()
     custom = FakeCustom()
-    client = DynamoKubernetesClient("ns", core=core, custom=custom)
+    apps = FakeApps()
+    client = DynamoKubernetesClient("ns", core=core, custom=custom, apps=apps)
 
     assert client.list_job_objects("job_1") == {
         ("ConfigMap", "cm"),
+        ("Service", "svc"),
+        ("Deployment", "deploy"),
         ("DynamoGraphDeployment", "dgd"),
     }
-    assert core.selector == ("ns", "tandemn.com/managed-by=orca,tandemn.com/job-id=job_1")
+    selector = ("ns", "tandemn.com/managed-by=orca,tandemn.com/job-id=job_1")
+    assert core.configmap_selector == selector
+    assert core.service_selector == selector
+    assert apps.selector == selector
     assert custom.selector == (
         (GROUP, VERSION, "ns", DGD_PLURAL),
         {"label_selector": "tandemn.com/managed-by=orca,tandemn.com/job-id=job_1"},

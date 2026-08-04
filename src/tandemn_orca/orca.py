@@ -37,7 +37,6 @@ from tandemn_system_data.models.enums import ActionType, JobStatus, RankRole, Ra
 from tandemn_system_data.models.plan import Plan, PlanAction
 from tandemn_system_data.models.rank import Rank
 
-from tandemn_orca.dynamo_kubernetes import load_kube_client
 from tandemn_orca.launcher import DynamoLauncher, Launcher, ModelCatalogError, NoopLauncher
 from tandemn_orca.scripts.resource_map_from_aws import CapacityRefresher, parse_region_csv
 
@@ -329,9 +328,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Orca against Tandemn Store plans.")
     parser.add_argument("--user-id", default=os.getenv("TANDEMN_USER_ID"))
     parser.add_argument("--namespace", default=os.getenv("TANDEMN_K8S_NAMESPACE", "default"))
-    parser.add_argument("--router-namespace", default=os.getenv("TANDEMN_ROUTER_NAMESPACE"))
-    parser.add_argument("--router-kubeconfig", default=os.getenv("TANDEMN_ROUTER_KUBECONFIG"))
-    parser.add_argument("--router-context", default=os.getenv("TANDEMN_ROUTER_CONTEXT"))
     parser.add_argument("--router-image", default=os.getenv("TANDEMN_ROUTER_IMAGE"))
     parser.add_argument(
         "--aws-regions",
@@ -356,11 +352,6 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if not args.user_id:
         raise SystemExit("--user-id or TANDEMN_USER_ID is required")
-    if args.router_namespace and not args.router_image:
-        raise SystemExit(
-            "--router-image or TANDEMN_ROUTER_IMAGE is required with router publishing"
-        )
-
     client = PostgresClient()
     refresher = CapacityRefresher(
         client,
@@ -373,18 +364,12 @@ def main(argv: list[str] | None = None) -> None:
     except Exception:
         logger.exception("capacity refresh failed")
 
-    router_k8s = (
-        load_kube_client(args.router_namespace, args.router_kubeconfig, args.router_context)
-        if args.router_namespace
-        else None
-    )
     orca = Orca(
         client,
         launcher=DynamoLauncher(
             namespace=args.namespace,
-            router_k8s=router_k8s,
             router_image=args.router_image,
-            model_catalogs=ModelCatalogStore(client) if router_k8s is not None else None,
+            model_catalogs=ModelCatalogStore(client) if args.router_image else None,
         ),
     )
     while True:

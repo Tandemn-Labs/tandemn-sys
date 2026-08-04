@@ -53,9 +53,6 @@ def render_router_configmap(
         env = shape.get("env")
         if not isinstance(env, (list, tuple)) or len(env) != 5 or not all(env):
             raise ValueError(f"rank {rank.rank_id}: router config requires a five-part env")
-        endpoint = shape.get("router_endpoint")
-        if not isinstance(endpoint, str) or not endpoint:
-            raise ValueError(f"rank {rank.rank_id}: router_endpoint is required")
         max_num_seq = max_num_seq_by_rank.get(rank.rank_id)
         if not max_num_seq:
             raise ValueError(f"rank {rank.rank_id}: max_num_seq must be a positive int")
@@ -63,7 +60,7 @@ def render_router_configmap(
             {
                 "id": pool_dgd_name(job_id, rank),
                 "rank_id": rank.rank_id,
-                "endpoint": endpoint,
+                "endpoint": frontend_service_endpoint(job_id, rank, namespace),
                 "env": list(env),
                 "enabled": True,
                 "max_num_seq": max_num_seq,
@@ -191,6 +188,10 @@ def render_router_objects(
 
 def router_name(job_id: str) -> str:
     return dgd_name(job_id, "router")
+
+
+def frontend_service_endpoint(job_id: str, rank: Rank, namespace: str) -> str:
+    return f"http://{pool_dgd_name(job_id, rank)}-frontend.{namespace}.svc.cluster.local:8000"
 
 
 def pool_key(rank: Rank) -> str:
