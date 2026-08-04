@@ -63,11 +63,17 @@ class DynamoKubernetesClient:
         configmaps = self.core.list_namespaced_config_map(
             self.namespace, label_selector=selector
         ).items
+        services = self.core.list_namespaced_service(self.namespace, label_selector=selector).items
+        deployments = self.apps.list_namespaced_deployment(
+            self.namespace, label_selector=selector
+        ).items
         dgds = self.custom.list_namespaced_custom_object(
             GROUP, VERSION, self.namespace, DGD_PLURAL, label_selector=selector
         ).get("items", [])
         return {
             *(("ConfigMap", item.metadata.name) for item in configmaps),
+            *(("Service", item.metadata.name) for item in services),
+            *(("Deployment", item.metadata.name) for item in deployments),
             *(("DynamoGraphDeployment", item["metadata"]["name"]) for item in dgds),
         }
 
