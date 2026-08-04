@@ -166,14 +166,9 @@ def test_one_rank_compiles_to_one_pool_with_replica_budget():
 
 def test_router_configmap_matches_router_json_contract():
     rank = _rank("g6e.12xlarge", "L40S")
-    rank.shape_json.update(
-        {
-            "router_endpoint": "https://rank.example.internal",
-            "maximum_requests": 64,
-        }
-    )
+    rank.shape_json["router_endpoint"] = "https://rank.example.internal"
 
-    configmap = render_router_configmap("job_online_001", [rank], "routing")
+    configmap = render_router_configmap("job_online_001", [rank], {rank.rank_id: 256}, "routing")
     config = json.loads(configmap["data"]["router.json"])
 
     assert configmap["metadata"]["namespace"] == "routing"
@@ -188,7 +183,8 @@ def test_router_configmap_matches_router_json_contract():
                 "endpoint": "https://rank.example.internal",
                 "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
                 "enabled": True,
-                "maximum_requests": 64,
+                "max_num_seq": 256,
+                "maximum_requests": 256,
             }
         ],
     }
@@ -196,15 +192,14 @@ def test_router_configmap_matches_router_json_contract():
 
 def test_router_objects_mount_config_and_expose_service():
     rank = _rank("g6e.12xlarge", "L40S")
-    rank.shape_json.update(
-        {
-            "router_endpoint": "https://rank.example.internal",
-            "maximum_requests": 64,
-        }
-    )
+    rank.shape_json["router_endpoint"] = "https://rank.example.internal"
 
     configmap, deployment, service = render_router_objects(
-        "job_online_001", [rank], "registry.example/tandemn-router:test", "routing"
+        "job_online_001",
+        [rank],
+        {rank.rank_id: 256},
+        "registry.example/tandemn-router:test",
+        "routing",
     )
 
     assert configmap["metadata"]["name"] == "tdm-online-001-router-config"
