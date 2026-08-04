@@ -17,7 +17,19 @@ VERSION = "v1alpha1"
 DGD_PLURAL = "dynamographdeployments"
 
 
-def load_kube_client(namespace: str = "default") -> DynamoKubernetesClient:
+def load_kube_client(
+    namespace: str = "default",
+    kubeconfig: str | None = None,
+    context: str | None = None,
+) -> DynamoKubernetesClient:
+    if kubeconfig is not None or context is not None:
+        api_client = config.new_client_from_config(config_file=kubeconfig, context=context)
+        return DynamoKubernetesClient(
+            namespace,
+            core=client.CoreV1Api(api_client),
+            custom=client.CustomObjectsApi(api_client),
+            apps=client.AppsV1Api(api_client),
+        )
     try:
         config.load_incluster_config()
     except ConfigException:
@@ -34,10 +46,17 @@ def job_selector(job_id: str) -> str:
 
 
 class DynamoKubernetesClient:
-    def __init__(self, namespace: str = "default", core: Any = None, custom: Any = None) -> None:
+    def __init__(
+        self,
+        namespace: str = "default",
+        core: Any = None,
+        custom: Any = None,
+        apps: Any = None,
+    ) -> None:
         self.namespace = namespace
         self.core = core or client.CoreV1Api()
         self.custom = custom or client.CustomObjectsApi()
+        self.apps = apps or client.AppsV1Api()
 
     def list_job_objects(self, job_id: str) -> set[ObjectKey]:
         selector = job_selector(job_id)
@@ -61,6 +80,26 @@ class DynamoKubernetesClient:
         kind, name = object_key(obj)
         if kind == "ConfigMap":
             self.core.patch_namespaced_config_map(
+                name,
+                self.namespace,
+                obj,
+                field_manager=FIELD_MANAGER,
+                force=True,
+                _content_type=APPLY,
+            )
+            return
+        if kind == "Deployment":
+            self.apps.patch_namespaced_deployment(
+                name,
+                self.namespace,
+                obj,
+                field_manager=FIELD_MANAGER,
+                force=True,
+                _content_type=APPLY,
+            )
+            return
+        if kind == "Service":
+            self.core.patch_namespaced_service(
                 name,
                 self.namespace,
                 obj,
@@ -95,6 +134,12 @@ class DynamoKubernetesClient:
         try:
             if kind == "ConfigMap":
                 self.core.delete_namespaced_config_map(name, self.namespace)
+                return
+            if kind == "Deployment":
+                self.apps.delete_namespaced_deployment(name, self.namespace)
+                return
+            if kind == "Service":
+                self.core.delete_namespaced_service(name, self.namespace)
                 return
             if kind == "DynamoGraphDeployment":
                 self.custom.delete_namespaced_custom_object(
