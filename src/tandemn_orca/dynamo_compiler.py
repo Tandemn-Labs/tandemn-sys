@@ -27,6 +27,7 @@ PLANNER_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.1"
 # len(service name) <= 45 for pod naming; our longest service is
 # "VllmDecodeWorker" (16), so DGD names must stay within 29.
 MAX_DGD_NAME = 29
+ROUTER_TELEMETRY_SECRET = "tandemn-router-telemetry"
 
 
 def compile_job(job_id: str, ranks: list[Rank], namespace: str = "default") -> list[dict[str, Any]]:
@@ -61,6 +62,7 @@ def render_router_configmap(
         deployments.append(
             {
                 "id": pool_dgd_name(job_id, rank),
+                "rank_id": rank.rank_id,
                 "endpoint": endpoint,
                 "env": list(env),
                 "enabled": True,
@@ -143,10 +145,21 @@ def render_router_objects(
                                     ":8080",
                                 ],
                                 "ports": [{"name": "http", "containerPort": 8080}],
+                                "env": [
+                                    {
+                                        "name": "TANDEMN_ROUTER_TELEMETRY_TOKEN",
+                                        "valueFrom": {
+                                            "secretKeyRef": {
+                                                "name": ROUTER_TELEMETRY_SECRET,
+                                                "key": "token",
+                                            }
+                                        },
+                                    }
+                                ],
                                 "volumeMounts": [
                                     {"name": "config", "mountPath": "/config", "readOnly": True}
                                 ],
-                                "readinessProbe": {"httpGet": {"path": "/healthz", "port": "http"}},
+                                "readinessProbe": {"httpGet": {"path": "/readyz", "port": "http"}},
                                 "livenessProbe": {"httpGet": {"path": "/healthz", "port": "http"}},
                                 "resources": {
                                     "requests": {"cpu": "50m", "memory": "64Mi"},
