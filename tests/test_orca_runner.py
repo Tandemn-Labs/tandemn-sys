@@ -32,10 +32,13 @@ class FailingOnceOrca(FakeOrca):
 class FakeLauncher:
     instances: ClassVar[list[FakeLauncher]] = []
 
-    def __init__(self, namespace: str, router_k8s=None, router_image=None) -> None:
+    def __init__(
+        self, namespace: str, router_k8s=None, router_image=None, model_catalogs=None
+    ) -> None:
         self.namespace = namespace
         self.router_k8s = router_k8s
         self.router_image = router_image
+        self.model_catalogs = model_catalogs
         FakeLauncher.instances.append(self)
 
 
@@ -63,6 +66,7 @@ def _patch_runner(monkeypatch, orca_cls=FakeOrca):
     monkeypatch.setattr(mod, "PostgresClient", lambda: "client")
     monkeypatch.setattr(mod, "DynamoLauncher", FakeLauncher)
     monkeypatch.setattr(mod, "load_kube_client", lambda *args: ("router-k8s", args))
+    monkeypatch.setattr(mod, "ModelCatalogStore", lambda client: ("catalogs", client))
     monkeypatch.setattr(mod, "CapacityRefresher", FakeRefresher)
     monkeypatch.setattr(mod, "Orca", orca_cls)
     monkeypatch.setattr(mod.time, "sleep", lambda seconds: sleeps.append(seconds))
@@ -129,6 +133,7 @@ def test_main_wires_router_control_plane_client(monkeypatch):
         ("routing", "/config/control", "control"),
     )
     assert FakeLauncher.instances[0].router_image == "registry.example/tandemn-router:test"
+    assert FakeLauncher.instances[0].model_catalogs == ("catalogs", "client")
 
 
 def test_main_requires_user_id(monkeypatch):

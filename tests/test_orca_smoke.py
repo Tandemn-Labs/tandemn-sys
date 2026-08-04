@@ -21,6 +21,7 @@ from tandemn_system_data.models.plan import Plan, PlanAction
 from tandemn_system_data.models.rank import Rank
 
 import tandemn_orca.orca as orca_mod
+from tandemn_orca.launcher import ModelCatalogError
 from tandemn_orca.orca import Orca, ladder_to_ranks
 
 RANK_ID = "rank_01JBM2YQYZ1KQ9C8GZP1XB6V5T"
@@ -59,6 +60,8 @@ class FakeJobStore:
         self.rank_status: list[tuple[str, RankStatus, list[RankStatus], str | None]] = []
         self.rows = {rank.rank_id: rank.model_copy(deep=True) for rank in active or []}
         self.job_statuses = dict(job_statuses or {})
+        self.failures: list[tuple[str, str, str]] = []
+        self.errors: dict[str, str | None] = {}
 
     def transition(self, job_id, to, expected, *, finish_reason=None):
         self.transitions.append((job_id, to, list(expected)))
@@ -97,6 +100,18 @@ class FakeJobStore:
             return False
         self.rows[rank_id] = rank.model_copy(update={"status": to, "reason_code": reason_code})
         return True
+
+    def fail(self, job_id, expected, *, finish_reason, error_message):
+        if self.job_statuses.get(job_id) not in expected:
+            return False
+        self.job_statuses[job_id] = JobStatus.FINISHED
+        self.failures.append((job_id, finish_reason, error_message))
+        self.errors[job_id] = error_message
+        return True
+
+    def set_error(self, job_id, error_message):
+        self.errors[job_id] = error_message
+        return job_id in self.job_statuses
 
 
 class FakePlanStore:
@@ -375,6 +390,56 @@ def test_place_failure_restores_previous_job_status(monkeypatch, previous_status
         ("job_B", previous_status, [JobStatus.RUNNING]),
     ]
     assert orca._jobs.rows[RANK_ID].status is RankStatus.FAILED
+
+
+def test_place_catalog_failure_finishes_job_with_visible_error(monkeypatch):
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_B", type=ActionType.PLACE, ladder=EXPLICIT_LADDER)],
+    )
+    orca = _build_orca(monkeypatch, [plan])
+    message = "ModelCatalog 'model' field 'max_num_seq' is missing for gpu_type 'L40S'"
+
+    def fail_catalog(*_):
+        raise ModelCatalogError(message)
+
+    orca._launcher.reconcile = fail_catalog
+
+    assert orca.apply_pending("user_1") == 1
+
+    assert orca._jobs.job_statuses["job_B"] is JobStatus.FINISHED
+    assert orca._jobs.failures == [("job_B", ReasonCode.MODEL_CATALOG_INVALID, message)]
+    assert orca._jobs.rows[RANK_ID].reason_code == ReasonCode.MODEL_CATALOG_INVALID
+
+
+def test_swap_catalog_failure_keeps_running_job_and_records_error(monkeypatch):
+    old_rank = Rank(
+        rank_id=OLD_RANK_ID,
+        job_id="job_F",
+        plan_id="plan_prev",
+        role=RankRole.AGGREGATE,
+        status=RankStatus.RUNNING,
+        shape_json={"count": 1},
+        n_replicas=1,
+    )
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_F", type=ActionType.SWAP, ladder=EXPLICIT_LADDER)],
+    )
+    orca = _build_orca(monkeypatch, [plan], active=[old_rank])
+    message = "ModelCatalog 'model' is missing"
+
+    def fail_catalog(*_):
+        raise ModelCatalogError(message)
+
+    orca._launcher.reconcile = fail_catalog
+
+    assert orca.apply_pending("user_1") == 1
+
+    assert orca._jobs.job_statuses["job_F"] is JobStatus.RUNNING
+    assert orca._jobs.errors["job_F"] == message
+    assert orca._jobs.rows[OLD_RANK_ID] == old_rank
+    assert orca._jobs.rows[RANK_ID].reason_code == ReasonCode.MODEL_CATALOG_INVALID
 
 
 def test_swap_reuses_rank_with_new_replica_count_and_stops_removed_rank(monkeypatch):

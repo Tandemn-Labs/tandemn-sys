@@ -32,13 +32,13 @@ import re
 import time
 from typing import Any
 
-from tandemn_system_data.clients import JobStore, PlanStore, PostgresClient
+from tandemn_system_data.clients import JobStore, ModelCatalogStore, PlanStore, PostgresClient
 from tandemn_system_data.models.enums import ActionType, JobStatus, RankRole, RankStatus, ReasonCode
 from tandemn_system_data.models.plan import Plan, PlanAction
 from tandemn_system_data.models.rank import Rank
 
 from tandemn_orca.dynamo_kubernetes import load_kube_client
-from tandemn_orca.launcher import DynamoLauncher, Launcher, NoopLauncher
+from tandemn_orca.launcher import DynamoLauncher, Launcher, ModelCatalogError, NoopLauncher
 from tandemn_orca.scripts.resource_map_from_aws import CapacityRefresher, parse_region_csv
 
 logger = logging.getLogger(__name__)
@@ -207,6 +207,14 @@ class Orca:
             raise ValueError(f"place: job {action.job_id} is not waiting or paused")
         try:
             self._launch_ranks(action.job_id, ranks)
+        except ModelCatalogError as exc:
+            self._jobs.fail(
+                action.job_id,
+                [JobStatus.RUNNING],
+                finish_reason=ReasonCode.MODEL_CATALOG_INVALID,
+                error_message=str(exc),
+            )
+            raise
         except Exception:
             if moved and previous_status is not None:
                 self._jobs.transition(action.job_id, previous_status, [JobStatus.RUNNING])
@@ -244,7 +252,12 @@ class Orca:
             else rank
             for rank in ranks
         ]
-        recorded = self._launch_ranks(action.job_id, ranks, old_by_id)
+        try:
+            recorded = self._launch_ranks(action.job_id, ranks, old_by_id)
+        except ModelCatalogError as exc:
+            self._jobs.set_error(action.job_id, str(exc))
+            raise
+        self._jobs.set_error(action.job_id, None)
         self._stop_ranks(set(old_by_id) - {rank.rank_id for rank in recorded})
         logger.info("swapped job %s (plan %s)", action.job_id, plan.plan_id)
 
@@ -275,19 +288,24 @@ class Orca:
         recorded = self._jobs.launch_ranks(ranks)
         try:
             self._launcher.reconcile(job_id, recorded)
-        except Exception:
+        except Exception as exc:
             try:
                 reused = [previous[rank.rank_id] for rank in recorded if rank.rank_id in previous]
                 if reused:
                     self._jobs.launch_ranks(reused)
             finally:
+                reason_code = (
+                    ReasonCode.MODEL_CATALOG_INVALID
+                    if isinstance(exc, ModelCatalogError)
+                    else ReasonCode.LAUNCH_FAILED
+                )
                 for rank in recorded:
                     if rank.rank_id not in previous:
                         self._jobs.set_rank_status(
                             rank.rank_id,
                             RankStatus.FAILED,
                             [RankStatus.LAUNCHING],
-                            reason_code=ReasonCode.LAUNCH_FAILED,
+                            reason_code=reason_code,
                         )
             raise
         for rank in recorded:
@@ -366,6 +384,7 @@ def main(argv: list[str] | None = None) -> None:
             namespace=args.namespace,
             router_k8s=router_k8s,
             router_image=args.router_image,
+            model_catalogs=ModelCatalogStore(client) if router_k8s is not None else None,
         ),
     )
     while True:

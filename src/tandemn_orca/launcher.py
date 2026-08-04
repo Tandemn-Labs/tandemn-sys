@@ -15,6 +15,7 @@ import logging
 from collections.abc import Callable
 from typing import Protocol
 
+from tandemn_system_data.clients import ModelCatalogStore
 from tandemn_system_data.models.rank import Rank
 
 from tandemn_orca.dynamo_compiler import (
@@ -61,6 +62,10 @@ class ReconcileError(RuntimeError):
         super().__init__("; ".join(parts))
 
 
+class ModelCatalogError(ValueError):
+    """A router capacity value is missing or invalid for a selected rank."""
+
+
 class NoopLauncher:
     """Records intent only — no infrastructure is touched.
 
@@ -89,26 +94,32 @@ class DynamoLauncher:
         k8s: DynamoKubernetesClient | None = None,
         router_k8s: DynamoKubernetesClient | None = None,
         router_image: str | None = None,
+        model_catalogs: ModelCatalogStore | None = None,
     ) -> None:
         self.namespace = namespace
         self.k8s = k8s or load_kube_client(namespace)
         self.router_k8s = router_k8s
         self.router_image = router_image
+        self.model_catalogs = model_catalogs
 
     def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
         desired = compile_job(job_id, ranks, self.namespace)
+        router_objects = None
+        if self.router_k8s is not None:
+            max_num_seq = _max_num_seq_by_rank(ranks, self.model_catalogs)
+            router_objects = render_router_objects(
+                job_id,
+                ranks,
+                max_num_seq,
+                self.router_image or "",
+                self.router_k8s.namespace,
+            )
         desired_keys = {object_key(obj) for obj in desired}
         stale = self.k8s.list_job_objects(job_id) - desired_keys
         apply_error = _call(self.k8s.apply_many, desired)
         if apply_error:
             raise ReconcileError(apply_error, None)
-        if self.router_k8s is not None:
-            router_objects = render_router_objects(
-                job_id,
-                ranks,
-                self.router_image or "",
-                self.router_k8s.namespace,
-            )
+        if self.router_k8s is not None and router_objects is not None:
             apply_error = _call(self.router_k8s.apply_many, router_objects)
             if apply_error:
                 raise ReconcileError(apply_error, None)
@@ -138,3 +149,39 @@ def _call[T](fn: Callable[[T], object], arg: T) -> BaseException | None:
     except BaseException as exc:
         return exc
     return None
+
+
+def _max_num_seq_by_rank(
+    ranks: list[Rank], model_catalogs: ModelCatalogStore | None
+) -> dict[str, int]:
+    if model_catalogs is None:
+        raise ModelCatalogError("router publishing requires a ModelCatalogStore")
+    values: dict[str, int] = {}
+    for rank in ranks:
+        model_id = rank.shape_json.get("model_id")
+        gpu_type = rank.shape_json.get("gpu_type")
+        if not model_id or not gpu_type:
+            raise ModelCatalogError(
+                f"rank {rank.rank_id} is missing model_id or gpu_type for ModelCatalog lookup"
+            )
+        catalog = model_catalogs.get(str(model_id))
+        if catalog is None:
+            raise ModelCatalogError(f"ModelCatalog {model_id!r} is missing")
+        matches = [
+            entry
+            for entry in catalog.max_num_seq
+            if isinstance(entry, dict) and str(entry.get("gpu_type")) == str(gpu_type)
+        ]
+        if len(matches) != 1:
+            raise ModelCatalogError(
+                f"ModelCatalog {model_id!r} field 'max_num_seq' must contain exactly one "
+                f"entry for gpu_type {gpu_type!r}"
+            )
+        value = matches[0].get("value")
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ModelCatalogError(
+                f"ModelCatalog {model_id!r} field 'max_num_seq' for gpu_type "
+                f"{gpu_type!r} must be a positive integer"
+            )
+        values[rank.rank_id] = value
+    return values
