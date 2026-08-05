@@ -47,6 +47,7 @@ from tandemn_orca.launcher import (
     NoopLauncher,
 )
 from tandemn_orca.scripts.resource_map_from_aws import CapacityRefresher, parse_region_csv
+from tandemn_orca.tunnels import PortForwardManager
 
 logger = logging.getLogger(__name__)
 
@@ -415,6 +416,7 @@ def main(argv: list[str] | None = None) -> None:
         router_port_span=args.router_port_span,
         model_catalogs=ModelCatalogStore(client) if args.router_config_dir else None,
         default_cluster=default_cluster,
+        tunnels=PortForwardManager() if args.router_config_dir else None,
     )
     orca = Orca(client, launcher=launcher)
     while True:
