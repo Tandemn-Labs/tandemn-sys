@@ -11,8 +11,7 @@ from tandemn_orca.dynamo_compiler import (
     node_selector,
     pool_key,
     render_rank_dgd,
-    render_router_configmap,
-    render_router_objects,
+    render_router_config,
     worker_args,
 )
 
@@ -164,14 +163,13 @@ def test_one_rank_compiles_to_one_pool_with_replica_budget():
     assert "pool_key" not in planner_config
 
 
-def test_router_configmap_matches_router_json_contract():
+def test_local_router_config_matches_router_json_contract():
     rank = _rank("g6e.12xlarge", "L40S")
 
-    configmap = render_router_configmap("job_online_001", [rank], {rank.rank_id: 256}, "routing")
-    config = json.loads(configmap["data"]["router.json"])
+    config = render_router_config(
+        "job_online_001", [rank], {rank.rank_id: 256}, {rank.rank_id: 18042}
+    )
 
-    assert configmap["metadata"]["namespace"] == "routing"
-    assert configmap["metadata"]["labels"]["tandemn.com/job-id"] == "job_online_001"
     assert config == {
         "version": "plan_1",
         "job_id": "job_online_001",
@@ -180,7 +178,7 @@ def test_router_configmap_matches_router_json_contract():
             {
                 "id": "tdm-online-001-03a2a00c",
                 "rank_id": rank.rank_id,
-                "endpoint": "http://tdm-online-001-03a2a00c-frontend.routing.svc.cluster.local:8000",
+                "endpoint": "http://127.0.0.1:18042",
                 "env": ["reserved", "aws", "us-east-2", "use2-az3", "L40S"],
                 "enabled": True,
                 "max_num_seq": 256,
@@ -188,34 +186,6 @@ def test_router_configmap_matches_router_json_contract():
             }
         ],
     }
-
-
-def test_router_objects_mount_config_and_expose_service():
-    rank = _rank("g6e.12xlarge", "L40S")
-
-    configmap, deployment, service = render_router_objects(
-        "job_online_001",
-        [rank],
-        {rank.rank_id: 256},
-        "registry.example/tandemn-router:test",
-        "routing",
-    )
-
-    assert configmap["metadata"]["name"] == "tdm-online-001-router-config"
-    container = deployment["spec"]["template"]["spec"]["containers"][0]
-    assert container["image"] == "registry.example/tandemn-router:test"
-    assert container["readinessProbe"]["httpGet"]["path"] == "/readyz"
-    assert container["env"][0]["valueFrom"]["secretKeyRef"] == {
-        "name": "tandemn-router-telemetry",
-        "key": "token",
-    }
-    assert container["volumeMounts"] == [
-        {"name": "config", "mountPath": "/config", "readOnly": True}
-    ]
-    assert deployment["spec"]["template"]["spec"]["volumes"] == [
-        {"name": "config", "configMap": {"name": "tdm-online-001-router-config"}}
-    ]
-    assert service["spec"]["ports"] == [{"name": "http", "port": 80, "targetPort": "http"}]
 
 
 def test_rank_id_pools_per_rung():

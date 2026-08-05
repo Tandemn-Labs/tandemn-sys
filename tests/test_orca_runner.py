@@ -32,9 +32,18 @@ class FailingOnceOrca(FakeOrca):
 class FakeLauncher:
     instances: ClassVar[list[FakeLauncher]] = []
 
-    def __init__(self, namespace: str, router_image=None, model_catalogs=None) -> None:
+    def __init__(
+        self,
+        namespace: str,
+        router_config_dir=None,
+        router_port_base=18000,
+        router_port_span=10000,
+        model_catalogs=None,
+    ) -> None:
         self.namespace = namespace
-        self.router_image = router_image
+        self.router_config_dir = router_config_dir
+        self.router_port_base = router_port_base
+        self.router_port_span = router_port_span
         self.model_catalogs = model_catalogs
         FakeLauncher.instances.append(self)
 
@@ -105,7 +114,7 @@ def test_main_uses_env_defaults(monkeypatch):
     assert args.capacity_refresh_seconds == 12
 
 
-def test_main_enables_colocated_router(monkeypatch):
+def test_main_enables_local_router_config(monkeypatch):
     _patch_runner(monkeypatch)
 
     mod.main(
@@ -114,14 +123,17 @@ def test_main_enables_colocated_router(monkeypatch):
             "default",
             "--namespace",
             "serving",
-            "--router-image",
-            "registry.example/tandemn-router:test",
+            "--router-config-dir",
+            "/tmp/router-configs",
+            "--router-port-base",
+            "20000",
             "--once",
         ]
     )
 
     assert FakeLauncher.instances[0].namespace == "serving"
-    assert FakeLauncher.instances[0].router_image == "registry.example/tandemn-router:test"
+    assert FakeLauncher.instances[0].router_config_dir == "/tmp/router-configs"
+    assert FakeLauncher.instances[0].router_port_base == 20000
     assert FakeLauncher.instances[0].model_catalogs == ("catalogs", "client")
 
 

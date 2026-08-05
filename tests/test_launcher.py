@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from tandemn_system_data.models import ModelCatalog
 from tandemn_system_data.models.enums import RankRole
@@ -42,10 +44,7 @@ class FakeK8s:
 
     def list_job_objects(self, job_id):
         self.job_id = job_id
-        return {
-            ("ConfigMap", "stale-config"),
-            ("DynamoGraphDeployment", "job-online-001-aggregate-old"),
-        }
+        return {("DynamoGraphDeployment", "job-online-001-aggregate-old")}
 
     def apply_many(self, objects):
         self.applied.append(objects)
@@ -86,9 +85,7 @@ def test_dynamo_launcher_applies_desired_and_deletes_stale():
     applied_names = {obj["metadata"]["name"] for obj in k8s.applied[0]}
     assert k8s.job_id == "job_online_001"
     assert len(applied_names) == 1
-    assert k8s.deleted == [
-        {("ConfigMap", "stale-config"), ("DynamoGraphDeployment", "job-online-001-aggregate-old")}
-    ]
+    assert k8s.deleted == [{("DynamoGraphDeployment", "job-online-001-aggregate-old")}]
 
 
 def test_dynamo_launcher_keeps_stale_when_apply_fails():
@@ -119,60 +116,56 @@ def test_dynamo_launcher_teardown_deletes_job_objects():
     assert k8s.deleted_jobs == ["job_online_001"]
 
 
-def test_dynamo_launcher_publishes_and_deletes_router_config():
+def test_dynamo_launcher_writes_and_deletes_local_router_config(tmp_path):
     workload = FakeK8s()
     rank = _rank()
     launcher = DynamoLauncher(
         k8s=workload,
-        router_image="registry.example/tandemn-router:test",
+        router_config_dir=str(tmp_path),
         model_catalogs=_catalog(),
     )
 
     launcher.reconcile("job_online_001", [rank])
-    launcher.teardown_job("job_online_001")
 
-    assert [obj["kind"] for obj in workload.applied[0]] == [
-        "DynamoGraphDeployment",
-        "ConfigMap",
-        "Deployment",
-        "Service",
-    ]
-    router_config = workload.applied[0][1]["data"]["router.json"]
-    assert '"max_num_seq":256' in router_config
-    assert '"maximum_requests":256' in router_config
-    assert (
-        '"endpoint":"http://tdm-online-001-03a2a00c-frontend.default.svc.cluster.local:8000"'
-        in router_config
-    )
+    assert [obj["kind"] for obj in workload.applied[0]] == ["DynamoGraphDeployment"]
+    config_path = tmp_path / "job_online_001.json"
+    router_config = json.loads(config_path.read_text())
+    deployment = router_config["deployments"][0]
+    assert deployment["max_num_seq"] == 256
+    assert deployment["maximum_requests"] == 256
+    assert deployment["endpoint"].startswith("http://127.0.0.1:")
     worker_args = workload.applied[0][0]["spec"]["services"]["VllmDecodeWorker"]["extraPodSpec"][
         "mainContainer"
     ]["args"]
     assert "--max-num-seqs" not in worker_args
+    launcher.teardown_job("job_online_001")
     assert workload.deleted_jobs == ["job_online_001"]
+    assert not config_path.exists()
 
 
-def test_dynamo_launcher_keeps_stale_when_router_publish_fails():
+def test_dynamo_launcher_does_not_write_config_when_apply_fails(tmp_path):
     workload = FakeK8s(apply_error=RuntimeError("publish"))
     rank = _rank()
 
     with pytest.raises(ReconcileError, match="publish"):
         DynamoLauncher(
             k8s=workload,
-            router_image="registry.example/tandemn-router:test",
+            router_config_dir=str(tmp_path),
             model_catalogs=_catalog(),
         ).reconcile("job_online_001", [rank])
 
     assert workload.deleted == []
+    assert not (tmp_path / "job_online_001.json").exists()
 
 
-def test_dynamo_launcher_rejects_missing_catalog_before_workload_apply():
+def test_dynamo_launcher_rejects_missing_catalog_before_workload_apply(tmp_path):
     workload = FakeK8s()
     rank = _rank()
 
     with pytest.raises(ModelCatalogError, match=r"ModelCatalog.*is missing"):
         DynamoLauncher(
             k8s=workload,
-            router_image="registry.example/tandemn-router:test",
+            router_config_dir=str(tmp_path),
             model_catalogs=FakeCatalogs(),
         ).reconcile("job_online_001", [rank])
 
@@ -186,7 +179,7 @@ def test_dynamo_launcher_rejects_missing_catalog_before_workload_apply():
         ([{"gpu_type": "L40S", "value": 0}], "positive integer"),
     ],
 )
-def test_dynamo_launcher_rejects_invalid_gpu_capacity(entries, message):
+def test_dynamo_launcher_rejects_invalid_gpu_capacity(entries, message, tmp_path):
     workload = FakeK8s()
     rank = _rank()
     catalogs = FakeCatalogs(
@@ -196,7 +189,7 @@ def test_dynamo_launcher_rejects_invalid_gpu_capacity(entries, message):
     with pytest.raises(ModelCatalogError, match=message):
         DynamoLauncher(
             k8s=workload,
-            router_image="registry.example/tandemn-router:test",
+            router_config_dir=str(tmp_path),
             model_catalogs=catalogs,
         ).reconcile("job_online_001", [rank])
 
