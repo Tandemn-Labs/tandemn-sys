@@ -364,6 +364,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=float(os.getenv("TANDEMN_ORCA_POLL_SECONDS", "5")),
     )
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--skip-capacity-refresh", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -390,10 +391,11 @@ def main(argv: list[str] | None = None) -> None:
         parse_region_csv(args.aws_regions),
         refresh_seconds=args.capacity_refresh_seconds,
     )
-    try:
-        refresher.refresh_if_due(force=True)
-    except Exception:
-        logger.exception("capacity refresh failed")
+    if not args.skip_capacity_refresh:
+        try:
+            refresher.refresh_if_due(force=True)
+        except Exception:
+            logger.exception("capacity refresh failed")
 
     if args.cluster_contexts:
         contexts = load_cluster_contexts(args.cluster_contexts)
@@ -420,10 +422,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     orca = Orca(client, launcher=launcher)
     while True:
-        try:
-            refresher.refresh_if_due()
-        except Exception:
-            logger.exception("capacity refresh failed")
+        if not args.skip_capacity_refresh:
+            try:
+                refresher.refresh_if_due()
+            except Exception:
+                logger.exception("capacity refresh failed")
         try:
             applied = orca.apply_pending(args.user_id)
             logger.info("applied %s plan(s) for user %s", applied, args.user_id)
