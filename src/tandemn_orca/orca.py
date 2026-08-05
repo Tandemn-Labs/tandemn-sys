@@ -454,11 +454,19 @@ def main(argv: list[str] | None = None) -> None:
         previous_sigterm = signal.signal(signal.SIGTERM, stop_on_sigterm)
     try:
         try:
+            applied = orca.apply_pending(args.user_id)
+            logger.info("applied %s pending plan(s) at startup", applied)
+        except Exception:
+            logger.exception("initial plan apply failed")
+        try:
             reconciled = orca.reconcile_running(args.user_id)
             logger.info("reconciled %s running job(s)", reconciled)
         except Exception:
             logger.exception("running job reconciliation failed")
+        if args.once:
+            return
         while True:
+            time.sleep(args.interval_seconds)
             if not args.skip_capacity_refresh:
                 try:
                     refresher.refresh_if_due()
@@ -469,9 +477,6 @@ def main(argv: list[str] | None = None) -> None:
                 logger.info("applied %s plan(s) for user %s", applied, args.user_id)
             except Exception:
                 logger.exception("orca apply loop failed")
-            if args.once:
-                return
-            time.sleep(args.interval_seconds)
     finally:
         if tunnel_manager is not None:
             tunnel_manager.close()

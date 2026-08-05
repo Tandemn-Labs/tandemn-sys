@@ -114,7 +114,7 @@ def test_main_once_uses_dynamo_launcher(monkeypatch):
         "us-west-1",
         "us-west-2",
     ]
-    assert FakeRefresher.instances[0].calls == [True, False]
+    assert FakeRefresher.instances[0].calls == [True]
 
 
 def test_main_uses_env_defaults(monkeypatch):
