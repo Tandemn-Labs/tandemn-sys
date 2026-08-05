@@ -364,12 +364,15 @@ def test_validate_rank_identity_fails_closed():
         "wrong-rank": _worker("wrong-rank", 0, rank_id="rank_other"),
         "bad-member": _worker("bad-member", 0),
     }
+    workers["old-plan"].member_index = 0
     workers["bad-member"].member_index = 2
     rank = _rank(2)
     rank.shape_json.update({"count": 2, "node_count": 2})
     validate_rank_identity(workers, [rank])
-    assert all(worker.chain_index is None for worker in workers.values())
-    assert all(worker.job_id is None and worker.rank_id is None for worker in workers.values())
+    assert workers["old-plan"].chain_index == 0
+    for name in ("missing", "outside", "negative", "wrong-rank", "bad-member"):
+        assert workers[name].chain_index is None
+        assert workers[name].job_id is None and workers[name].rank_id is None
 
 
 def test_resolve_instance_price_per_hour_from_resource_map():

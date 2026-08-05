@@ -403,15 +403,13 @@ class KubeWorkerIndex:
 
 def validate_rank_identity(workers_by_pod: dict[str, WorkerInfo], ranks: list[Rank]) -> None:
     """Accept pod identity only when it matches one active Rank and replica range."""
-    by_identity: dict[tuple[str, str, str], Rank | None] = {}
+    by_identity: dict[tuple[str, str], Rank | None] = {}
     for rank in ranks:
-        if not rank.plan_id:
-            continue
-        key = (rank.job_id, rank.plan_id, rank.rank_id)
+        key = (rank.job_id, rank.rank_id)
         by_identity[key] = None if key in by_identity else rank
 
     for worker in workers_by_pod.values():
-        rank = by_identity.get((worker.job_id or "", worker.plan_id or "", worker.rank_id or ""))
+        rank = by_identity.get((worker.job_id or "", worker.rank_id or ""))
         node_count = rank.shape_json.get("node_count", 1) if rank else None
         gpu_count = rank.shape_json.get("count") if rank else None
         if (
