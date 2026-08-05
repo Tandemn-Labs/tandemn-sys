@@ -10,6 +10,7 @@ from tandemn_system_data.models import Rank, RankRole, ResourceMap
 
 from tandemn_orca.scripts.gpu_metrics_collector import (
     KubeWorkerIndex,
+    PrometheusClient,
     RankTelemetrySnapshot,
     RouterTelemetryClient,
     WorkerInfo,
@@ -353,6 +354,20 @@ def test_router_telemetry_client_posts_authenticated_json(monkeypatch):
     assert request.headers["Authorization"] == "Bearer secret"
     assert json.loads(request.data)["pending_requests"] == 1
     assert timeout == 5.0
+
+
+def test_prometheus_client_treats_connection_reset_as_missing_data(monkeypatch):
+    def reset(*args, **kwargs):
+        raise ConnectionResetError
+
+    monkeypatch.setattr(
+        "tandemn_orca.scripts.gpu_metrics_collector.urllib.request.urlopen",
+        reset,
+    )
+    client = PrometheusClient("http://prometheus")
+
+    assert client.query_scalar("up") is None
+    assert client.gpu_targets() == []
 
 
 def test_validate_rank_identity_fails_closed():
