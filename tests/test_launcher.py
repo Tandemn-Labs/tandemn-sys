@@ -7,7 +7,12 @@ from tandemn_system_data.models import ModelCatalog
 from tandemn_system_data.models.enums import RankRole
 from tandemn_system_data.models.rank import Rank
 
-from tandemn_orca.launcher import DynamoLauncher, ModelCatalogError, ReconcileError
+from tandemn_orca.launcher import (
+    DynamoLauncher,
+    ModelCatalogError,
+    MultiClusterLauncher,
+    ReconcileError,
+)
 
 RANK_ID = "rank_01JBM2YQYZ1KQ9C8GZP1XB6V5T"
 
@@ -119,10 +124,11 @@ def test_dynamo_launcher_teardown_deletes_job_objects():
 def test_dynamo_launcher_writes_and_deletes_local_router_config(tmp_path):
     workload = FakeK8s()
     rank = _rank()
-    launcher = DynamoLauncher(
-        k8s=workload,
+    launcher = MultiClusterLauncher(
+        {"default": DynamoLauncher(k8s=workload)},
         router_config_dir=str(tmp_path),
         model_catalogs=_catalog(),
+        default_cluster="default",
     )
 
     launcher.reconcile("job_online_001", [rank])
@@ -148,10 +154,11 @@ def test_dynamo_launcher_does_not_write_config_when_apply_fails(tmp_path):
     rank = _rank()
 
     with pytest.raises(ReconcileError, match="publish"):
-        DynamoLauncher(
-            k8s=workload,
+        MultiClusterLauncher(
+            {"default": DynamoLauncher(k8s=workload)},
             router_config_dir=str(tmp_path),
             model_catalogs=_catalog(),
+            default_cluster="default",
         ).reconcile("job_online_001", [rank])
 
     assert workload.deleted == []
@@ -163,10 +170,11 @@ def test_dynamo_launcher_rejects_missing_catalog_before_workload_apply(tmp_path)
     rank = _rank()
 
     with pytest.raises(ModelCatalogError, match=r"ModelCatalog.*is missing"):
-        DynamoLauncher(
-            k8s=workload,
+        MultiClusterLauncher(
+            {"default": DynamoLauncher(k8s=workload)},
             router_config_dir=str(tmp_path),
             model_catalogs=FakeCatalogs(),
+            default_cluster="default",
         ).reconcile("job_online_001", [rank])
 
     assert workload.applied == []
@@ -187,10 +195,44 @@ def test_dynamo_launcher_rejects_invalid_gpu_capacity(entries, message, tmp_path
     )
 
     with pytest.raises(ModelCatalogError, match=message):
-        DynamoLauncher(
-            k8s=workload,
+        MultiClusterLauncher(
+            {"default": DynamoLauncher(k8s=workload)},
             router_config_dir=str(tmp_path),
             model_catalogs=catalogs,
+            default_cluster="default",
         ).reconcile("job_online_001", [rank])
 
     assert workload.applied == []
+
+
+def test_multi_cluster_launcher_groups_ranks_by_cloud_region(tmp_path):
+    aws = FakeK8s()
+    gcp = FakeK8s()
+    aws_rank = _rank()
+    gcp_rank = aws_rank.model_copy(
+        deep=True,
+        update={"rank_id": "rank_01JBM30YQ7X3WQAR6HF8C2Q9T8"},
+    )
+    gcp_rank.shape_json["env"] = ["on_demand", "gcp", "us-central1", "a", "L40S"]
+    launcher = MultiClusterLauncher(
+        {
+            "aws|us-east-2": DynamoLauncher(k8s=aws, context="aws-context"),
+            "gcp|us-central1": DynamoLauncher(k8s=gcp, context="gcp-context"),
+        },
+        router_config_dir=str(tmp_path),
+        model_catalogs=_catalog(),
+    )
+
+    launcher.reconcile("job_online_001", [aws_rank, gcp_rank])
+
+    assert [obj["metadata"]["labels"]["tandemn.com/rank-id"] for obj in aws.applied[0]] == [
+        aws_rank.rank_id
+    ]
+    assert [obj["metadata"]["labels"]["tandemn.com/rank-id"] for obj in gcp.applied[0]] == [
+        gcp_rank.rank_id
+    ]
+    config = json.loads((tmp_path / "job_online_001.json").read_text())
+    assert {deployment["rank_id"] for deployment in config["deployments"]} == {
+        aws_rank.rank_id,
+        gcp_rank.rank_id,
+    }

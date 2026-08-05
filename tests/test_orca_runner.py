@@ -32,20 +32,21 @@ class FailingOnceOrca(FakeOrca):
 class FakeLauncher:
     instances: ClassVar[list[FakeLauncher]] = []
 
-    def __init__(
-        self,
-        namespace: str,
-        router_config_dir=None,
-        router_port_base=18000,
-        router_port_span=10000,
-        model_catalogs=None,
-    ) -> None:
+    def __init__(self, namespace: str, k8s=None, context=None) -> None:
         self.namespace = namespace
-        self.router_config_dir = router_config_dir
-        self.router_port_base = router_port_base
-        self.router_port_span = router_port_span
-        self.model_catalogs = model_catalogs
+        self.k8s = k8s
+        self.context = context
         FakeLauncher.instances.append(self)
+
+
+class FakeMultiClusterLauncher:
+    instances: ClassVar[list[FakeMultiClusterLauncher]] = []
+
+    def __init__(self, launchers, **kwargs) -> None:
+        self.launchers = launchers
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+        FakeMultiClusterLauncher.instances.append(self)
 
 
 class FakeRefresher:
@@ -67,10 +68,13 @@ class FakeRefresher:
 def _patch_runner(monkeypatch, orca_cls=FakeOrca):
     FakeOrca.instances.clear()
     FakeLauncher.instances.clear()
+    FakeMultiClusterLauncher.instances.clear()
     FakeRefresher.instances.clear()
     sleeps: list[float] = []
     monkeypatch.setattr(mod, "PostgresClient", lambda: "client")
     monkeypatch.setattr(mod, "DynamoLauncher", FakeLauncher)
+    monkeypatch.setattr(mod, "MultiClusterLauncher", FakeMultiClusterLauncher)
+    monkeypatch.setattr(mod, "load_kube_client", lambda *args, **kwargs: (args, kwargs))
     monkeypatch.setattr(mod, "ModelCatalogStore", lambda client: ("catalogs", client))
     monkeypatch.setattr(mod, "CapacityRefresher", FakeRefresher)
     monkeypatch.setattr(mod, "Orca", orca_cls)
@@ -85,7 +89,8 @@ def test_main_once_uses_dynamo_launcher(monkeypatch):
 
     assert FakeLauncher.instances[0].namespace == "koi"
     assert FakeOrca.instances[0].client == "client"
-    assert FakeOrca.instances[0].launcher is FakeLauncher.instances[0]
+    assert FakeOrca.instances[0].launcher is FakeMultiClusterLauncher.instances[0]
+    assert FakeMultiClusterLauncher.instances[0].default_cluster == "default"
     assert FakeOrca.instances[0].applied_users == ["default"]
     assert FakeRefresher.instances[0].client == "client"
     assert FakeRefresher.instances[0].regions == [
@@ -132,9 +137,35 @@ def test_main_enables_local_router_config(monkeypatch):
     )
 
     assert FakeLauncher.instances[0].namespace == "serving"
-    assert FakeLauncher.instances[0].router_config_dir == "/tmp/router-configs"
-    assert FakeLauncher.instances[0].router_port_base == 20000
-    assert FakeLauncher.instances[0].model_catalogs == ("catalogs", "client")
+    multi = FakeMultiClusterLauncher.instances[0]
+    assert multi.router_config_dir == "/tmp/router-configs"
+    assert multi.router_port_base == 20000
+    assert multi.model_catalogs == ("catalogs", "client")
+
+
+def test_main_maps_cloud_regions_to_kube_contexts(monkeypatch, tmp_path):
+    _patch_runner(monkeypatch)
+    contexts = tmp_path / "contexts.json"
+    contexts.write_text('{"aws|us-east-1":"eks-east","gcp|us-central1":"gke-central"}')
+
+    mod.main(
+        [
+            "--user-id",
+            "default",
+            "--cluster-contexts",
+            str(contexts),
+            "--once",
+        ]
+    )
+
+    multi = FakeMultiClusterLauncher.instances[0]
+    assert set(multi.launchers) == {"aws|us-east-1", "gcp|us-central1"}
+    assert [launcher.context for launcher in FakeLauncher.instances] == [
+        "eks-east",
+        "gke-central",
+    ]
+    assert FakeLauncher.instances[0].k8s == (("default",), {"context": "eks-east"})
+    assert multi.default_cluster is None
 
 
 def test_main_requires_user_id(monkeypatch):
