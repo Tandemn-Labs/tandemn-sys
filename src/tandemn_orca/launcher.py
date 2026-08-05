@@ -95,52 +95,89 @@ class DynamoLauncher:
         self,
         namespace: str = "default",
         k8s: DynamoKubernetesClient | None = None,
-        router_config_dir: str | None = None,
-        router_port_base: int = 18000,
-        router_port_span: int = 10000,
-        model_catalogs: ModelCatalogStore | None = None,
+        context: str | None = None,
     ) -> None:
         self.namespace = namespace
         self.k8s = k8s or load_kube_client(namespace)
-        self.router_config_dir = Path(router_config_dir) if router_config_dir else None
-        self.router_port_base = router_port_base
-        self.router_port_span = router_port_span
-        self.model_catalogs = model_catalogs
+        self.context = context
 
     def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
         desired = compile_job(job_id, ranks, self.namespace)
-        router_config = None
-        ports: dict[str, int] = {}
-        if self.router_config_dir is not None:
-            max_num_seq = _max_num_seq_by_rank(ranks, self.model_catalogs)
-            ports = _ports_by_rank(ranks, self.router_port_base, self.router_port_span)
-            router_config = render_router_config(job_id, ranks, max_num_seq, ports)
         desired_keys = {object_key(obj) for obj in desired}
         stale = self.k8s.list_job_objects(job_id) - desired_keys
         apply_error = _call(self.k8s.apply_many, desired)
         if apply_error:
             raise ReconcileError(apply_error, None)
         self._delete_stale(stale)
-        if router_config is not None:
-            assert self.router_config_dir is not None
-            _write_router_config(self.router_config_dir, job_id, router_config)
-            for rank in ranks:
-                logger.info(
-                    "router tunnel: kubectl --namespace %s port-forward service/%s-frontend %s:8000",
-                    self.namespace,
-                    pool_dgd_name(job_id, rank),
-                    ports[rank.rank_id],
-                )
 
     def teardown_job(self, job_id: str) -> None:
         self.k8s.delete_all_for_job(job_id)
-        if self.router_config_dir is not None:
-            self.router_config_dir.joinpath(f"{job_id}.json").unlink(missing_ok=True)
 
     def _delete_stale(self, stale: set[ObjectKey]) -> None:
         delete_error = _call(self.k8s.delete_many, stale)
         if delete_error:
             raise ReconcileError(None, delete_error)
+
+
+class MultiClusterLauncher:
+    """Apply rank groups to kube contexts and publish one laptop router config."""
+
+    def __init__(
+        self,
+        launchers: dict[str, DynamoLauncher],
+        *,
+        router_config_dir: str | None = None,
+        router_port_base: int = 18000,
+        router_port_span: int = 10000,
+        model_catalogs: ModelCatalogStore | None = None,
+        default_cluster: str | None = None,
+    ) -> None:
+        if not launchers:
+            raise ValueError("at least one cluster launcher is required")
+        self.launchers = launchers
+        self.router_config_dir = Path(router_config_dir) if router_config_dir else None
+        self.router_port_base = router_port_base
+        self.router_port_span = router_port_span
+        self.model_catalogs = model_catalogs
+        self.default_cluster = default_cluster
+
+    def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
+        groups: dict[str, list[Rank]] = {key: [] for key in self.launchers}
+        for rank in ranks:
+            key = self.default_cluster or _rank_cluster_key(rank)
+            if key not in groups:
+                raise ValueError(f"no kube context configured for rank environment {key!r}")
+            groups[key].append(rank)
+
+        router_config = None
+        ports: dict[str, int] = {}
+        if self.router_config_dir is not None:
+            max_num_seq = _max_num_seq_by_rank(ranks, self.model_catalogs)
+            ports = _ports_by_rank(ranks, self.router_port_base, self.router_port_span)
+            router_config = render_router_config(job_id, ranks, max_num_seq, ports)
+
+        for key, launcher in self.launchers.items():
+            launcher.reconcile(job_id, groups[key])
+
+        if router_config is not None:
+            assert self.router_config_dir is not None
+            _write_router_config(self.router_config_dir, job_id, router_config)
+            for key, grouped_ranks in groups.items():
+                for rank in grouped_ranks:
+                    logger.info(
+                        "router tunnel: kubectl --context %s --namespace %s port-forward "
+                        "service/%s-frontend %s:8000",
+                        self.launchers[key].context or key,
+                        self.launchers[key].namespace,
+                        pool_dgd_name(job_id, rank),
+                        ports[rank.rank_id],
+                    )
+
+    def teardown_job(self, job_id: str) -> None:
+        for launcher in self.launchers.values():
+            launcher.teardown_job(job_id)
+        if self.router_config_dir is not None:
+            self.router_config_dir.joinpath(f"{job_id}.json").unlink(missing_ok=True)
 
 
 def _call[T](fn: Callable[[T], object], arg: T) -> BaseException | None:
@@ -185,6 +222,13 @@ def _max_num_seq_by_rank(
             )
         values[rank.rank_id] = value
     return values
+
+
+def _rank_cluster_key(rank: Rank) -> str:
+    env = rank.shape_json.get("env")
+    if not isinstance(env, (list, tuple)) or len(env) != 5 or not env[1] or not env[2]:
+        raise ValueError(f"rank {rank.rank_id} requires a five-part env for cluster selection")
+    return f"{env[1]}|{env[2]}"
 
 
 def _ports_by_rank(ranks: list[Rank], base: int, span: int) -> dict[str, int]:
