@@ -172,6 +172,28 @@ class Orca:
                 logger.info("plan %s already applied, skipping", plan.plan_id)
         return applied
 
+    def reconcile_running(self, user_id: str) -> int:
+        """Restore infrastructure, local configs, and tunnels after Orca restarts."""
+        reconciled = 0
+        for running in self._jobs.running_jobs(user_id):
+            ranks = [
+                Rank(
+                    rank_id=allocation.rank_id,
+                    job_id=running.job.job_id,
+                    plan_id=allocation.plan_id,
+                    role=allocation.role,
+                    shape_json=dict(allocation.shape_json),
+                    n_replicas=allocation.n_replicas,
+                    status=allocation.status,
+                    reason_code=allocation.reason_code,
+                )
+                for allocation in running.ranks
+            ]
+            if ranks:
+                self._launcher.reconcile(running.job.job_id, ranks)
+                reconciled += 1
+        return reconciled
+
     def _apply_plan(self, plan: Plan) -> None:
         for action in plan.actions:
             # One bad action must not wedge the plan: an exception here would
@@ -421,6 +443,11 @@ def main(argv: list[str] | None = None) -> None:
         tunnels=PortForwardManager() if args.router_config_dir else None,
     )
     orca = Orca(client, launcher=launcher)
+    try:
+        reconciled = orca.reconcile_running(args.user_id)
+        logger.info("reconciled %s running job(s)", reconciled)
+    except Exception:
+        logger.exception("running job reconciliation failed")
     while True:
         if not args.skip_capacity_refresh:
             try:

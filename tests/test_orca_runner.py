@@ -14,11 +14,16 @@ class FakeOrca:
         self.client = client
         self.launcher = launcher
         self.applied_users: list[str] = []
+        self.reconciled_users: list[str] = []
         FakeOrca.instances.append(self)
 
     def apply_pending(self, user_id: str) -> int:
         self.applied_users.append(user_id)
         return 1
+
+    def reconcile_running(self, user_id: str) -> int:
+        self.reconciled_users.append(user_id)
+        return 0
 
 
 class FailingOnceOrca(FakeOrca):
@@ -93,6 +98,7 @@ def test_main_once_uses_dynamo_launcher(monkeypatch):
     assert FakeOrca.instances[0].launcher is FakeMultiClusterLauncher.instances[0]
     assert FakeMultiClusterLauncher.instances[0].default_cluster == "default"
     assert FakeOrca.instances[0].applied_users == ["default"]
+    assert FakeOrca.instances[0].reconciled_users == ["default"]
     assert FakeRefresher.instances[0].client == "client"
     assert FakeRefresher.instances[0].regions == [
         "us-east-1",
