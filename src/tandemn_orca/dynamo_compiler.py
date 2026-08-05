@@ -27,7 +27,6 @@ PLANNER_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.1"
 # len(service name) <= 45 for pod naming; our longest service is
 # "VllmDecodeWorker" (16), so DGD names must stay within 29.
 MAX_DGD_NAME = 29
-ROUTER_TELEMETRY_SECRET = "tandemn-router-telemetry"
 
 
 def compile_job(job_id: str, ranks: list[Rank], namespace: str = "default") -> list[dict[str, Any]]:
@@ -36,13 +35,13 @@ def compile_job(job_id: str, ranks: list[Rank], namespace: str = "default") -> l
     return [render_rank_dgd(job_id, rank, namespace) for rank in ranks]
 
 
-def render_router_configmap(
+def render_router_config(
     job_id: str,
     ranks: list[Rank],
     max_num_seq_by_rank: dict[str, int],
-    namespace: str = "default",
+    ports_by_rank: dict[str, int],
 ) -> dict[str, Any]:
-    """Render the per-job router's global deployment registry."""
+    """Render the laptop router's per-job deployment registry."""
     plan_ids = {rank.plan_id for rank in ranks if rank.plan_id}
     if len(plan_ids) != 1 or len(ranks) == 0:
         raise ValueError("router config requires ranks from exactly one plan")
@@ -56,11 +55,14 @@ def render_router_configmap(
         max_num_seq = max_num_seq_by_rank.get(rank.rank_id)
         if not max_num_seq:
             raise ValueError(f"rank {rank.rank_id}: max_num_seq must be a positive int")
+        port = ports_by_rank.get(rank.rank_id)
+        if not port:
+            raise ValueError(f"rank {rank.rank_id}: local tunnel port is required")
         deployments.append(
             {
                 "id": pool_dgd_name(job_id, rank),
                 "rank_id": rank.rank_id,
-                "endpoint": frontend_service_endpoint(job_id, rank, namespace),
+                "endpoint": f"http://127.0.0.1:{port}",
                 "env": list(env),
                 "enabled": True,
                 "max_num_seq": max_num_seq,
@@ -69,129 +71,12 @@ def render_router_configmap(
         )
 
     plan_id = plan_ids.pop()
-    name = dgd_name(job_id, "router-config")
     return {
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {
-            "name": name,
-            "namespace": namespace,
-            "labels": {
-                "tandemn.com/managed-by": "orca",
-                "tandemn.com/job-id": job_id,
-                "tandemn.com/plan-id": plan_id,
-                "tandemn.com/resource-kind": "router-config",
-            },
-        },
-        "data": {
-            "router.json": json.dumps(
-                {
-                    "version": plan_id,
-                    "job_id": job_id,
-                    "overflow_threshold": 0.8,
-                    "deployments": deployments,
-                },
-                separators=(",", ":"),
-            )
-        },
+        "version": plan_id,
+        "job_id": job_id,
+        "overflow_threshold": 0.8,
+        "deployments": deployments,
     }
-
-
-def router_configmap_name(job_id: str) -> str:
-    return dgd_name(job_id, "router-config")
-
-
-def render_router_objects(
-    job_id: str,
-    ranks: list[Rank],
-    max_num_seq_by_rank: dict[str, int],
-    image: str,
-    namespace: str = "default",
-) -> list[dict[str, Any]]:
-    """Render the ConfigMap, Deployment, and Service for one job router."""
-    if not image:
-        raise ValueError("router image is required")
-    name = router_name(job_id)
-    configmap = render_router_configmap(job_id, ranks, max_num_seq_by_rank, namespace)
-    resource_labels = {
-        "app.kubernetes.io/name": "tandemn-router",
-        "tandemn.com/managed-by": "orca",
-        "tandemn.com/job-id": job_id,
-    }
-    pod_labels = {**resource_labels, "tandemn.com/resource-kind": "router"}
-    return [
-        configmap,
-        {
-            "apiVersion": "apps/v1",
-            "kind": "Deployment",
-            "metadata": {"name": name, "namespace": namespace, "labels": pod_labels},
-            "spec": {
-                "replicas": 1,
-                "selector": {"matchLabels": resource_labels},
-                "template": {
-                    "metadata": {"labels": pod_labels},
-                    "spec": {
-                        "containers": [
-                            {
-                                "name": "router",
-                                "image": image,
-                                "args": [
-                                    "-config",
-                                    "/config/router.json",
-                                    "-listen",
-                                    ":8080",
-                                ],
-                                "ports": [{"name": "http", "containerPort": 8080}],
-                                "env": [
-                                    {
-                                        "name": "TANDEMN_ROUTER_TELEMETRY_TOKEN",
-                                        "valueFrom": {
-                                            "secretKeyRef": {
-                                                "name": ROUTER_TELEMETRY_SECRET,
-                                                "key": "token",
-                                            }
-                                        },
-                                    }
-                                ],
-                                "volumeMounts": [
-                                    {"name": "config", "mountPath": "/config", "readOnly": True}
-                                ],
-                                "readinessProbe": {"httpGet": {"path": "/readyz", "port": "http"}},
-                                "livenessProbe": {"httpGet": {"path": "/healthz", "port": "http"}},
-                                "resources": {
-                                    "requests": {"cpu": "50m", "memory": "64Mi"},
-                                    "limits": {"memory": "128Mi"},
-                                },
-                            }
-                        ],
-                        "volumes": [
-                            {
-                                "name": "config",
-                                "configMap": {"name": router_configmap_name(job_id)},
-                            }
-                        ],
-                    },
-                },
-            },
-        },
-        {
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {"name": name, "namespace": namespace, "labels": pod_labels},
-            "spec": {
-                "selector": resource_labels,
-                "ports": [{"name": "http", "port": 80, "targetPort": "http"}],
-            },
-        },
-    ]
-
-
-def router_name(job_id: str) -> str:
-    return dgd_name(job_id, "router")
-
-
-def frontend_service_endpoint(job_id: str, rank: Rank, namespace: str) -> str:
-    return f"http://{pool_dgd_name(job_id, rank)}-frontend.{namespace}.svc.cluster.local:8000"
 
 
 def pool_key(rank: Rank) -> str:

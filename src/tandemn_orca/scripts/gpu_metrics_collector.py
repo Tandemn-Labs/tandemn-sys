@@ -63,8 +63,6 @@ from tandemn_system_data.clients import (
 )
 from tandemn_system_data.models import GpuMetric, Rank, ResourceMap
 
-from tandemn_orca.dynamo_compiler import router_name
-
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROMETHEUS_URL = "http://localhost:9090"
@@ -219,10 +217,7 @@ class RouterTelemetryClient:
         self.timeout = timeout
 
     def push(self, snapshot: RankTelemetrySnapshot) -> None:
-        base_url = self.url_template.format(
-            job_id=snapshot.job_id,
-            router_name=router_name(snapshot.job_id),
-        ).rstrip("/")
+        base_url = self.url_template.format(job_id=snapshot.job_id).rstrip("/")
         request = urllib.request.Request(
             f"{base_url}/internal/telemetry",
             data=json.dumps(
@@ -682,7 +677,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--router-url-template",
         default=os.getenv("TANDEMN_ROUTER_URL_TEMPLATE"),
-        help="Per-job router URL template with {job_id} and/or {router_name}",
+        help="Laptop router URL, optionally templated with {job_id}",
     )
     parser.add_argument(
         "--router-telemetry-token",

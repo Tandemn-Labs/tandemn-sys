@@ -26,9 +26,7 @@ def load_kube_client(
         api_client = config.new_client_from_config(config_file=kubeconfig, context=context)
         return DynamoKubernetesClient(
             namespace,
-            core=client.CoreV1Api(api_client),
             custom=client.CustomObjectsApi(api_client),
-            apps=client.AppsV1Api(api_client),
         )
     try:
         config.load_incluster_config()
@@ -49,31 +47,17 @@ class DynamoKubernetesClient:
     def __init__(
         self,
         namespace: str = "default",
-        core: Any = None,
         custom: Any = None,
-        apps: Any = None,
     ) -> None:
         self.namespace = namespace
-        self.core = core or client.CoreV1Api()
         self.custom = custom or client.CustomObjectsApi()
-        self.apps = apps or client.AppsV1Api()
 
     def list_job_objects(self, job_id: str) -> set[ObjectKey]:
         selector = job_selector(job_id)
-        configmaps = self.core.list_namespaced_config_map(
-            self.namespace, label_selector=selector
-        ).items
-        services = self.core.list_namespaced_service(self.namespace, label_selector=selector).items
-        deployments = self.apps.list_namespaced_deployment(
-            self.namespace, label_selector=selector
-        ).items
         dgds = self.custom.list_namespaced_custom_object(
             GROUP, VERSION, self.namespace, DGD_PLURAL, label_selector=selector
         ).get("items", [])
         return {
-            *(("ConfigMap", item.metadata.name) for item in configmaps),
-            *(("Service", item.metadata.name) for item in services),
-            *(("Deployment", item.metadata.name) for item in deployments),
             *(("DynamoGraphDeployment", item["metadata"]["name"]) for item in dgds),
         }
 
@@ -84,36 +68,6 @@ class DynamoKubernetesClient:
 
     def apply(self, obj: dict[str, Any]) -> None:
         kind, name = object_key(obj)
-        if kind == "ConfigMap":
-            self.core.patch_namespaced_config_map(
-                name,
-                self.namespace,
-                obj,
-                field_manager=FIELD_MANAGER,
-                force=True,
-                _content_type=APPLY,
-            )
-            return
-        if kind == "Deployment":
-            self.apps.patch_namespaced_deployment(
-                name,
-                self.namespace,
-                obj,
-                field_manager=FIELD_MANAGER,
-                force=True,
-                _content_type=APPLY,
-            )
-            return
-        if kind == "Service":
-            self.core.patch_namespaced_service(
-                name,
-                self.namespace,
-                obj,
-                field_manager=FIELD_MANAGER,
-                force=True,
-                _content_type=APPLY,
-            )
-            return
         if kind == "DynamoGraphDeployment":
             self.custom.patch_namespaced_custom_object(
                 GROUP,
@@ -138,15 +92,6 @@ class DynamoKubernetesClient:
 
     def delete(self, kind: str, name: str) -> None:
         try:
-            if kind == "ConfigMap":
-                self.core.delete_namespaced_config_map(name, self.namespace)
-                return
-            if kind == "Deployment":
-                self.apps.delete_namespaced_deployment(name, self.namespace)
-                return
-            if kind == "Service":
-                self.core.delete_namespaced_service(name, self.namespace)
-                return
             if kind == "DynamoGraphDeployment":
                 self.custom.delete_namespaced_custom_object(
                     GROUP, VERSION, self.namespace, DGD_PLURAL, name

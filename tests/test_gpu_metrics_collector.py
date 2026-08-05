@@ -320,10 +320,10 @@ def test_router_telemetry_client_posts_authenticated_json(monkeypatch):
         observed_at=datetime(2026, 8, 4, tzinfo=UTC),
     )
 
-    RouterTelemetryClient("http://{router_name}.routing.svc", "secret").push(snapshot)
+    RouterTelemetryClient("http://127.0.0.1:18080", "secret").push(snapshot)
 
     request, timeout = requests[0]
-    assert request.full_url == "http://tdm-1-router.routing.svc/internal/telemetry"
+    assert request.full_url == "http://127.0.0.1:18080/internal/telemetry"
     assert request.headers["Authorization"] == "Bearer secret"
     assert json.loads(request.data)["pending_requests"] == 1
     assert timeout == 5.0
