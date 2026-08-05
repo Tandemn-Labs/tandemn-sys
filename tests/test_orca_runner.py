@@ -178,6 +178,14 @@ def test_main_requires_user_id(monkeypatch):
         mod.main(["--once"])
 
 
+def test_main_can_skip_capacity_refresh(monkeypatch):
+    _patch_runner(monkeypatch)
+
+    mod.main(["--user-id", "default", "--skip-capacity-refresh", "--once"])
+
+    assert FakeRefresher.instances[0].calls == []
+
+
 def test_runner_logs_error_and_retries(monkeypatch):
     sleeps = _patch_runner(monkeypatch, FailingOnceOrca)
 
