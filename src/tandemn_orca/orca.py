@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import signal
 import time
 from typing import Any
 
@@ -433,6 +434,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         launchers = {"default": DynamoLauncher(namespace=args.namespace)}
         default_cluster = "default"
+    tunnel_manager = PortForwardManager() if args.router_config_dir else None
     launcher = MultiClusterLauncher(
         launchers,
         router_config_dir=args.router_config_dir,
@@ -440,28 +442,41 @@ def main(argv: list[str] | None = None) -> None:
         router_port_span=args.router_port_span,
         model_catalogs=ModelCatalogStore(client) if args.router_config_dir else None,
         default_cluster=default_cluster,
-        tunnels=PortForwardManager() if args.router_config_dir else None,
+        tunnels=tunnel_manager,
     )
     orca = Orca(client, launcher=launcher)
+    previous_sigterm = None
+    if tunnel_manager is not None:
+
+        def stop_on_sigterm(*_args: object) -> None:
+            raise KeyboardInterrupt
+
+        previous_sigterm = signal.signal(signal.SIGTERM, stop_on_sigterm)
     try:
-        reconciled = orca.reconcile_running(args.user_id)
-        logger.info("reconciled %s running job(s)", reconciled)
-    except Exception:
-        logger.exception("running job reconciliation failed")
-    while True:
-        if not args.skip_capacity_refresh:
-            try:
-                refresher.refresh_if_due()
-            except Exception:
-                logger.exception("capacity refresh failed")
         try:
-            applied = orca.apply_pending(args.user_id)
-            logger.info("applied %s plan(s) for user %s", applied, args.user_id)
+            reconciled = orca.reconcile_running(args.user_id)
+            logger.info("reconciled %s running job(s)", reconciled)
         except Exception:
-            logger.exception("orca apply loop failed")
-        if args.once:
-            return
-        time.sleep(args.interval_seconds)
+            logger.exception("running job reconciliation failed")
+        while True:
+            if not args.skip_capacity_refresh:
+                try:
+                    refresher.refresh_if_due()
+                except Exception:
+                    logger.exception("capacity refresh failed")
+            try:
+                applied = orca.apply_pending(args.user_id)
+                logger.info("applied %s plan(s) for user %s", applied, args.user_id)
+            except Exception:
+                logger.exception("orca apply loop failed")
+            if args.once:
+                return
+            time.sleep(args.interval_seconds)
+    finally:
+        if tunnel_manager is not None:
+            tunnel_manager.close()
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":
