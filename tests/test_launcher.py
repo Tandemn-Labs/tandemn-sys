@@ -214,6 +214,15 @@ def test_multi_cluster_launcher_groups_ranks_by_cloud_region(tmp_path):
         update={"rank_id": "rank_01JBM30YQ7X3WQAR6HF8C2Q9T8"},
     )
     gcp_rank.shape_json["env"] = ["on_demand", "gcp", "us-central1", "a", "L40S"]
+
+    class Tunnels:
+        def __init__(self):
+            self.calls = []
+
+        def reconcile(self, job_id, specs):
+            self.calls.append((job_id, specs))
+
+    tunnels = Tunnels()
     launcher = MultiClusterLauncher(
         {
             "aws|us-east-2": DynamoLauncher(k8s=aws, context="aws-context"),
@@ -221,6 +230,7 @@ def test_multi_cluster_launcher_groups_ranks_by_cloud_region(tmp_path):
         },
         router_config_dir=str(tmp_path),
         model_catalogs=_catalog(),
+        tunnels=tunnels,
     )
 
     launcher.reconcile("job_online_001", [aws_rank, gcp_rank])
@@ -235,4 +245,9 @@ def test_multi_cluster_launcher_groups_ranks_by_cloud_region(tmp_path):
     assert {deployment["rank_id"] for deployment in config["deployments"]} == {
         aws_rank.rank_id,
         gcp_rank.rank_id,
+    }
+    specs = tunnels.calls[0][1]
+    assert {(spec.context, spec.service) for spec in specs} == {
+        ("aws-context", "tdm-online-001-03a2a00c-frontend"),
+        ("gcp-context", "tdm-online-001-efd9077e-frontend"),
     }

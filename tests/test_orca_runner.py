@@ -76,6 +76,7 @@ def _patch_runner(monkeypatch, orca_cls=FakeOrca):
     monkeypatch.setattr(mod, "MultiClusterLauncher", FakeMultiClusterLauncher)
     monkeypatch.setattr(mod, "load_kube_client", lambda *args, **kwargs: (args, kwargs))
     monkeypatch.setattr(mod, "ModelCatalogStore", lambda client: ("catalogs", client))
+    monkeypatch.setattr(mod, "PortForwardManager", lambda: "tunnels")
     monkeypatch.setattr(mod, "CapacityRefresher", FakeRefresher)
     monkeypatch.setattr(mod, "Orca", orca_cls)
     monkeypatch.setattr(mod.time, "sleep", lambda seconds: sleeps.append(seconds))
@@ -141,6 +142,7 @@ def test_main_enables_local_router_config(monkeypatch):
     assert multi.router_config_dir == "/tmp/router-configs"
     assert multi.router_port_base == 20000
     assert multi.model_catalogs == ("catalogs", "client")
+    assert multi.tunnels == "tunnels"
 
 
 def test_main_maps_cloud_regions_to_kube_contexts(monkeypatch, tmp_path):
