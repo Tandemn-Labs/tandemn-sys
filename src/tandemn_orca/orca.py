@@ -328,7 +328,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Orca against Tandemn Store plans.")
     parser.add_argument("--user-id", default=os.getenv("TANDEMN_USER_ID"))
     parser.add_argument("--namespace", default=os.getenv("TANDEMN_K8S_NAMESPACE", "default"))
-    parser.add_argument("--router-image", default=os.getenv("TANDEMN_ROUTER_IMAGE"))
+    parser.add_argument("--router-config-dir", default=os.getenv("TANDEMN_ROUTER_CONFIG_DIR"))
+    parser.add_argument(
+        "--router-port-base",
+        type=int,
+        default=int(os.getenv("TANDEMN_ROUTER_PORT_BASE", "18000")),
+    )
+    parser.add_argument(
+        "--router-port-span",
+        type=int,
+        default=int(os.getenv("TANDEMN_ROUTER_PORT_SPAN", "10000")),
+    )
     parser.add_argument(
         "--aws-regions",
         default=os.getenv("TANDEMN_AWS_REGIONS", "us-east-1,us-east-2,us-west-1,us-west-2"),
@@ -368,8 +378,10 @@ def main(argv: list[str] | None = None) -> None:
         client,
         launcher=DynamoLauncher(
             namespace=args.namespace,
-            router_image=args.router_image,
-            model_catalogs=ModelCatalogStore(client) if args.router_image else None,
+            router_config_dir=args.router_config_dir,
+            router_port_base=args.router_port_base,
+            router_port_span=args.router_port_span,
+            model_catalogs=ModelCatalogStore(client) if args.router_config_dir else None,
         ),
     )
     while True:

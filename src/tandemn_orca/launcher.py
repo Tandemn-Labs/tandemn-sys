@@ -11,8 +11,12 @@ infrastructure.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 from collections.abc import Callable
+from pathlib import Path
 from typing import Protocol
 
 from tandemn_system_data.clients import ModelCatalogStore
@@ -20,7 +24,8 @@ from tandemn_system_data.models.rank import Rank
 
 from tandemn_orca.dynamo_compiler import (
     compile_job,
-    render_router_objects,
+    pool_dgd_name,
+    render_router_config,
 )
 from tandemn_orca.dynamo_kubernetes import (
     DynamoKubernetesClient,
@@ -90,36 +95,47 @@ class DynamoLauncher:
         self,
         namespace: str = "default",
         k8s: DynamoKubernetesClient | None = None,
-        router_image: str | None = None,
+        router_config_dir: str | None = None,
+        router_port_base: int = 18000,
+        router_port_span: int = 10000,
         model_catalogs: ModelCatalogStore | None = None,
     ) -> None:
         self.namespace = namespace
         self.k8s = k8s or load_kube_client(namespace)
-        self.router_image = router_image
+        self.router_config_dir = Path(router_config_dir) if router_config_dir else None
+        self.router_port_base = router_port_base
+        self.router_port_span = router_port_span
         self.model_catalogs = model_catalogs
 
     def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
         desired = compile_job(job_id, ranks, self.namespace)
-        if self.router_image:
+        router_config = None
+        ports: dict[str, int] = {}
+        if self.router_config_dir is not None:
             max_num_seq = _max_num_seq_by_rank(ranks, self.model_catalogs)
-            desired.extend(
-                render_router_objects(
-                    job_id,
-                    ranks,
-                    max_num_seq,
-                    self.router_image,
-                    self.namespace,
-                )
-            )
+            ports = _ports_by_rank(ranks, self.router_port_base, self.router_port_span)
+            router_config = render_router_config(job_id, ranks, max_num_seq, ports)
         desired_keys = {object_key(obj) for obj in desired}
         stale = self.k8s.list_job_objects(job_id) - desired_keys
         apply_error = _call(self.k8s.apply_many, desired)
         if apply_error:
             raise ReconcileError(apply_error, None)
         self._delete_stale(stale)
+        if router_config is not None:
+            assert self.router_config_dir is not None
+            _write_router_config(self.router_config_dir, job_id, router_config)
+            for rank in ranks:
+                logger.info(
+                    "router tunnel: kubectl --namespace %s port-forward service/%s-frontend %s:8000",
+                    self.namespace,
+                    pool_dgd_name(job_id, rank),
+                    ports[rank.rank_id],
+                )
 
     def teardown_job(self, job_id: str) -> None:
         self.k8s.delete_all_for_job(job_id)
+        if self.router_config_dir is not None:
+            self.router_config_dir.joinpath(f"{job_id}.json").unlink(missing_ok=True)
 
     def _delete_stale(self, stale: set[ObjectKey]) -> None:
         delete_error = _call(self.k8s.delete_many, stale)
@@ -139,7 +155,7 @@ def _max_num_seq_by_rank(
     ranks: list[Rank], model_catalogs: ModelCatalogStore | None
 ) -> dict[str, int]:
     if model_catalogs is None:
-        raise ModelCatalogError("router publishing requires a ModelCatalogStore")
+        raise ModelCatalogError("local router config requires a ModelCatalogStore")
     values: dict[str, int] = {}
     for rank in ranks:
         model_id = rank.shape_json.get("model_id")
@@ -169,3 +185,32 @@ def _max_num_seq_by_rank(
             )
         values[rank.rank_id] = value
     return values
+
+
+def _ports_by_rank(ranks: list[Rank], base: int, span: int) -> dict[str, int]:
+    if base < 1 or span < 1 or base + span > 65536:
+        raise ValueError("router port range must fit within 1..65535")
+    ports: dict[str, int] = {}
+    used: dict[int, str] = {}
+    for rank in ranks:
+        digest = hashlib.sha256(rank.rank_id.encode()).digest()
+        port = base + int.from_bytes(digest[:4], "big") % span
+        if port in used and used[port] != rank.rank_id:
+            raise ValueError(
+                f"router port collision between ranks {used[port]!r} and {rank.rank_id!r}"
+            )
+        ports[rank.rank_id] = port
+        used[port] = rank.rank_id
+    return ports
+
+
+def _write_router_config(directory: Path, job_id: str, config: dict) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{job_id}.json"
+    temporary = directory / f".{job_id}.json.tmp"
+    with temporary.open("w") as file:
+        json.dump(config, file, indent=2)
+        file.write("\n")
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temporary, path)

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from kubernetes.client.rest import ApiException
 
 from tandemn_orca.dynamo_kubernetes import (
@@ -17,50 +15,12 @@ from tandemn_orca.dynamo_kubernetes import (
 )
 
 
-def _configmap(name: str = "router-config") -> dict:
-    return {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name}}
-
-
 def _dgd(name: str = "pool") -> dict:
     return {
         "apiVersion": "nvidia.com/v1alpha1",
         "kind": "DynamoGraphDeployment",
         "metadata": {"name": name},
     }
-
-
-def _deployment(name: str = "router") -> dict:
-    return {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": name}}
-
-
-def _service(name: str = "router") -> dict:
-    return {"apiVersion": "v1", "kind": "Service", "metadata": {"name": name}}
-
-
-class FakeCore:
-    def __init__(self) -> None:
-        self.applied: list[tuple] = []
-        self.deleted: list[tuple] = []
-
-    def list_namespaced_config_map(self, namespace, label_selector):
-        self.configmap_selector = (namespace, label_selector)
-        return SimpleNamespace(items=[SimpleNamespace(metadata=SimpleNamespace(name="cm"))])
-
-    def list_namespaced_service(self, namespace, label_selector):
-        self.service_selector = (namespace, label_selector)
-        return SimpleNamespace(items=[SimpleNamespace(metadata=SimpleNamespace(name="svc"))])
-
-    def patch_namespaced_config_map(self, *args, **kwargs):
-        self.applied.append((args, kwargs))
-
-    def delete_namespaced_config_map(self, *args):
-        self.deleted.append(args)
-
-    def patch_namespaced_service(self, *args, **kwargs):
-        self.applied.append((args, kwargs))
-
-    def delete_namespaced_service(self, *args):
-        self.deleted.append(args)
 
 
 class FakeCustom:
@@ -79,114 +39,50 @@ class FakeCustom:
         self.deleted.append(args)
 
 
-class FakeApps:
-    def __init__(self) -> None:
-        self.applied: list[tuple] = []
-        self.deleted: list[tuple] = []
-
-    def patch_namespaced_deployment(self, *args, **kwargs):
-        self.applied.append((args, kwargs))
-
-    def list_namespaced_deployment(self, namespace, label_selector):
-        self.selector = (namespace, label_selector)
-        return SimpleNamespace(items=[SimpleNamespace(metadata=SimpleNamespace(name="deploy"))])
-
-    def delete_namespaced_deployment(self, *args):
-        self.deleted.append(args)
-
-
 def test_object_key_and_selector():
     assert object_key(_dgd("x")) == ("DynamoGraphDeployment", "x")
     assert job_selector("job_1") == "tandemn.com/managed-by=orca,tandemn.com/job-id=job_1"
 
 
-def test_list_job_objects_reads_all_managed_resources():
-    core = FakeCore()
+def test_list_job_objects_reads_dgds():
     custom = FakeCustom()
-    apps = FakeApps()
-    client = DynamoKubernetesClient("ns", core=core, custom=custom, apps=apps)
+    client = DynamoKubernetesClient("ns", custom=custom)
 
-    assert client.list_job_objects("job_1") == {
-        ("ConfigMap", "cm"),
-        ("Service", "svc"),
-        ("Deployment", "deploy"),
-        ("DynamoGraphDeployment", "dgd"),
-    }
-    selector = ("ns", "tandemn.com/managed-by=orca,tandemn.com/job-id=job_1")
-    assert core.configmap_selector == selector
-    assert core.service_selector == selector
-    assert apps.selector == selector
+    assert client.list_job_objects("job_1") == {("DynamoGraphDeployment", "dgd")}
     assert custom.selector == (
         (GROUP, VERSION, "ns", DGD_PLURAL),
         {"label_selector": "tandemn.com/managed-by=orca,tandemn.com/job-id=job_1"},
     )
 
 
-def test_apply_many_uses_server_side_apply_for_supported_objects():
-    core = FakeCore()
+def test_apply_many_uses_server_side_apply():
     custom = FakeCustom()
-    apps = FakeApps()
-    client = DynamoKubernetesClient("ns", core=core, custom=custom, apps=apps)
+    client = DynamoKubernetesClient("ns", custom=custom)
 
-    assert client.apply_many(
-        [_configmap("cm"), _dgd("dgd"), _deployment("router"), _service("router")]
-    ) == {
-        ("ConfigMap", "cm"),
-        ("DynamoGraphDeployment", "dgd"),
-        ("Deployment", "router"),
-        ("Service", "router"),
-    }
-
-    assert core.applied == [
-        (
-            ("cm", "ns", _configmap("cm")),
-            {"field_manager": FIELD_MANAGER, "force": True, "_content_type": APPLY},
-        ),
-        (
-            ("router", "ns", _service("router")),
-            {"field_manager": FIELD_MANAGER, "force": True, "_content_type": APPLY},
-        ),
-    ]
+    assert client.apply_many([_dgd("dgd")]) == {("DynamoGraphDeployment", "dgd")}
     assert custom.applied == [
         (
             (GROUP, VERSION, "ns", DGD_PLURAL, "dgd", _dgd("dgd")),
             {"field_manager": FIELD_MANAGER, "force": True, "_content_type": APPLY},
         )
     ]
-    assert apps.applied == [
-        (
-            ("router", "ns", _deployment("router")),
-            {"field_manager": FIELD_MANAGER, "force": True, "_content_type": APPLY},
-        )
-    ]
 
 
-def test_delete_many_deletes_supported_objects():
-    core = FakeCore()
+def test_delete_many_deletes_dgds():
     custom = FakeCustom()
-    apps = FakeApps()
-    client = DynamoKubernetesClient("ns", core=core, custom=custom, apps=apps)
+    client = DynamoKubernetesClient("ns", custom=custom)
 
-    client.delete_many(
-        {
-            ("ConfigMap", "cm"),
-            ("DynamoGraphDeployment", "dgd"),
-            ("Deployment", "router"),
-            ("Service", "router"),
-        }
-    )
+    client.delete_many({("DynamoGraphDeployment", "dgd")})
 
-    assert core.deleted == [("cm", "ns"), ("router", "ns")]
     assert custom.deleted == [(GROUP, VERSION, "ns", DGD_PLURAL, "dgd")]
-    assert apps.deleted == [("router", "ns")]
 
 
 def test_delete_ignores_not_found():
-    class MissingCore(FakeCore):
-        def delete_namespaced_config_map(self, *args):
+    class MissingCustom(FakeCustom):
+        def delete_namespaced_custom_object(self, *args):
             raise ApiException(status=404)
 
-    DynamoKubernetesClient("ns", core=MissingCore(), custom=FakeCustom()).delete("ConfigMap", "cm")
+    DynamoKubernetesClient("ns", custom=MissingCustom()).delete("DynamoGraphDeployment", "dgd")
 
 
 def test_load_kube_client_falls_back_to_kubeconfig(monkeypatch):
@@ -203,11 +99,9 @@ def test_load_kube_client_falls_back_to_kubeconfig(monkeypatch):
         "tandemn_orca.dynamo_kubernetes.config.load_kube_config",
         lambda: calls.append("kubeconfig"),
     )
-    monkeypatch.setattr("tandemn_orca.dynamo_kubernetes.client.CoreV1Api", lambda: FakeCore())
     monkeypatch.setattr(
         "tandemn_orca.dynamo_kubernetes.client.CustomObjectsApi", lambda: FakeCustom()
     )
-    monkeypatch.setattr("tandemn_orca.dynamo_kubernetes.client.AppsV1Api", lambda: FakeApps())
 
     loaded = load_kube_client("ns")
 
@@ -222,21 +116,11 @@ def test_load_kube_client_uses_explicit_context(monkeypatch):
         lambda **kwargs: api_client,
     )
     monkeypatch.setattr(
-        "tandemn_orca.dynamo_kubernetes.client.CoreV1Api",
-        lambda loaded: ("core", loaded),
-    )
-    monkeypatch.setattr(
         "tandemn_orca.dynamo_kubernetes.client.CustomObjectsApi",
         lambda loaded: ("custom", loaded),
     )
-    monkeypatch.setattr(
-        "tandemn_orca.dynamo_kubernetes.client.AppsV1Api",
-        lambda loaded: ("apps", loaded),
-    )
 
-    loaded = load_kube_client("routing", "/config/control", "control")
+    loaded = load_kube_client("serving", context="cloud-region")
 
-    assert loaded.namespace == "routing"
-    assert loaded.core == ("core", api_client)
+    assert loaded.namespace == "serving"
     assert loaded.custom == ("custom", api_client)
-    assert loaded.apps == ("apps", api_client)
