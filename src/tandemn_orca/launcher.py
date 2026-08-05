@@ -33,6 +33,7 @@ from tandemn_orca.dynamo_kubernetes import (
     load_kube_client,
     object_key,
 )
+from tandemn_orca.tunnels import PortForwardManager, TunnelSpec
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,7 @@ class MultiClusterLauncher:
         router_port_span: int = 10000,
         model_catalogs: ModelCatalogStore | None = None,
         default_cluster: str | None = None,
+        tunnels: PortForwardManager | None = None,
     ) -> None:
         if not launchers:
             raise ValueError("at least one cluster launcher is required")
@@ -140,6 +142,7 @@ class MultiClusterLauncher:
         self.router_port_span = router_port_span
         self.model_catalogs = model_catalogs
         self.default_cluster = default_cluster
+        self.tunnels = tunnels
 
     def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
         groups: dict[str, list[Rank]] = {key: [] for key in self.launchers}
@@ -161,6 +164,22 @@ class MultiClusterLauncher:
 
         if router_config is not None:
             assert self.router_config_dir is not None
+            if self.tunnels is not None:
+                self.tunnels.reconcile(
+                    job_id,
+                    [
+                        TunnelSpec(
+                            job_id=job_id,
+                            rank_id=rank.rank_id,
+                            context=self.launchers[key].context,
+                            namespace=self.launchers[key].namespace,
+                            service=f"{pool_dgd_name(job_id, rank)}-frontend",
+                            local_port=ports[rank.rank_id],
+                        )
+                        for key, grouped_ranks in groups.items()
+                        for rank in grouped_ranks
+                    ],
+                )
             _write_router_config(self.router_config_dir, job_id, router_config)
             for key, grouped_ranks in groups.items():
                 for rank in grouped_ranks:
@@ -176,6 +195,8 @@ class MultiClusterLauncher:
     def teardown_job(self, job_id: str) -> None:
         for launcher in self.launchers.values():
             launcher.teardown_job(job_id)
+        if self.tunnels is not None:
+            self.tunnels.reconcile(job_id, [])
         if self.router_config_dir is not None:
             self.router_config_dir.joinpath(f"{job_id}.json").unlink(missing_ok=True)
 
