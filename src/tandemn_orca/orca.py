@@ -26,6 +26,7 @@ Ladder shape (opaque JSONB; Koi <-> Orca contract):
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -37,7 +38,14 @@ from tandemn_system_data.models.enums import ActionType, JobStatus, RankRole, Ra
 from tandemn_system_data.models.plan import Plan, PlanAction
 from tandemn_system_data.models.rank import Rank
 
-from tandemn_orca.launcher import DynamoLauncher, Launcher, ModelCatalogError, NoopLauncher
+from tandemn_orca.dynamo_kubernetes import load_kube_client
+from tandemn_orca.launcher import (
+    DynamoLauncher,
+    Launcher,
+    ModelCatalogError,
+    MultiClusterLauncher,
+    NoopLauncher,
+)
 from tandemn_orca.scripts.resource_map_from_aws import CapacityRefresher, parse_region_csv
 
 logger = logging.getLogger(__name__)
@@ -329,6 +337,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--user-id", default=os.getenv("TANDEMN_USER_ID"))
     parser.add_argument("--namespace", default=os.getenv("TANDEMN_K8S_NAMESPACE", "default"))
     parser.add_argument("--router-config-dir", default=os.getenv("TANDEMN_ROUTER_CONFIG_DIR"))
+    parser.add_argument("--cluster-contexts", default=os.getenv("TANDEMN_CLUSTER_CONTEXTS"))
     parser.add_argument(
         "--router-port-base",
         type=int,
@@ -357,6 +366,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def load_cluster_contexts(path: str) -> dict[str, str]:
+    with open(path) as file:
+        raw = json.load(file)
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("cluster context map must be a non-empty JSON object")
+    contexts = {str(key): str(value) for key, value in raw.items() if key and value}
+    if len(contexts) != len(raw):
+        raise ValueError("cluster context keys and values must be non-empty")
+    return contexts
+
+
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO)
     args = parse_args(argv)
@@ -374,16 +394,29 @@ def main(argv: list[str] | None = None) -> None:
     except Exception:
         logger.exception("capacity refresh failed")
 
-    orca = Orca(
-        client,
-        launcher=DynamoLauncher(
-            namespace=args.namespace,
-            router_config_dir=args.router_config_dir,
-            router_port_base=args.router_port_base,
-            router_port_span=args.router_port_span,
-            model_catalogs=ModelCatalogStore(client) if args.router_config_dir else None,
-        ),
+    if args.cluster_contexts:
+        contexts = load_cluster_contexts(args.cluster_contexts)
+        launchers = {
+            key: DynamoLauncher(
+                namespace=args.namespace,
+                k8s=load_kube_client(args.namespace, context=context),
+                context=context,
+            )
+            for key, context in contexts.items()
+        }
+        default_cluster = None
+    else:
+        launchers = {"default": DynamoLauncher(namespace=args.namespace)}
+        default_cluster = "default"
+    launcher = MultiClusterLauncher(
+        launchers,
+        router_config_dir=args.router_config_dir,
+        router_port_base=args.router_port_base,
+        router_port_span=args.router_port_span,
+        model_catalogs=ModelCatalogStore(client) if args.router_config_dir else None,
+        default_cluster=default_cluster,
     )
+    orca = Orca(client, launcher=launcher)
     while True:
         try:
             refresher.refresh_if_due()
