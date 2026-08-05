@@ -148,7 +148,7 @@ class PrometheusClient:
         try:
             with urllib.request.urlopen(url, timeout=self._timeout) as resp:
                 payload = json.load(resp)
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
             logger.warning("prometheus query failed: %s", error)
             return None
         results = payload.get("data", {}).get("result", [])
@@ -172,7 +172,7 @@ class PrometheusClient:
         try:
             with urllib.request.urlopen(url, timeout=self._timeout) as resp:
                 payload = json.load(resp)
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
             logger.warning("prometheus gpu discovery failed: %s", error)
             return []
         targets = []
