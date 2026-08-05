@@ -332,15 +332,21 @@ class KubeWorkerIndex:
     ``instance`` label carries the node's InternalIP) and its instance type.
     """
 
-    def __init__(self, namespace: str = "default", core: Any = None) -> None:
+    def __init__(
+        self, namespace: str = "default", core: Any = None, context: str | None = None
+    ) -> None:
         from kubernetes import client, config
 
         if core is None:
-            try:
-                config.load_incluster_config()
-            except Exception:
-                config.load_kube_config()
-            core = client.CoreV1Api()
+            if context is not None:
+                api_client = config.new_client_from_config(context=context)
+                core = client.CoreV1Api(api_client)
+            else:
+                try:
+                    config.load_incluster_config()
+                except Exception:
+                    config.load_kube_config()
+                core = client.CoreV1Api()
         self._core = core
         self._namespace = namespace
 
@@ -512,6 +518,16 @@ def collect_rank_telemetry(
             )
         )
     return snapshots
+
+
+def local_ranks_for_workers(ranks: list[Rank], workers_by_pod: dict[str, WorkerInfo]) -> list[Rank]:
+    """Keep only ranks with runtime pods in this collector's cluster."""
+    local = {
+        (worker.job_id, worker.rank_id)
+        for worker in workers_by_pod.values()
+        if worker.job_id and worker.rank_id and worker.chain_index is not None
+    }
+    return [rank for rank in ranks if (rank.job_id, rank.rank_id) in local]
 
 
 def collect_once(
@@ -688,6 +704,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--namespace", default="default", help="Kubernetes namespace of the worker pods"
     )
     parser.add_argument(
+        "--kube-context",
+        default=os.getenv("TANDEMN_KUBE_CONTEXT"),
+        help="Kubeconfig context for this collector process",
+    )
+    parser.add_argument(
         "--user-id",
         default=os.getenv("TANDEMN_USER_ID"),
         help="Resource map owner (or TANDEMN_USER_ID); prices instances for cost_per_token",
@@ -713,7 +734,7 @@ def main(argv: list[str] | None = None) -> int:
     resource_maps = (
         ResourceMapStore(client, user_id=args.user_id) if args.user_id is not None else None
     )
-    kube = KubeWorkerIndex(namespace=args.namespace)
+    kube = KubeWorkerIndex(namespace=args.namespace, context=args.kube_context)
     router_telemetry = (
         RouterTelemetryClient(args.router_url_template, args.router_telemetry_token)
         if args.router_url_template
@@ -728,7 +749,8 @@ def main(argv: list[str] | None = None) -> int:
         ranks = [rank for job_id in job_ids for rank in jobs.active_ranks(job_id)]
         validate_rank_identity(workers_by_pod, ranks)
         if router_telemetry is not None:
-            for snapshot in collect_rank_telemetry(prom, workers_by_pod, ranks):
+            local_ranks = local_ranks_for_workers(ranks, workers_by_pod)
+            for snapshot in collect_rank_telemetry(prom, workers_by_pod, local_ranks):
                 try:
                     router_telemetry.push(snapshot)
                 except (urllib.error.URLError, TimeoutError, OSError):

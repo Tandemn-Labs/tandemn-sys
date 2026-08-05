@@ -15,6 +15,7 @@ from tandemn_orca.scripts.gpu_metrics_collector import (
     WorkerInfo,
     collect_once,
     collect_rank_telemetry,
+    local_ranks_for_workers,
     resolve_instance_price_per_hour,
     validate_rank_identity,
 )
@@ -72,6 +73,23 @@ def test_worker_index_uses_single_and_multinode_grove_indexes():
         workers["multi-worker"].member_index,
     ) == (None, 0, 1)
     assert (workers["multi-leader"].chain_index, workers["multi-worker"].chain_index) == (2, 2)
+
+
+def test_worker_index_uses_explicit_kube_context(monkeypatch):
+    api_client = object()
+    core = object()
+    monkeypatch.setattr(
+        "kubernetes.config.new_client_from_config",
+        lambda **kwargs: api_client if kwargs == {"context": "gke-central"} else None,
+    )
+    monkeypatch.setattr(
+        "kubernetes.client.CoreV1Api",
+        lambda loaded: core if loaded is api_client else None,
+    )
+
+    index = KubeWorkerIndex(context="gke-central")
+
+    assert index._core is core
 
 
 class FakeProm:
@@ -292,6 +310,14 @@ def test_collect_rank_telemetry_deduplicates_multinode_members():
             observed_at=observed_at,
         )
     ]
+
+
+def test_local_ranks_for_workers_excludes_remote_cluster_ranks():
+    local = _rank(1, rank_id="rank_local")
+    remote = _rank(1, rank_id="rank_remote")
+    workers = {"local-pod": _worker("local-pod", 0, rank_id="rank_local")}
+
+    assert local_ranks_for_workers([local, remote], workers) == [local]
 
 
 def test_router_telemetry_client_posts_authenticated_json(monkeypatch):
