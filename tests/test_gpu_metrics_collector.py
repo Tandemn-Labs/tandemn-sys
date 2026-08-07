@@ -286,7 +286,12 @@ def test_validate_rank_identity_accepts_grove_slots_in_replica_range():
 def test_collect_rank_telemetry_deduplicates_multinode_members():
     class Prom:
         def query_scalar(self, query):
-            return 3.0 if "num_requests_running" in query else 1.0
+            if "num_requests_running" in query:
+                return 3.0
+            if "gpu_cache_usage_percent" in query:
+                # Distinct per chain: the snapshot must carry the rank-level mean.
+                return 0.3 if "chain-0" in query else 0.5
+            return 1.0
 
     workers = {}
     for chain_index in range(3):
@@ -309,6 +314,7 @@ def test_collect_rank_telemetry_deduplicates_multinode_members():
             pending_requests=2,
             ready_replicas=2,
             observed_at=observed_at,
+            kv_cache_util=0.4,
         )
     ]
 
@@ -353,6 +359,7 @@ def test_router_telemetry_client_posts_authenticated_json(monkeypatch):
     assert request.full_url == "http://127.0.0.1:18080/internal/telemetry"
     assert request.headers["Authorization"] == "Bearer secret"
     assert json.loads(request.data)["pending_requests"] == 1
+    assert json.loads(request.data)["kv_cache_util"] == 0.0
     assert timeout == 5.0
 
 
