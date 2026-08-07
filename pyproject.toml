@@ -21,6 +21,7 @@ dependencies = [
 tandemn-orca = "tandemn_orca.orca:main"
 tandemn-gpu-metrics-collector = "tandemn_orca.scripts.gpu_metrics_collector:main"
 tandemn-submit-job = "tandemn_orca.scripts.submit_job:main"
+tandemn-endpoint = "tandemn_orca.scripts.endpoint:main"
 
 [project.optional-dependencies]
 dev = [
