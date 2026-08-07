@@ -12,6 +12,7 @@ from tandemn_orca.dynamo_compiler import (
     pool_key,
     render_rank_dgd,
     render_router_config,
+    router_listen_port,
     worker_args,
 )
 
@@ -173,6 +174,7 @@ def test_local_router_config_matches_router_json_contract():
     assert config == {
         "version": "plan_1",
         "job_id": "job_online_001",
+        "listen_port": router_listen_port("job_online_001"),
         "overflow_threshold": 0.8,
         "deployments": [
             {

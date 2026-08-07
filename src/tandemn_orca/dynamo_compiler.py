@@ -28,6 +28,17 @@ PLANNER_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.1"
 # "VllmDecodeWorker" (16), so DGD names must stay within 29.
 MAX_DGD_NAME = 29
 
+# Per-job router listen ports live above the rank tunnel range
+# (launcher: 18000 + span 10000) so a router never collides with a tunnel.
+ROUTER_LISTEN_PORT_BASE = 28000
+ROUTER_LISTEN_PORT_SPAN = 1000
+
+
+def router_listen_port(job_id: str) -> int:
+    """Deterministic user-facing port for one job's router process."""
+    digest = hashlib.sha256(job_id.encode()).digest()
+    return ROUTER_LISTEN_PORT_BASE + int.from_bytes(digest[:4], "big") % ROUTER_LISTEN_PORT_SPAN
+
 
 def compile_job(job_id: str, ranks: list[Rank], namespace: str = "default") -> list[dict[str, Any]]:
     if len({rank.rank_id for rank in ranks}) != len(ranks):
@@ -74,6 +85,7 @@ def render_router_config(
     return {
         "version": plan_id,
         "job_id": job_id,
+        "listen_port": router_listen_port(job_id),
         "overflow_threshold": 0.8,
         "deployments": deployments,
     }
