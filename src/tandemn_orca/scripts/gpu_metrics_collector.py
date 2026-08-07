@@ -105,7 +105,7 @@ WORKER_QUERIES: dict[str, str] = {
     "throughput_token_per_sec": "sum(rate(vllm:generation_tokens_total{{{worker}}}[1m]))",
     "live_batch_size": "sum(vllm:num_requests_running{{{worker}}})",
     "depth_req_q": "sum(vllm:num_requests_waiting{{{worker}}})",
-    "kv_cache_util": "max(vllm:kv_cache_usage_perc{{{worker}}})",
+    "kv_cache_util": "max(dynamo_component_gpu_cache_usage_percent{{{worker}}})",
     "kvcache_hit_rate": (
         "sum(rate(vllm:prefix_cache_hits_total{{{worker}}}[5m])) / "
         "sum(rate(vllm:prefix_cache_queries_total{{{worker}}}[5m]))"
@@ -208,6 +208,7 @@ class RankTelemetrySnapshot:
     pending_requests: int
     ready_replicas: int
     observed_at: datetime
+    kv_cache_util: float = 0.0
 
 
 class RouterTelemetryClient:
@@ -492,6 +493,7 @@ def collect_rank_telemetry(
             chains.setdefault(worker.chain_index, []).append(worker)
 
         active = pending = ready_replicas = 0
+        kv_samples: list[float] = []
         for members in chains.values():
             if len([member for member in members if member.ready]) < members[0].node_count:
                 continue
@@ -504,6 +506,9 @@ def collect_rank_telemetry(
             active += math.ceil(max(0.0, running))
             pending += math.ceil(max(0.0, waiting))
             ready_replicas += 1
+            kv = prom.query_scalar(WORKER_QUERIES["kv_cache_util"].format(worker=selector))
+            if kv is not None:
+                kv_samples.append(max(0.0, kv))
 
         snapshots.append(
             RankTelemetrySnapshot(
@@ -513,6 +518,11 @@ def collect_rank_telemetry(
                 pending_requests=pending,
                 ready_replicas=ready_replicas,
                 observed_at=observed_at,
+                # Rank-level utilization, the planner's signal: replicas have
+                # equal-size caches, so the mean across chains is used/capacity
+                # for the whole rank. Chains with no KV sample drop out of the
+                # mean rather than dragging it toward zero.
+                kv_cache_util=sum(kv_samples) / len(kv_samples) if kv_samples else 0.0,
             )
         )
     return snapshots
