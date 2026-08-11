@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from tandemn_system_data.models import Rank, RankRole, ResourceMap
 
+from tandemn_orca.dynamo_compiler import router_listen_port
 from tandemn_orca.scripts.gpu_metrics_collector import (
     KubeWorkerIndex,
     PrometheusClient,
@@ -361,6 +362,11 @@ def test_router_telemetry_client_posts_authenticated_json(monkeypatch):
     assert json.loads(request.data)["pending_requests"] == 1
     assert json.loads(request.data)["kv_cache_util"] == 0.0
     assert timeout == 5.0
+
+    RouterTelemetryClient(None, "secret").push(snapshot)
+    derived, _ = requests[1]
+    port = router_listen_port("job_1")
+    assert derived.full_url == f"http://127.0.0.1:{port}/internal/telemetry"
 
 
 def test_prometheus_client_treats_connection_reset_as_missing_data(monkeypatch):

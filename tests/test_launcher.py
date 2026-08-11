@@ -121,17 +121,28 @@ def test_dynamo_launcher_teardown_deletes_job_objects():
     assert k8s.deleted_jobs == ["job_online_001"]
 
 
+class FakeRouters:
+    def __init__(self):
+        self.calls = []
+
+    def reconcile(self, job_id, config_path):
+        self.calls.append((job_id, config_path))
+
+
 def test_dynamo_launcher_writes_and_deletes_local_router_config(tmp_path):
     workload = FakeK8s()
     rank = _rank()
+    routers = FakeRouters()
     launcher = MultiClusterLauncher(
         {"default": DynamoLauncher(k8s=workload)},
         router_config_dir=str(tmp_path),
         model_catalogs=_catalog(),
         default_cluster="default",
+        routers=routers,
     )
 
     launcher.reconcile("job_online_001", [rank])
+    assert routers.calls == [("job_online_001", str(tmp_path / "job_online_001.json"))]
 
     assert [obj["kind"] for obj in workload.applied[0]] == ["DynamoGraphDeployment"]
     config_path = tmp_path / "job_online_001.json"
@@ -147,6 +158,7 @@ def test_dynamo_launcher_writes_and_deletes_local_router_config(tmp_path):
     launcher.teardown_job("job_online_001")
     assert workload.deleted_jobs == ["job_online_001"]
     assert not config_path.exists()
+    assert routers.calls[-1] == ("job_online_001", None)
 
 
 def test_dynamo_launcher_does_not_write_config_when_apply_fails(tmp_path):

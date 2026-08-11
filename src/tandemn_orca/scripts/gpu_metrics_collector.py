@@ -63,6 +63,8 @@ from tandemn_system_data.clients import (
 )
 from tandemn_system_data.models import GpuMetric, Rank, ResourceMap
 
+from tandemn_orca.dynamo_compiler import router_listen_port
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROMETHEUS_URL = "http://localhost:9090"
@@ -123,10 +125,6 @@ WORKER_QUERIES: dict[str, str] = {
     ),
     "decode_itr_counts_per_second": (
         "sum(rate(vllm:request_decode_time_seconds_count{{{worker}}}[1m]))"
-    ),
-    "kv_pressure_score": (
-        "max(vllm:kv_cache_usage_perc{{{worker}}}) + sum(vllm:num_requests_waiting{{{worker}}}) "
-        "+ sum(rate(vllm:num_preemptions_total{{{worker}}}[5m]))"
     ),
     "pd_inbalance": (
         "sum(rate(vllm:request_prefill_time_seconds_sum{{{worker}}}[5m])) / "
@@ -212,13 +210,18 @@ class RankTelemetrySnapshot:
 
 
 class RouterTelemetryClient:
-    def __init__(self, url_template: str, token: str, timeout: float = 5.0) -> None:
+    def __init__(self, url_template: str | None, token: str, timeout: float = 5.0) -> None:
         self.url_template = url_template
         self.token = token
         self.timeout = timeout
 
     def push(self, snapshot: RankTelemetrySnapshot) -> None:
-        base_url = self.url_template.format(job_id=snapshot.job_id).rstrip("/")
+        if self.url_template:
+            base_url = self.url_template.format(job_id=snapshot.job_id).rstrip("/")
+        else:
+            # Each job's router binds its deterministic listen_port; derive it
+            # so one collector feeds every job's router without configuration.
+            base_url = f"http://127.0.0.1:{router_listen_port(snapshot.job_id)}"
         request = urllib.request.Request(
             f"{base_url}/internal/telemetry",
             data=json.dumps(
@@ -743,9 +746,11 @@ def main(argv: list[str] | None = None) -> int:
         ResourceMapStore(client, user_id=args.user_id) if args.user_id is not None else None
     )
     kube = KubeWorkerIndex(namespace=args.namespace, context=args.kube_context)
+    # With a token but no template, the client derives each job's router URL
+    # from its deterministic listen_port — one collector, N job routers.
     router_telemetry = (
-        RouterTelemetryClient(args.router_url_template, args.router_telemetry_token)
-        if args.router_url_template
+        RouterTelemetryClient(args.router_url_template or None, args.router_telemetry_token)
+        if args.router_telemetry_token
         else None
     )
 

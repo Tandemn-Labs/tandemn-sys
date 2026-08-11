@@ -48,7 +48,7 @@ from tandemn_orca.launcher import (
     NoopLauncher,
 )
 from tandemn_orca.scripts.resource_map_from_aws import CapacityRefresher, parse_region_csv
-from tandemn_orca.tunnels import PortForwardManager
+from tandemn_orca.tunnels import PortForwardManager, RouterProcessManager
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +361,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--user-id", default=os.getenv("TANDEMN_USER_ID"))
     parser.add_argument("--namespace", default=os.getenv("TANDEMN_K8S_NAMESPACE", "default"))
     parser.add_argument("--router-config-dir", default=os.getenv("TANDEMN_ROUTER_CONFIG_DIR"))
+    parser.add_argument("--router-binary", default=os.getenv("TANDEMN_ROUTER_BINARY"))
     parser.add_argument("--cluster-contexts", default=os.getenv("TANDEMN_CLUSTER_CONTEXTS"))
     parser.add_argument(
         "--router-port-base",
@@ -435,6 +436,13 @@ def main(argv: list[str] | None = None) -> None:
         launchers = {"default": DynamoLauncher(namespace=args.namespace)}
         default_cluster = "default"
     tunnel_manager = PortForwardManager() if args.router_config_dir else None
+    router_manager = None
+    if args.router_binary and args.router_config_dir:
+        if not os.getenv("TANDEMN_ROUTER_TELEMETRY_TOKEN"):
+            raise SystemExit(
+                "--router-binary requires TANDEMN_ROUTER_TELEMETRY_TOKEN in the environment"
+            )
+        router_manager = RouterProcessManager(args.router_binary)
     launcher = MultiClusterLauncher(
         launchers,
         router_config_dir=args.router_config_dir,
@@ -443,6 +451,7 @@ def main(argv: list[str] | None = None) -> None:
         model_catalogs=ModelCatalogStore(client) if args.router_config_dir else None,
         default_cluster=default_cluster,
         tunnels=tunnel_manager,
+        routers=router_manager,
     )
     orca = Orca(client, launcher=launcher)
     previous_sigterm = None
@@ -478,6 +487,8 @@ def main(argv: list[str] | None = None) -> None:
             except Exception:
                 logger.exception("orca apply loop failed")
     finally:
+        if router_manager is not None:
+            router_manager.close()
         if tunnel_manager is not None:
             tunnel_manager.close()
         if previous_sigterm is not None:
