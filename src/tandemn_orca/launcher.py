@@ -33,7 +33,7 @@ from tandemn_orca.dynamo_kubernetes import (
     load_kube_client,
     object_key,
 )
-from tandemn_orca.tunnels import PortForwardManager, TunnelSpec
+from tandemn_orca.tunnels import PortForwardManager, RouterProcessManager, TunnelSpec
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +133,7 @@ class MultiClusterLauncher:
         model_catalogs: ModelCatalogStore | None = None,
         default_cluster: str | None = None,
         tunnels: PortForwardManager | None = None,
+        routers: RouterProcessManager | None = None,
     ) -> None:
         if not launchers:
             raise ValueError("at least one cluster launcher is required")
@@ -143,6 +144,7 @@ class MultiClusterLauncher:
         self.model_catalogs = model_catalogs
         self.default_cluster = default_cluster
         self.tunnels = tunnels
+        self.routers = routers
 
     def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
         groups: dict[str, list[Rank]] = {key: [] for key in self.launchers}
@@ -181,6 +183,8 @@ class MultiClusterLauncher:
                     ],
                 )
             _write_router_config(self.router_config_dir, job_id, router_config)
+            if self.routers is not None:
+                self.routers.reconcile(job_id, str(self.router_config_dir / f"{job_id}.json"))
             for key, grouped_ranks in groups.items():
                 for rank in grouped_ranks:
                     logger.info(
@@ -197,6 +201,8 @@ class MultiClusterLauncher:
             launcher.teardown_job(job_id)
         if self.tunnels is not None:
             self.tunnels.reconcile(job_id, [])
+        if self.routers is not None:
+            self.routers.reconcile(job_id, None)
         if self.router_config_dir is not None:
             self.router_config_dir.joinpath(f"{job_id}.json").unlink(missing_ok=True)
 
