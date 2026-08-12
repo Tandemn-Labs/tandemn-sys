@@ -78,6 +78,11 @@ def render_router_config(
                 "enabled": True,
                 "max_num_seq": max_num_seq,
                 "maximum_requests": rank.n_replicas * max_num_seq,
+                # Replica ceiling for the overflow gate: above the KV
+                # threshold the router sheds new sessions only once
+                # ready_replicas reaches this, leaving earlier pressure to
+                # local Dynamo autoscaling.
+                "max_replicas": rank.n_replicas,
             }
         )
 
