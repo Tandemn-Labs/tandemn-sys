@@ -185,6 +185,7 @@ def test_local_router_config_matches_router_json_contract():
                 "enabled": True,
                 "max_num_seq": 256,
                 "maximum_requests": 256,
+                "max_replicas": 1,
             }
         ],
     }
