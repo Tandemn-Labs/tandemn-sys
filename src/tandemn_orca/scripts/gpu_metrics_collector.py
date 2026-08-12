@@ -107,7 +107,12 @@ WORKER_QUERIES: dict[str, str] = {
     "throughput_token_per_sec": "sum(rate(vllm:generation_tokens_total{{{worker}}}[1m]))",
     "live_batch_size": "sum(vllm:num_requests_running{{{worker}}})",
     "depth_req_q": "sum(vllm:num_requests_waiting{{{worker}}})",
-    "kv_cache_util": "max(dynamo_component_gpu_cache_usage_percent{{{worker}}})",
+    # Dynamo worker gauge (0.0-1.0), verified live on Dynamo 1.2.1; the vLLM
+    # passthrough gauge is the fallback if a future Dynamo drops it.
+    "kv_cache_util": (
+        "max(dynamo_component_gpu_cache_usage_percent{{{worker}}} "
+        "or vllm:kv_cache_usage_perc{{{worker}}})"
+    ),
     "kvcache_hit_rate": (
         "sum(rate(vllm:prefix_cache_hits_total{{{worker}}}[5m])) / "
         "sum(rate(vllm:prefix_cache_queries_total{{{worker}}}[5m]))"
@@ -131,6 +136,24 @@ WORKER_QUERIES: dict[str, str] = {
         "sum(rate(vllm:request_decode_time_seconds_sum{{{worker}}}[5m]))"
     ),
 }
+
+# Inputs to derived metrics, not GpuMetric fields themselves (WORKER_QUERIES
+# keys map 1:1 onto row fields; these must stay out of that mapping).
+AUX_WORKER_QUERIES: dict[str, str] = {
+    # Mean requested generation budget of recently completed requests.
+    "requested_max_tokens": (
+        "sum(rate(vllm:request_params_max_tokens_sum{{{worker}}}[5m])) / "
+        "sum(rate(vllm:request_params_max_tokens_count{{{worker}}}[5m]))"
+    ),
+    # Total KV blocks allocated by the engine, verified live on Dynamo 1.2.1
+    # (equals vllm:cache_config_info's num_gpu_blocks). If a future Dynamo
+    # drops it, kv_pressure_score degrades to None and warns once.
+    "kv_total_blocks": "max(dynamo_component_total_blocks{{{worker}}})",
+}
+
+# vLLM V1 default KV block size. Only block-rounds the demand side of
+# kv_pressure_score; capacity is already expressed in blocks.
+KV_BLOCK_SIZE_TOKENS = 16
 
 
 class PrometheusClient:
@@ -443,6 +466,38 @@ def validate_rank_identity(workers_by_pod: dict[str, WorkerInfo], ranks: list[Ra
             worker.ttft_target_ms = float(target)
 
 
+def kv_pressure_score(
+    running: float | None,
+    waiting: float | None,
+    avg_prompt_tokens: float | None,
+    avg_requested_tokens: float | None,
+    kv_total_blocks: float | None,
+    block_size: int = KV_BLOCK_SIZE_TOKENS,
+) -> float | None:
+    """Requested KV demand over engine KV capacity, in block units.
+
+    Mirrors LLMServingSim ``Scheduler.get_kv_pressure_score``: every waiting or
+    running request is charged its full requested final context length,
+    block-rounded, against total KV capacity. Fleet-average lengths stand in
+    for per-request lengths, which Prometheus cannot see.
+    """
+    if running is None or waiting is None:
+        return None
+    if not kv_total_blocks or kv_total_blocks <= 0:
+        return None
+    requests = max(0.0, running) + max(0.0, waiting)
+    if requests == 0:
+        return 0.0
+    if avg_prompt_tokens is None or avg_requested_tokens is None:
+        return None
+    requested_ctx = max(0.0, avg_prompt_tokens) + max(0.0, avg_requested_tokens)
+    blocks_per_request = math.ceil(requested_ctx / block_size)
+    return requests * blocks_per_request / kv_total_blocks
+
+
+_warned_missing_kv_capacity = False
+
+
 def _worker_inference_values(
     prom: PrometheusClient,
     worker: WorkerInfo,
@@ -460,6 +515,31 @@ def _worker_inference_values(
         field: prom.query_scalar(query.format(worker=selector))
         for field, query in WORKER_QUERIES.items()
     }
+
+    aux = {
+        field: prom.query_scalar(query.format(worker=selector))
+        for field, query in AUX_WORKER_QUERIES.items()
+    }
+    if aux["kv_total_blocks"] is None:
+        global _warned_missing_kv_capacity
+        if not _warned_missing_kv_capacity:
+            _warned_missing_kv_capacity = True
+            logger.warning(
+                "dynamo_component_total_blocks returned no data; "
+                "kv_pressure_score will be None until the worker exports KvStats"
+            )
+    requested = aux["requested_max_tokens"]
+    if requested is None:
+        # Engines without request_params_max_tokens: fall back to observed
+        # generation length (expected demand instead of requested demand).
+        requested = values.get("output_length_observed")
+    values["kv_pressure_score"] = kv_pressure_score(
+        values.get("live_batch_size"),
+        values.get("depth_req_q"),
+        values.get("input_length_observed"),
+        requested,
+        aux["kv_total_blocks"],
+    )
 
     throughput = values.get("throughput_token_per_sec")
     values["cost_per_token"] = (
@@ -566,7 +646,7 @@ def collect_once(
     # reuse one query pass.
     worker_cache: dict[str, dict[str, float | None]] = {}
     none_inference: dict[str, float | None] = dict.fromkeys(
-        [*WORKER_QUERIES, "cost_per_token", "slo_margin"]
+        [*WORKER_QUERIES, "kv_pressure_score", "cost_per_token", "slo_margin"]
     )
 
     targets = prom.gpu_targets()

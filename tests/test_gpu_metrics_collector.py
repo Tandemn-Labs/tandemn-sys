@@ -15,8 +15,10 @@ from tandemn_orca.scripts.gpu_metrics_collector import (
     RankTelemetrySnapshot,
     RouterTelemetryClient,
     WorkerInfo,
+    _worker_inference_values,
     collect_once,
     collect_rank_telemetry,
+    kv_pressure_score,
     local_ranks_for_workers,
     resolve_instance_price_per_hour,
     validate_rank_identity,
@@ -443,3 +445,64 @@ def test_resolve_instance_price_per_hour_from_resource_map():
     assert resolve_instance_price_per_hour(resource_map, "g6.xlarge") is None
     assert resolve_instance_price_per_hour(resource_map, "p5.48xlarge") is None
     assert resolve_instance_price_per_hour(resource_map, None) is None
+
+
+def test_kv_pressure_score_matches_simulator_ratio():
+    # 5 requests, each block-rounded to ceil((100 + 60) / 16) = 10 blocks,
+    # against 200 total KV blocks: 50 / 200.
+    assert kv_pressure_score(2.0, 3.0, 100.0, 60.0, 200.0) == 0.25
+
+
+def test_kv_pressure_score_zero_requests_is_zero_without_lengths():
+    assert kv_pressure_score(0.0, 0.0, None, None, 200.0) == 0.0
+
+
+def test_kv_pressure_score_missing_inputs_return_none():
+    assert kv_pressure_score(2.0, 3.0, 100.0, 60.0, None) is None
+    assert kv_pressure_score(2.0, 3.0, 100.0, 60.0, 0.0) is None
+    assert kv_pressure_score(2.0, 3.0, None, 60.0, 200.0) is None
+    assert kv_pressure_score(2.0, 3.0, 100.0, None, 200.0) is None
+    assert kv_pressure_score(None, 3.0, 100.0, 60.0, 200.0) is None
+
+
+class _KvPressureProm:
+    """Answers each derived-metric input by a distinctive query fragment."""
+
+    def __init__(self, *, max_tokens: float | None = 60.0):
+        self.max_tokens = max_tokens
+
+    def query_scalar(self, query: str):
+        if "request_params_max_tokens" in query:
+            return self.max_tokens
+        if "num_requests_running" in query:
+            return 2.0
+        if "num_requests_waiting" in query:
+            return 3.0
+        if "request_prompt_tokens" in query:
+            return 100.0
+        if "request_generation_tokens" in query:
+            return 60.0
+        if "dynamo_component_total_blocks" in query:
+            return 200.0
+        return None
+
+
+def test_worker_inference_values_compute_simulator_style_kv_pressure():
+    values = _worker_inference_values(
+        _KvPressureProm(),
+        _worker("worker-pod-1", 0),
+        price_per_hour=None,
+        ttft_target_ms=None,
+    )
+    assert values["kv_pressure_score"] == 0.25
+
+
+def test_kv_pressure_falls_back_to_observed_generation_length():
+    # Without request_params_max_tokens, output_length_observed (60) stands in.
+    values = _worker_inference_values(
+        _KvPressureProm(max_tokens=None),
+        _worker("worker-pod-1", 0),
+        price_per_hour=None,
+        ttft_target_ms=None,
+    )
+    assert values["kv_pressure_score"] == 0.25
