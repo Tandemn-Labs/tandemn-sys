@@ -14,11 +14,19 @@ def test_build_catalog_preserves_azure_capabilities_and_shared_schema() -> None:
             {"name": "vCPUs", "value": "24"},
             {"name": "MemoryGB", "value": "220"},
             {"name": "RdmaEnabled", "value": "True"},
+            {"name": "NetworkBandwidthMbps", "value": "40000"},
             {"name": "UnmappedCapability", "value": "kept"},
         ],
     }
 
-    catalog = build_catalog([sku, sku], ["eastus"])
+    prices = {
+        ("Standard_NC24ads_A100_v4", "eastus"): {
+            "AcceleratorName": "A100",
+            "Price": "3.21",
+            "SpotPrice": "1.23",
+        }
+    }
+    catalog = build_catalog([sku, sku], ["eastus"], prices)
     instance = catalog["instance_types"][0]
 
     assert instance["vcpu"] == 24
@@ -26,6 +34,7 @@ def test_build_catalog_preserves_azure_capabilities_and_shared_schema() -> None:
     assert instance["accelerators"][0]["name"] == "A100"
     assert instance["accelerators"][0]["gpu_bandwidth_gbps"] == 2039
     assert instance["network"]["rdma_supported"] is True
+    assert instance["network"]["network_performance"] == "40000"
     assert catalog["instance_type_count"] == 1
     assert instance["offerings"] == [
         {
@@ -33,15 +42,40 @@ def test_build_catalog_preserves_azure_capabilities_and_shared_schema() -> None:
             "zone_name": "1",
             "zone_id": "1",
             "location_type": "availability-zone",
+            "on_demand_usd_per_hour": 3.21,
+            "capacity_reservation_usd_per_hour": 3.21,
+            "spot_usd_per_hour": 1.23,
         },
         {
             "region": "eastus",
             "zone_name": "2",
             "zone_id": "2",
             "location_type": "availability-zone",
+            "on_demand_usd_per_hour": 3.21,
+            "capacity_reservation_usd_per_hour": 3.21,
+            "spot_usd_per_hour": 1.23,
         },
     ]
     assert catalog["source_skus"][0]["capabilities"][-1] == {
         "name": "UnmappedCapability",
         "value": "kept",
     }
+
+
+def test_build_catalog_uses_skypilot_amd_accelerator_name() -> None:
+    sku = {
+        "resourceType": "virtualMachines",
+        "name": "Standard_NV8as_v4",
+        "locations": ["eastus"],
+        "locationInfo": [{"location": "eastus", "zones": []}],
+        "capabilities": [{"name": "GPUs", "value": "1"}, {"name": "GpuMemoryGB", "value": "16"}],
+    }
+
+    catalog = build_catalog(
+        [sku], ["eastus"], {("Standard_NV8as_v4", "eastus"): {"AcceleratorName": "MI25"}}
+    )
+    gpu = catalog["instance_types"][0]["accelerators"][0]
+
+    assert gpu["vendor"] == "amd"
+    assert gpu["name"] == "MI25"
+    assert gpu["k8s_resource_name"] == "amd.com/gpu"
