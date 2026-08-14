@@ -79,3 +79,22 @@ def test_build_catalog_uses_skypilot_amd_accelerator_name() -> None:
     assert gpu["vendor"] == "amd"
     assert gpu["name"] == "MI25"
     assert gpu["k8s_resource_name"] == "amd.com/gpu"
+
+
+def test_build_catalog_normalizes_mi300x_with_amd_facts() -> None:
+    sku = {
+        "resourceType": "virtualMachines",
+        "name": "Standard_ND96isr_MI300X_v5",
+        "locations": ["westus"],
+        "locationInfo": [{"location": "westus", "zones": []}],
+        "capabilities": [{"name": "GPUs", "value": "8"}],
+    }
+
+    gpu = build_catalog([sku], ["westus"])["instance_types"][0]["accelerators"][0]
+
+    assert gpu["vendor"] == "amd"
+    assert gpu["name"] == "MI300X"
+    assert gpu["canonical_gpu_name"] == "MI300X"
+    assert gpu["memory_mib_each"] == 192 * 1024
+    assert gpu["gpu_bandwidth_gbps"] == 5300
+    assert gpu["infinity_fabric_bandwidth_gbps"] == 1024
