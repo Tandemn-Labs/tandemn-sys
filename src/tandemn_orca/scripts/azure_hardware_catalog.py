@@ -30,6 +30,18 @@ JsonDict = dict[str, Any]
 AZURE_CATALOG_KEY = "azure-accelerated-hardware-v1"
 API_VERSION = "2021-07-01"
 SKYPILOT_AZURE_VMS = "https://raw.githubusercontent.com/skypilot-org/skypilot-catalog/master/catalogs/v8/azure/vms.csv"
+AMD_MI300X_SPEC = "https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html"
+MI300X_SKU = "Standard_ND96isr_MI300X_v5"
+MI300X_GPU_SPEC: JsonDict = {
+    **UNKNOWN_GPU_SPEC,
+    "canonical_gpu_name": "MI300X",
+    "gpu_generation": "CDNA3",
+    "gpu_bandwidth_gbps": 5300,
+    "gpu_tflops_fp16": 1300,
+    "infinity_fabric_bandwidth_gbps": 8 * 128,
+    "pcie_bandwidth_gbps": 128,
+    "gpu_watts": 750,
+}
 
 
 def az(*args: str) -> str:
@@ -136,10 +148,11 @@ def normalize_gpu(
     if count is None or count <= 0:
         return None
     sku_name = str(sku["name"])
-    name = gpu_name(sku_name, catalog_name)
+    is_mi300x = sku_name == MI300X_SKU
+    name = "MI300X" if is_mi300x else gpu_name(sku_name, catalog_name)
     vendor = gpu_vendor(name, sku_name)
     memory_gb = as_int(caps.get("GpuMemoryGB"))
-    memory_mib = memory_gb * 1024 if memory_gb is not None else None
+    memory_mib = 192 * 1024 if is_mi300x else memory_gb * 1024 if memory_gb is not None else None
     if name == "A100" and memory_mib is None:
         memory_mib = 80 * 1024
     return {
@@ -150,7 +163,8 @@ def normalize_gpu(
         "memory_mib_each": memory_mib,
         "memory_mib_total": memory_mib * count if memory_mib is not None else None,
         "k8s_resource_name": accelerator_resource_name("gpu", vendor),
-        **(gpu_spec(name, memory_mib) if vendor else UNKNOWN_GPU_SPEC),
+        **(MI300X_GPU_SPEC if is_mi300x else gpu_spec(name, memory_mib) if vendor else UNKNOWN_GPU_SPEC),
+        **({"gpu_spec_source": AMD_MI300X_SPEC} if is_mi300x else {}),
     }
 
 
