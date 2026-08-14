@@ -7,12 +7,14 @@ the subscription and exposes the exact SKU availability for that subscription.
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import subprocess
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import delete
 from tandemn_system_data.clients import HardwareCatalogStore, PostgresClient
@@ -27,6 +29,7 @@ from tandemn_orca.scripts.aws_hardware_catalog import (
 JsonDict = dict[str, Any]
 AZURE_CATALOG_KEY = "azure-accelerated-hardware-v1"
 API_VERSION = "2021-07-01"
+SKYPILOT_AZURE_VMS = "https://raw.githubusercontent.com/skypilot-org/skypilot-catalog/master/catalogs/v8/azure/vms.csv"
 
 
 def az(*args: str) -> str:
@@ -61,6 +64,20 @@ def azure_skus() -> list[JsonDict]:
     return skus
 
 
+def skypilot_prices() -> dict[tuple[str, str], JsonDict]:
+    """Fetch Azure's region-specific VM prices and accelerator names."""
+    try:
+        with urllib.request.urlopen(SKYPILOT_AZURE_VMS, timeout=60) as response:
+            rows = csv.DictReader(io.StringIO(response.read().decode()))
+            return {
+                (row["InstanceType"], row["Region"]): row
+                for row in rows
+                if row.get("InstanceType") and row.get("Region")
+            }
+    except OSError:
+        return {}
+
+
 def capabilities(sku: JsonDict) -> JsonDict:
     """Keep Azure's complete capability map alongside normalized fields."""
     return {
@@ -81,8 +98,10 @@ def as_bool(value: object) -> bool:
     return str(value).lower() == "true"
 
 
-def gpu_name(sku_name: str) -> str:
+def gpu_name(sku_name: str, catalog_name: str | None = None) -> str:
     """Infer the physical GPU where Azure's Resource SKUs API omits it."""
+    if catalog_name:
+        return catalog_name
     name = sku_name.lower()
     for fragment, gpu in (
         ("gb200", "B200"),
@@ -101,41 +120,66 @@ def gpu_name(sku_name: str) -> str:
     return sku_name
 
 
-def normalize_gpu(sku: JsonDict, caps: JsonDict) -> JsonDict | None:
+def gpu_vendor(name: str, sku_name: str) -> str | None:
+    normalized = name.lower()
+    if any(fragment in normalized for fragment in ("mi", "radeon", "v710")):
+        return "amd"
+    if name != sku_name:
+        return "nvidia"
+    return None
+
+
+def normalize_gpu(
+    sku: JsonDict, caps: JsonDict, catalog_name: str | None = None
+) -> JsonDict | None:
     count = as_int(caps.get("GPUs"))
     if count is None or count <= 0:
         return None
-    name = gpu_name(str(sku["name"]))
+    sku_name = str(sku["name"])
+    name = gpu_name(sku_name, catalog_name)
+    vendor = gpu_vendor(name, sku_name)
     memory_gb = as_int(caps.get("GpuMemoryGB"))
     memory_mib = memory_gb * 1024 if memory_gb is not None else None
     if name == "A100" and memory_mib is None:
         memory_mib = 80 * 1024
     return {
         "kind": "gpu",
-        "vendor": "nvidia" if name != str(sku["name"]) else None,
+        "vendor": vendor,
         "name": name,
         "count": count,
         "memory_mib_each": memory_mib,
         "memory_mib_total": memory_mib * count if memory_mib is not None else None,
-        "k8s_resource_name": accelerator_resource_name("gpu", "nvidia"),
-        **(gpu_spec(name, memory_mib) if name != str(sku["name"]) else UNKNOWN_GPU_SPEC),
+        "k8s_resource_name": accelerator_resource_name("gpu", vendor),
+        **(gpu_spec(name, memory_mib) if vendor else UNKNOWN_GPU_SPEC),
     }
 
 
-def normalize_sku(sku: JsonDict, regions: set[str]) -> JsonDict | None:
+def normalize_sku(
+    sku: JsonDict, regions: set[str], prices: dict[tuple[str, str], JsonDict]
+) -> JsonDict | None:
     if sku.get("resourceType") != "virtualMachines":
         return None
     caps = capabilities(sku)
-    gpu = normalize_gpu(sku, caps)
+    name = str(sku["name"])
+    catalog_rows = [prices.get((name, region), {}) for region in regions]
+    gpu = normalize_gpu(
+        sku,
+        caps,
+        next(
+            (row.get("AcceleratorName") for row in catalog_rows if row.get("AcceleratorName")), None
+        ),
+    )
     if gpu is None:
         return None
-    locations = {
-        str(item["location"]): sorted({str(zone) for zone in item.get("zones", [])})
+    locations: dict[str, list[str | None]] = {
+        str(item["location"]): cast(
+            list[str | None], sorted({str(zone) for zone in item.get("zones", [])}) or [None]
+        )
         for item in sku.get("locationInfo", [])
         if item.get("location") in regions
     }
-    network = {
-        "network_performance": None,
+    network: JsonDict = {
+        "network_performance": caps.get("NetworkBandwidthMbps") or caps.get("NetworkBandwidth"),
         "max_enis": as_int(caps.get("MaxNetworkInterfaces")),
         "max_network_cards": None,
         "efa_supported": False,
@@ -143,11 +187,12 @@ def normalize_sku(sku: JsonDict, regions: set[str]) -> JsonDict | None:
         "ena_support": None,
         "ena_srd_supported": False,
         "encryption_in_transit_supported": False,
+        # ponytail: Azure exposes no per-NIC topology here; add a source if one becomes available.
         "network_cards": [],
         "accelerated_networking_supported": as_bool(caps.get("AcceleratedNetworkingEnabled")),
         "rdma_supported": as_bool(caps.get("RdmaEnabled")),
     }
-    storage = {
+    storage: JsonDict = {
         "instance_storage_supported": False,
         "instance_storage_total_gb": 0,
         "instance_storage_nvme_support": None,
@@ -162,7 +207,7 @@ def normalize_sku(sku: JsonDict, regions: set[str]) -> JsonDict | None:
         "os_disk_size_mib": as_int(caps.get("OSVhdSizeMB")),
         "premium_io_supported": as_bool(caps.get("PremiumIO")),
     }
-    name = str(sku["name"])
+    resource_names = [gpu["k8s_resource_name"]] if gpu["k8s_resource_name"] else []
     return {
         "cloud": "azure",
         "instance_type": name,
@@ -184,10 +229,10 @@ def normalize_sku(sku: JsonDict, regions: set[str]) -> JsonDict | None:
             "supports_efa_nodeclass": False,
             "recommended_efa_interfaces": 0,
             "efa_network_interface_profile": None,
-            "requires_nvidia_device_plugin": True,
-            "requires_amd_device_plugin": False,
+            "requires_nvidia_device_plugin": gpu["vendor"] == "nvidia",
+            "requires_amd_device_plugin": gpu["vendor"] == "amd",
             "requires_neuron_device_plugin": False,
-            "k8s_accelerator_resource_names": ["nvidia.com/gpu"],
+            "k8s_accelerator_resource_names": resource_names,
             "instance_store_policy": None,
         },
         "offerings": [
@@ -196,17 +241,35 @@ def normalize_sku(sku: JsonDict, regions: set[str]) -> JsonDict | None:
                 "zone_name": zone,
                 "zone_id": zone,
                 "location_type": "availability-zone" if zone else "region",
+                "on_demand_usd_per_hour": as_float(prices.get((name, region), {}).get("Price")),
+                "capacity_reservation_usd_per_hour": as_float(
+                    prices.get((name, region), {}).get("Price")
+                ),
+                "spot_usd_per_hour": as_float(prices.get((name, region), {}).get("SpotPrice")),
             }
             for region, zones in locations.items()
-            for zone in zones or [None]
+            for zone in zones
         ],
         "pricing": {"on_demand_usd_per_hour": None, "capacity_reservation_usd_per_hour": None},
     }
 
 
-def build_catalog(skus: list[JsonDict], regions: list[str] | None = None) -> JsonDict:
+def as_float(value: object) -> float | None:
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def build_catalog(
+    skus: list[JsonDict],
+    regions: list[str] | None = None,
+    prices: dict[tuple[str, str], JsonDict] | None = None,
+) -> JsonDict:
     """Normalize one unique record per Azure VM SKU."""
-    selected_regions = set(regions or (str(location) for sku in skus for location in sku.get("locations", [])))
+    selected_regions = set(
+        regions or (str(location) for sku in skus for location in sku.get("locations", []))
+    )
     source_skus = {
         str(sku["name"]): sku
         for sku in skus
@@ -215,7 +278,7 @@ def build_catalog(skus: list[JsonDict], regions: list[str] | None = None) -> Jso
     normalized = [
         (sku, instance)
         for sku in source_skus.values()
-        if (instance := normalize_sku(sku, selected_regions)) is not None
+        if (instance := normalize_sku(sku, selected_regions, prices or {})) is not None
     ]
     normalized.sort(key=lambda pair: str(pair[1]["instance_type"]))
     return {
@@ -231,7 +294,9 @@ def build_catalog(skus: list[JsonDict], regions: list[str] | None = None) -> Jso
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--regions", help="Comma-separated Azure regions; defaults to all visible regions")
+    parser.add_argument(
+        "--regions", help="Comma-separated Azure regions; defaults to all visible regions"
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--store", action="store_true", help="Write the catalog to Tandemn Store")
     return parser.parse_args()
@@ -240,12 +305,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     skus = azure_skus()
-    regions = (
-        [region.strip() for region in args.regions.split(",")]
-        if args.regions
-        else None
-    )
-    catalog = build_catalog(skus, regions)
+    regions = [region.strip() for region in args.regions.split(",")] if args.regions else None
+    catalog = build_catalog(skus, regions, skypilot_prices())
     rendered = json.dumps(catalog, indent=2, sort_keys=True)
     if args.output:
         args.output.write_text(rendered + "\n", encoding="utf-8")
