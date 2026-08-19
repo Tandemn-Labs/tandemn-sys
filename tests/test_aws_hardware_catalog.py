@@ -139,4 +139,5 @@ def test_build_catalog_uses_boto3_clients(monkeypatch):
 def test_gpu_specs_split_a100_memory_and_use_na_for_unknown():
     assert mod.gpu_spec("A100", 40960)["canonical_gpu_name"] == "A100-40GB"
     assert mod.gpu_spec("A100", 81920)["canonical_gpu_name"] == "A100-80GB"
+    assert mod.gpu_spec("A100", None)["canonical_gpu_name"] == "NA"
     assert mod.gpu_spec("Mystery GPU", None)["gpu_bandwidth_gbps"] == "NA"
