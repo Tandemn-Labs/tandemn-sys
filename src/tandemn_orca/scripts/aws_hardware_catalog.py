@@ -331,7 +331,9 @@ def accelerator_resource_name(kind: str, vendor: str | None) -> str | None:
 def gpu_spec_key(name: object, memory_mib_each: int | None) -> str | None:
     compact = "".join(ch for ch in str(name or "").lower() if ch.isalnum())
     if "a100" in compact:
-        if memory_mib_each is not None and memory_mib_each >= 70 * 1024:
+        if memory_mib_each is None:
+            return None
+        if memory_mib_each >= 70 * 1024:
             return "A100-80GB"
         return "A100-40GB"
 
