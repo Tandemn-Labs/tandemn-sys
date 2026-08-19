@@ -42,6 +42,33 @@ MI300X_GPU_SPEC: JsonDict = {
     "pcie_bandwidth_gbps": 128,
     "gpu_watts": 750,
 }
+AZURE_A100_SKU_FACTS: dict[str, JsonDict] = {
+    "Standard_ND96amsr_A100_v4": {
+        "memory_mib_each": 80 * 1024,
+        "nvlink_bandwidth_gbps": 600,
+        "network_bandwidth_gbps": 1600,
+    },
+    "Standard_ND96asr_v4": {
+        "memory_mib_each": 40 * 1024,
+        "nvlink_bandwidth_gbps": 600,
+        "network_bandwidth_gbps": 1600,
+    },
+    "Standard_NC24ads_A100_v4": {
+        "memory_mib_each": 80 * 1024,
+        "nvlink_bandwidth_gbps": 0,
+        "network_bandwidth_gbps": 200,
+    },
+    "Standard_NC48ads_A100_v4": {
+        "memory_mib_each": 80 * 1024,
+        "nvlink_bandwidth_gbps": 0,
+        "network_bandwidth_gbps": 200,
+    },
+    "Standard_NC96ads_A100_v4": {
+        "memory_mib_each": 80 * 1024,
+        "nvlink_bandwidth_gbps": 0,
+        "network_bandwidth_gbps": 200,
+    },
+}
 
 
 def az(*args: str) -> str:
@@ -151,10 +178,22 @@ def normalize_gpu(
     is_mi300x = sku_name == MI300X_SKU
     name = "MI300X" if is_mi300x else gpu_name(sku_name, catalog_name)
     vendor = gpu_vendor(name, sku_name)
+    sku_facts = AZURE_A100_SKU_FACTS.get(sku_name, {})
     memory_gb = as_int(caps.get("GpuMemoryGB"))
-    memory_mib = 192 * 1024 if is_mi300x else memory_gb * 1024 if memory_gb is not None else None
-    if name == "A100" and memory_mib is None:
-        memory_mib = 80 * 1024
+    memory_mib = (
+        192 * 1024
+        if is_mi300x
+        else memory_gb * 1024
+        if memory_gb is not None
+        else sku_facts.get("memory_mib_each")
+    )
+    specs = (
+        MI300X_GPU_SPEC
+        if is_mi300x
+        else gpu_spec(name, memory_mib)
+        if vendor
+        else UNKNOWN_GPU_SPEC
+    )
     return {
         "kind": "gpu",
         "vendor": vendor,
@@ -163,7 +202,12 @@ def normalize_gpu(
         "memory_mib_each": memory_mib,
         "memory_mib_total": memory_mib * count if memory_mib is not None else None,
         "k8s_resource_name": accelerator_resource_name("gpu", vendor),
-        **(MI300X_GPU_SPEC if is_mi300x else gpu_spec(name, memory_mib) if vendor else UNKNOWN_GPU_SPEC),
+        **specs,
+        **(
+            {"nvlink_bandwidth_gbps": sku_facts["nvlink_bandwidth_gbps"]}
+            if "nvlink_bandwidth_gbps" in sku_facts
+            else {}
+        ),
         **({"gpu_spec_source": AMD_MI300X_SPEC} if is_mi300x else {}),
     }
 
@@ -201,8 +245,12 @@ def normalize_sku(
         "ena_support": None,
         "ena_srd_supported": False,
         "encryption_in_transit_supported": False,
-        # ponytail: Azure exposes no per-NIC topology here; add a source if one becomes available.
-        "network_cards": [],
+        # Azure exposes aggregate bandwidth for these benchmark SKUs, not NIC topology.
+        "network_cards": (
+            [{"peak_bandwidth_gbps": sku_facts["network_bandwidth_gbps"]}]
+            if (sku_facts := AZURE_A100_SKU_FACTS.get(name))
+            else []
+        ),
         "accelerated_networking_supported": as_bool(caps.get("AcceleratedNetworkingEnabled")),
         "rdma_supported": as_bool(caps.get("RdmaEnabled")),
     }

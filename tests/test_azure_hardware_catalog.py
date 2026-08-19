@@ -98,3 +98,57 @@ def test_build_catalog_normalizes_mi300x_with_amd_facts() -> None:
     assert gpu["memory_mib_each"] == 192 * 1024
     assert gpu["gpu_bandwidth_gbps"] == 5300
     assert gpu["infinity_fabric_bandwidth_gbps"] == 1024
+
+
+def test_build_catalog_uses_verified_a100_sku_facts_when_azure_omits_memory() -> None:
+    skus = [
+        {
+            "resourceType": "virtualMachines",
+            "name": "Standard_ND96amsr_A100_v4",
+            "locations": ["westus2"],
+            "locationInfo": [{"location": "westus2", "zones": ["1"]}],
+            "capabilities": [{"name": "GPUs", "value": "8"}],
+        },
+        {
+            "resourceType": "virtualMachines",
+            "name": "Standard_NC96ads_A100_v4",
+            "locations": ["westus3"],
+            "locationInfo": [{"location": "westus3", "zones": ["1"]}],
+            "capabilities": [{"name": "GPUs", "value": "4"}],
+        },
+        {
+            "resourceType": "virtualMachines",
+            "name": "Standard_ND96asr_v4",
+            "locations": ["westus2"],
+            "locationInfo": [{"location": "westus2", "zones": ["1"]}],
+            "capabilities": [{"name": "GPUs", "value": "8"}],
+        },
+    ]
+    prices = {
+        ("Standard_ND96amsr_A100_v4", "westus2"): {"AcceleratorName": "A100-80GB"},
+        ("Standard_NC96ads_A100_v4", "westus3"): {"AcceleratorName": "A100-80GB"},
+        ("Standard_ND96asr_v4", "westus2"): {"AcceleratorName": "A100"},
+    }
+    instances = {
+        instance["instance_type"]: instance
+        for instance in build_catalog(skus, ["westus2", "westus3"], prices)["instance_types"]
+    }
+
+    nd = instances["Standard_ND96amsr_A100_v4"]
+    nd_gpu = nd["accelerators"][0]
+    assert nd_gpu["memory_mib_each"] == 80 * 1024
+    assert nd_gpu["memory_mib_total"] == 8 * 80 * 1024
+    assert nd_gpu["canonical_gpu_name"] == "A100-80GB"
+    assert nd_gpu["nvlink_bandwidth_gbps"] == 600
+    assert nd["network"]["network_cards"] == [{"peak_bandwidth_gbps": 1600}]
+
+    nc = instances["Standard_NC96ads_A100_v4"]
+    nc_gpu = nc["accelerators"][0]
+    assert nc_gpu["memory_mib_each"] == 80 * 1024
+    assert nc_gpu["canonical_gpu_name"] == "A100-80GB"
+    assert nc_gpu["nvlink_bandwidth_gbps"] == 0
+    assert nc["network"]["network_cards"] == [{"peak_bandwidth_gbps": 200}]
+
+    legacy_nd = instances["Standard_ND96asr_v4"]["accelerators"][0]
+    assert legacy_nd["memory_mib_each"] == 40 * 1024
+    assert legacy_nd["canonical_gpu_name"] == "A100-40GB"
