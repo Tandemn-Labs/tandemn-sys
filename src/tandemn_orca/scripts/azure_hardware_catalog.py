@@ -11,6 +11,7 @@ import csv
 import io
 import json
 import subprocess
+import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,6 +43,31 @@ MI300X_GPU_SPEC: JsonDict = {
     "pcie_bandwidth_gbps": 128,
     "gpu_watts": 750,
 }
+
+
+def mi300x_price(region: str) -> float | None:
+    """Read Azure's current Linux on-demand MI300X price when SkyPilot lacks it."""
+    filter_value = (
+        "serviceName eq 'Virtual Machines' and "
+        f"armSkuName eq '{MI300X_SKU}' and armRegionName eq '{region}'"
+    )
+    url = "https://prices.azure.com/api/retail/prices?$filter=" + urllib.parse.quote(
+        filter_value
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            items = json.load(response).get("Items", [])
+    except OSError:
+        return None
+    for item in items:
+        if (
+            item.get("type") == "Consumption"
+            and "Spot" not in str(item.get("meterName"))
+            and "Low Priority" not in str(item.get("meterName"))
+            and "Windows" not in str(item.get("productName"))
+        ):
+            return as_float(item.get("retailPrice"))
+    return None
 AZURE_A100_SKU_FACTS: dict[str, JsonDict] = {
     "Standard_ND96amsr_A100_v4": {
         "memory_mib_each": 80 * 1024,
@@ -236,6 +262,17 @@ def normalize_sku(
         for item in sku.get("locationInfo", [])
         if item.get("location") in regions
     }
+    for region in regions.intersection(str(value) for value in sku.get("locations", [])):
+        locations.setdefault(region, [None])
+    prices_by_region = {
+        region: as_float(prices.get((name, region), {}).get("Price"))
+        for region in locations
+    }
+    if name == MI300X_SKU:
+        prices_by_region = {
+            region: price or mi300x_price(region)
+            for region, price in prices_by_region.items()
+        }
     network: JsonDict = {
         "network_performance": caps.get("NetworkBandwidthMbps") or caps.get("NetworkBandwidth"),
         "max_enis": as_int(caps.get("MaxNetworkInterfaces")),
@@ -300,13 +337,11 @@ def normalize_sku(
         "offerings": [
             {
                 "region": region,
-                "zone_name": zone,
-                "zone_id": zone,
+                "zone_name": zone or "default",
+                "zone_id": zone or "default",
                 "location_type": "availability-zone" if zone else "region",
-                "on_demand_usd_per_hour": as_float(prices.get((name, region), {}).get("Price")),
-                "capacity_reservation_usd_per_hour": as_float(
-                    prices.get((name, region), {}).get("Price")
-                ),
+                "on_demand_usd_per_hour": prices_by_region[region],
+                "capacity_reservation_usd_per_hour": prices_by_region[region],
                 "spot_usd_per_hour": as_float(prices.get((name, region), {}).get("SpotPrice")),
             }
             for region, zones in locations.items()

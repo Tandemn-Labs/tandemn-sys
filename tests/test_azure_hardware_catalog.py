@@ -90,7 +90,12 @@ def test_build_catalog_normalizes_mi300x_with_amd_facts() -> None:
         "capabilities": [{"name": "GPUs", "value": "8"}],
     }
 
-    gpu = build_catalog([sku], ["westus"])["instance_types"][0]["accelerators"][0]
+    instance = build_catalog(
+        [sku],
+        ["westus"],
+        {("Standard_ND96isr_MI300X_v5", "westus"): {"Price": "62.853"}},
+    )["instance_types"][0]
+    gpu = instance["accelerators"][0]
 
     assert gpu["vendor"] == "amd"
     assert gpu["name"] == "MI300X"
@@ -98,6 +103,26 @@ def test_build_catalog_normalizes_mi300x_with_amd_facts() -> None:
     assert gpu["memory_mib_each"] == 192 * 1024
     assert gpu["gpu_bandwidth_gbps"] == 5300
     assert gpu["infinity_fabric_bandwidth_gbps"] == 1024
+    assert instance["offerings"][0]["zone_name"] == "default"
+    assert instance["offerings"][0]["on_demand_usd_per_hour"] == 62.853
+
+
+def test_build_catalog_keeps_sku_locations_missing_location_info() -> None:
+    sku = {
+        "resourceType": "virtualMachines",
+        "name": "Standard_ND96isr_MI300X_v5",
+        "locations": ["westus", "francecentral"],
+        "locationInfo": [{"location": "westus", "zones": []}],
+        "capabilities": [{"name": "GPUs", "value": "8"}],
+    }
+
+    offerings = build_catalog(
+        [sku],
+        ["westus", "francecentral"],
+        {("Standard_ND96isr_MI300X_v5", "westus"): {"Price": "62.853"}},
+    )["instance_types"][0]["offerings"]
+
+    assert {offering["region"] for offering in offerings} == {"westus", "francecentral"}
 
 
 def test_build_catalog_uses_verified_a100_sku_facts_when_azure_omits_memory() -> None:
