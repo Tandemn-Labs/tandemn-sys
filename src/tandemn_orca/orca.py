@@ -252,7 +252,10 @@ class Orca:
                                 job_id,
                                 rank.rank_id,
                                 deployments.get(rank.rank_id),
-                                ever_served=rank.rank_id in self._served_rank_ids,
+                                ever_served=(
+                                    rank.status is RankStatus.RUNNING
+                                    or rank.rank_id in self._served_rank_ids
+                                ),
                             ),
                         )
                     )
@@ -493,8 +496,6 @@ class Orca:
                             reason_code=reason_code,
                         )
             raise
-        for rank in recorded:
-            self._jobs.set_rank_status(rank.rank_id, RankStatus.RUNNING, [rank.status])
         return recorded
 
     def _teardown_ranks(self, job_id: str, reason_code: str | None = None) -> None:
