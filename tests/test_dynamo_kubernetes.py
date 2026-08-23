@@ -7,6 +7,7 @@ from tandemn_orca.dynamo_kubernetes import (
     DGD_PLURAL,
     FIELD_MANAGER,
     GROUP,
+    REQUEST_TIMEOUT_SECONDS,
     VERSION,
     DynamoKubernetesClient,
     job_selector,
@@ -35,8 +36,8 @@ class FakeCustom:
     def patch_namespaced_custom_object(self, *args, **kwargs):
         self.applied.append((args, kwargs))
 
-    def delete_namespaced_custom_object(self, *args):
-        self.deleted.append(args)
+    def delete_namespaced_custom_object(self, *args, **kwargs):
+        self.deleted.append((args, kwargs))
 
 
 def test_object_key_and_selector():
@@ -51,7 +52,10 @@ def test_list_job_objects_reads_dgds():
     assert client.list_job_objects("job_1") == {("DynamoGraphDeployment", "dgd")}
     assert custom.selector == (
         (GROUP, VERSION, "ns", DGD_PLURAL),
-        {"label_selector": "tandemn.com/managed-by=orca,tandemn.com/job-id=job_1"},
+        {
+            "label_selector": "tandemn.com/managed-by=orca,tandemn.com/job-id=job_1",
+            "_request_timeout": REQUEST_TIMEOUT_SECONDS,
+        },
     )
 
 
@@ -63,7 +67,12 @@ def test_apply_many_uses_server_side_apply():
     assert custom.applied == [
         (
             (GROUP, VERSION, "ns", DGD_PLURAL, "dgd", _dgd("dgd")),
-            {"field_manager": FIELD_MANAGER, "force": True, "_content_type": APPLY},
+            {
+                "field_manager": FIELD_MANAGER,
+                "force": True,
+                "_content_type": APPLY,
+                "_request_timeout": REQUEST_TIMEOUT_SECONDS,
+            },
         )
     ]
 
@@ -74,12 +83,17 @@ def test_delete_many_deletes_dgds():
 
     client.delete_many({("DynamoGraphDeployment", "dgd")})
 
-    assert custom.deleted == [(GROUP, VERSION, "ns", DGD_PLURAL, "dgd")]
+    assert custom.deleted == [
+        (
+            (GROUP, VERSION, "ns", DGD_PLURAL, "dgd"),
+            {"_request_timeout": REQUEST_TIMEOUT_SECONDS},
+        )
+    ]
 
 
 def test_delete_ignores_not_found():
     class MissingCustom(FakeCustom):
-        def delete_namespaced_custom_object(self, *args):
+        def delete_namespaced_custom_object(self, *args, **kwargs):
             raise ApiException(status=404)
 
     DynamoKubernetesClient("ns", custom=MissingCustom()).delete("DynamoGraphDeployment", "dgd")
@@ -119,8 +133,52 @@ def test_load_kube_client_uses_explicit_context(monkeypatch):
         "tandemn_orca.dynamo_kubernetes.client.CustomObjectsApi",
         lambda loaded: ("custom", loaded),
     )
+    monkeypatch.setattr(
+        "tandemn_orca.dynamo_kubernetes.client.CoreV1Api",
+        lambda loaded: ("core", loaded),
+    )
 
     loaded = load_kube_client("serving", context="cloud-region")
 
     assert loaded.namespace == "serving"
     assert loaded.custom == ("custom", api_client)
+    assert loaded.core == ("core", api_client)
+
+
+def test_job_dgds_keeps_status():
+    """list_job_objects discards everything but names; the health poll needs status."""
+
+    class StatusCustom(FakeCustom):
+        def list_namespaced_custom_object(self, *args, **kwargs):
+            self.selector = (args, kwargs)
+            return {
+                "items": [
+                    {"metadata": {"name": "dgd"}, "status": {"state": "successful"}},
+                ]
+            }
+
+    client = DynamoKubernetesClient("ns", custom=StatusCustom())
+
+    assert client.job_dgds("job_1") == [
+        {"metadata": {"name": "dgd"}, "status": {"state": "successful"}}
+    ]
+
+
+def test_rank_pods_reads_raw_json_not_the_snake_cased_model():
+    class FakeResponse:
+        data = b'{"items": [{"status": {"containerStatuses": [{"name": "main"}]}}]}'
+
+    class FakeCore:
+        def list_namespaced_pod(self, *args, **kwargs):
+            self.call = (args, kwargs)
+            return FakeResponse()
+
+    core = FakeCore()
+    client = DynamoKubernetesClient("ns", custom=FakeCustom(), core=core)
+
+    pods = client.rank_pods("job_1", "rank_1")
+
+    # camelCase survives: the generated model's to_dict() would rename this.
+    assert pods[0]["status"]["containerStatuses"][0]["name"] == "main"
+    assert core.call[1]["label_selector"] == "tandemn.com/job-id=job_1,tandemn.com/rank-id=rank_1"
+    assert core.call[1]["_preload_content"] is False

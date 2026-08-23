@@ -562,8 +562,15 @@ def test_preempt_tears_down_and_pauses(monkeypatch):
 
     assert orca.apply_pending("user_1") == 1
     assert orca._launcher.torn_down_jobs == ["job_E"]
+    # Preemption records why, so a preempted rank is distinguishable from one
+    # that stopped because its job finished.
     assert orca._jobs.rank_status == [
-        (OLD_RANK_ID, RankStatus.STOPPED, [RankStatus.LAUNCHING, RankStatus.RUNNING], None),
+        (
+            OLD_RANK_ID,
+            RankStatus.STOPPED,
+            [RankStatus.LAUNCHING, RankStatus.RUNNING],
+            ReasonCode.PREEMPTED,
+        ),
     ]
     assert orca._jobs.transitions == [("job_E", JobStatus.PAUSED, [JobStatus.RUNNING])]
 
