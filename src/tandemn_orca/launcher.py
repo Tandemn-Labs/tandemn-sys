@@ -114,6 +114,10 @@ class DynamoLauncher:
     def teardown_job(self, job_id: str) -> None:
         self.k8s.delete_all_for_job(job_id)
 
+    def k8s_for_rank(self, rank: Rank) -> DynamoKubernetesClient:
+        """Cluster client that owns this rank's objects."""
+        return self.k8s
+
     def _delete_stale(self, stale: set[ObjectKey]) -> None:
         delete_error = _call(self.k8s.delete_many, stale)
         if delete_error:
@@ -195,6 +199,14 @@ class MultiClusterLauncher:
                         pool_dgd_name(job_id, rank),
                         ports[rank.rank_id],
                     )
+
+    def k8s_for_rank(self, rank: Rank) -> DynamoKubernetesClient:
+        """Cluster client that owns this rank's objects."""
+        key = self.default_cluster or _rank_cluster_key(rank)
+        launcher = self.launchers.get(key)
+        if launcher is None:
+            raise ValueError(f"no kube context configured for rank environment {key!r}")
+        return launcher.k8s
 
     def teardown_job(self, job_id: str) -> None:
         for launcher in self.launchers.values():

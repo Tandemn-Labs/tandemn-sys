@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from kubernetes import client, config
@@ -16,6 +17,11 @@ GROUP = "nvidia.com"
 VERSION = "v1alpha1"
 DGD_PLURAL = "dynamographdeployments"
 
+# The Python client defaults to no timeout, so a blackholed API server would
+# block Orca's single-threaded poll loop forever -- stalling plan application,
+# not just the call that hung.
+REQUEST_TIMEOUT_SECONDS = 10
+
 
 def load_kube_client(
     namespace: str = "default",
@@ -27,6 +33,7 @@ def load_kube_client(
         return DynamoKubernetesClient(
             namespace,
             custom=client.CustomObjectsApi(api_client),
+            core=client.CoreV1Api(api_client),
         )
     try:
         config.load_incluster_config()
@@ -48,18 +55,48 @@ class DynamoKubernetesClient:
         self,
         namespace: str = "default",
         custom: Any = None,
+        core: Any = None,
     ) -> None:
         self.namespace = namespace
         self.custom = custom or client.CustomObjectsApi()
+        self._core = core
+
+    @property
+    def core(self) -> Any:
+        if self._core is None:
+            self._core = client.CoreV1Api()
+        return self._core
 
     def list_job_objects(self, job_id: str) -> set[ObjectKey]:
-        selector = job_selector(job_id)
-        dgds = self.custom.list_namespaced_custom_object(
-            GROUP, VERSION, self.namespace, DGD_PLURAL, label_selector=selector
-        ).get("items", [])
         return {
-            *(("DynamoGraphDeployment", item["metadata"]["name"]) for item in dgds),
+            ("DynamoGraphDeployment", item["metadata"]["name"]) for item in self.job_dgds(job_id)
         }
+
+    def job_dgds(self, job_id: str) -> list[dict[str, Any]]:
+        """Every DGD Orca owns for a job, status included."""
+        return self.custom.list_namespaced_custom_object(
+            GROUP,
+            VERSION,
+            self.namespace,
+            DGD_PLURAL,
+            label_selector=job_selector(job_id),
+            _request_timeout=REQUEST_TIMEOUT_SECONDS,
+        ).get("items", [])
+
+    def rank_pods(self, job_id: str, rank_id: str) -> list[dict[str, Any]]:
+        """Pods backing one rank, for reading why its containers died.
+
+        Raw JSON, not the typed model: the generated client's ``to_dict()``
+        renames keys to snake_case, and every other object here keeps the
+        API server's camelCase.
+        """
+        response = self.core.list_namespaced_pod(
+            self.namespace,
+            label_selector=f"tandemn.com/job-id={job_id},tandemn.com/rank-id={rank_id}",
+            _preload_content=False,
+            _request_timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        return json.loads(response.data).get("items", [])
 
     def apply_many(self, objects: list[dict[str, Any]]) -> set[ObjectKey]:
         for obj in objects:
@@ -79,6 +116,7 @@ class DynamoKubernetesClient:
                 field_manager=FIELD_MANAGER,
                 force=True,
                 _content_type=APPLY,
+                _request_timeout=REQUEST_TIMEOUT_SECONDS,
             )
             return
         raise ValueError(f"unsupported Kubernetes object kind: {kind}")
@@ -94,7 +132,12 @@ class DynamoKubernetesClient:
         try:
             if kind == "DynamoGraphDeployment":
                 self.custom.delete_namespaced_custom_object(
-                    GROUP, VERSION, self.namespace, DGD_PLURAL, name
+                    GROUP,
+                    VERSION,
+                    self.namespace,
+                    DGD_PLURAL,
+                    name,
+                    _request_timeout=REQUEST_TIMEOUT_SECONDS,
                 )
                 return
             raise ValueError(f"unsupported Kubernetes object kind: {kind}")

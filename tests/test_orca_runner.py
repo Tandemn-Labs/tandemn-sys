@@ -10,11 +10,13 @@ import tandemn_orca.orca as mod
 class FakeOrca:
     instances: ClassVar[list[FakeOrca]] = []
 
-    def __init__(self, client, launcher) -> None:
+    def __init__(self, client, launcher, **kwargs) -> None:
         self.client = client
         self.launcher = launcher
+        self.kwargs = kwargs
         self.applied_users: list[str] = []
         self.reconciled_users: list[str] = []
+        self.health_users: list[str] = []
         FakeOrca.instances.append(self)
 
     def apply_pending(self, user_id: str) -> int:
@@ -24,6 +26,10 @@ class FakeOrca:
     def reconcile_running(self, user_id: str) -> int:
         self.reconciled_users.append(user_id)
         return 0
+
+    def reconcile_rank_health(self, user_id: str) -> list:
+        self.health_users.append(user_id)
+        return []
 
 
 class FailingOnceOrca(FakeOrca):
