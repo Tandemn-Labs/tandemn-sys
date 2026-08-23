@@ -32,6 +32,7 @@ import os
 import re
 import signal
 import time
+from dataclasses import replace
 from typing import Any
 
 from tandemn_system_data.clients import JobStore, ModelCatalogStore, PlanStore, PostgresClient
@@ -47,6 +48,14 @@ from tandemn_orca.launcher import (
     MultiClusterLauncher,
     NoopLauncher,
 )
+from tandemn_orca.rank_health import (
+    RankHealth,
+    Verdict,
+    dgd_by_rank_id,
+    rank_health,
+    termination_reason_code,
+)
+from tandemn_orca.router_health import RankHealthPublisher
 from tandemn_orca.scripts.resource_map_from_aws import CapacityRefresher, parse_region_csv
 from tandemn_orca.tunnels import PortForwardManager, RouterProcessManager
 
@@ -154,11 +163,25 @@ def _parse_role(role_name: object) -> RankRole | None:
 class Orca:
     """One instance per process, sharing a PostgresClient with the stores."""
 
-    def __init__(self, client: PostgresClient, launcher: Launcher | None = None) -> None:
+    def __init__(
+        self,
+        client: PostgresClient,
+        launcher: Launcher | None = None,
+        *,
+        down_polls_before_failed: int = 2,
+    ) -> None:
         self._client = client
         self._jobs = JobStore(client)
         self._plans = PlanStore(client)
         self._launcher = launcher or NoopLauncher()
+        self._down_polls_before_failed = max(1, down_polls_before_failed)
+        # Consecutive DOWN readings per rank. A single bad poll must not fail a
+        # rank: the operator recomputes status on its own cadence and a rolling
+        # update briefly reports zero ready replicas.
+        self._down_streak: dict[str, int] = {}
+        # Ranks observed serving at least once. Before that, zero ready replicas
+        # means "still launching"; after it, the same reading means "died".
+        self._served_rank_ids: set[str] = set()
 
     def apply_pending(self, user_id: str) -> int:
         """Apply every unapplied plan for a user. Returns plans applied."""
@@ -172,6 +195,135 @@ class Orca:
                 # Another Orca worker already applied it; CAS lost the race.
                 logger.info("plan %s already applied, skipping", plan.plan_id)
         return applied
+
+    def reconcile_rank_health(self, user_id: str) -> list[RankHealth]:
+        """Move ranks.status to match what each rank's DGD reports.
+
+        This is the only path by which a RUNNING rank can reach FAILED: plan
+        application sets RUNNING once the API server accepts the DGD and never
+        revisits it, so without this poll a rank whose workers died stays
+        RUNNING forever and keeps receiving routed traffic.
+
+        Returns the effective health of every active rank so the caller can
+        publish it to the job routers.
+        """
+        k8s_for_rank = getattr(self._launcher, "k8s_for_rank", None)
+        if k8s_for_rank is None:
+            return []  # NoopLauncher: no cluster to observe.
+
+        results: list[RankHealth] = []
+        active_rank_ids: set[str] = set()
+        for running in self._jobs.running_jobs(user_id):
+            job_id = running.job.job_id
+            # One DGD list per cluster, not per rank: a job's ranks may span
+            # kube contexts but usually share one.
+            by_cluster: dict[int, tuple[Any, list[Rank]]] = {}
+            for allocation in running.ranks:
+                rank = Rank(
+                    rank_id=allocation.rank_id,
+                    job_id=job_id,
+                    plan_id=allocation.plan_id,
+                    role=allocation.role,
+                    shape_json=dict(allocation.shape_json),
+                    n_replicas=allocation.n_replicas,
+                    status=allocation.status,
+                    reason_code=allocation.reason_code,
+                )
+                try:
+                    k8s = k8s_for_rank(rank)
+                except ValueError:
+                    logger.exception("no cluster client for rank %s", rank.rank_id)
+                    continue
+                by_cluster.setdefault(id(k8s), (k8s, []))[1].append(rank)
+
+            for k8s, ranks in by_cluster.values():
+                try:
+                    deployments = dgd_by_rank_id(k8s.job_dgds(job_id))
+                except Exception:
+                    logger.exception("DGD status read failed for job %s", job_id)
+                    continue
+                for rank in ranks:
+                    active_rank_ids.add(rank.rank_id)
+                    results.append(
+                        self._apply_rank_health(
+                            k8s,
+                            rank,
+                            rank_health(
+                                job_id,
+                                rank.rank_id,
+                                deployments.get(rank.rank_id),
+                                ever_served=rank.rank_id in self._served_rank_ids,
+                            ),
+                        )
+                    )
+
+        # A rank that left the active set takes its debounce state with it, so a
+        # relaunched rank_id starts clean rather than inheriting a stale streak.
+        self._down_streak = {
+            rank_id: streak
+            for rank_id, streak in self._down_streak.items()
+            if rank_id in active_rank_ids
+        }
+        self._served_rank_ids &= active_rank_ids
+        return results
+
+    def _apply_rank_health(self, k8s: Any, rank: Rank, health: RankHealth) -> RankHealth:
+        """Record one rank's health, returning the debounced verdict."""
+        if health.verdict is Verdict.SERVING:
+            self._served_rank_ids.add(rank.rank_id)
+            self._down_streak.pop(rank.rank_id, None)
+            # Only promote out of LAUNCHING. set_rank_status writes
+            # reason_code and updated_at unconditionally, so a no-op CAS would
+            # erase failure provenance and reset every age-based rule.
+            if rank.status is RankStatus.LAUNCHING:
+                self._jobs.set_rank_status(rank.rank_id, RankStatus.RUNNING, [RankStatus.LAUNCHING])
+                logger.info(
+                    "rank %s serving with %s replica(s)", rank.rank_id, health.serving_replicas
+                )
+            return health
+
+        if health.verdict is Verdict.UNKNOWN:
+            self._down_streak.pop(rank.rank_id, None)
+            return health
+
+        streak = self._down_streak.get(rank.rank_id, 0) + 1
+        self._down_streak[rank.rank_id] = streak
+        if streak < self._down_polls_before_failed:
+            # Not yet conclusive. Report no opinion rather than DOWN so a
+            # single bad reading cannot evict every session homed on this rank.
+            return replace(
+                health,
+                verdict=Verdict.UNKNOWN,
+                reason_code=None,
+                detail=f"{health.detail} ({streak}/{self._down_polls_before_failed})",
+            )
+
+        reason_code, detail = self._failure_cause(k8s, rank, health)
+        if self._jobs.set_rank_status(
+            rank.rank_id,
+            RankStatus.FAILED,
+            list(ACTIVE_RANK_STATUSES),
+            reason_code=reason_code,
+        ):
+            logger.warning("rank %s failed (%s): %s", rank.rank_id, reason_code, detail)
+        return replace(health, reason_code=reason_code, detail=detail)
+
+    def _failure_cause(self, k8s: Any, rank: Rank, health: RankHealth) -> tuple[str, str]:
+        """Prefer the container's own termination reason over the DGD's silence.
+
+        The DGD reports that replicas are not ready, never why. Pod termination
+        state is the only place OOMKilled and CrashLoopBackOff surface, and it
+        is read here rather than every poll because this runs once per failure.
+        """
+        try:
+            pods = k8s.rank_pods(rank.job_id, rank.rank_id)
+        except Exception:
+            logger.exception("pod lookup failed for rank %s", rank.rank_id)
+            pods = []
+        cause = termination_reason_code(pods)
+        if cause is not None:
+            return cause
+        return health.reason_code or ReasonCode.FAILED, health.detail
 
     def reconcile_running(self, user_id: str) -> int:
         """Restore infrastructure, local configs, and tunnels after Orca restarts."""
@@ -254,7 +406,9 @@ class Orca:
 
     def _preempt(self, plan: Plan, action: PlanAction) -> None:
         """running -> paused: tear down the job's ranks, keep the job row."""
-        self._teardown_ranks(action.job_id)
+        # Record why: without it a preempted rank is indistinguishable from one
+        # that finished cleanly, since STOPPED is written on both paths.
+        self._teardown_ranks(action.job_id, ReasonCode.PREEMPTED)
         moved = self._jobs.transition(action.job_id, JobStatus.PAUSED, [JobStatus.RUNNING])
         if not moved:
             logger.warning("preempt: job %s was not running", action.job_id)
@@ -343,17 +497,22 @@ class Orca:
             self._jobs.set_rank_status(rank.rank_id, RankStatus.RUNNING, [rank.status])
         return recorded
 
-    def _teardown_ranks(self, job_id: str) -> None:
+    def _teardown_ranks(self, job_id: str, reason_code: str | None = None) -> None:
         rank_ids = self._active_rank_ids(job_id)
         self._launcher.teardown_job(job_id)
-        self._stop_ranks(rank_ids)
+        self._stop_ranks(rank_ids, reason_code)
 
     def _active_rank_ids(self, job_id: str) -> set[str]:
         return {rank.rank_id for rank in self._jobs.active_ranks(job_id)}
 
-    def _stop_ranks(self, rank_ids: set[str]) -> None:
+    def _stop_ranks(self, rank_ids: set[str], reason_code: str | None = None) -> None:
         for rank_id in rank_ids:
-            self._jobs.set_rank_status(rank_id, RankStatus.STOPPED, list(ACTIVE_RANK_STATUSES))
+            self._jobs.set_rank_status(
+                rank_id,
+                RankStatus.STOPPED,
+                list(ACTIVE_RANK_STATUSES),
+                reason_code=reason_code,
+            )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -386,6 +545,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--interval-seconds",
         type=float,
         default=float(os.getenv("TANDEMN_ORCA_POLL_SECONDS", "5")),
+    )
+    parser.add_argument(
+        "--down-polls-before-failed",
+        type=int,
+        default=int(os.getenv("TANDEMN_DOWN_POLLS_BEFORE_FAILED", "2")),
+        help="consecutive DGD polls reporting no ready replica before a rank is failed",
+    )
+    parser.add_argument(
+        "--no-rank-health",
+        dest="rank_health",
+        action="store_false",
+        help="skip the DGD-status rank health poll (leaves ranks.status at plan-apply values)",
     )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--skip-capacity-refresh", action="store_true")
@@ -453,7 +624,11 @@ def main(argv: list[str] | None = None) -> None:
         tunnels=tunnel_manager,
         routers=router_manager,
     )
-    orca = Orca(client, launcher=launcher)
+    orca = Orca(client, launcher=launcher, down_polls_before_failed=args.down_polls_before_failed)
+    telemetry_token = os.getenv("TANDEMN_ROUTER_TELEMETRY_TOKEN")
+    health_publisher = (
+        RankHealthPublisher(telemetry_token) if telemetry_token and args.rank_health else None
+    )
     previous_sigterm = None
     if tunnel_manager is not None:
 
@@ -472,6 +647,13 @@ def main(argv: list[str] | None = None) -> None:
             logger.info("reconciled %s running job(s)", reconciled)
         except Exception:
             logger.exception("running job reconciliation failed")
+        if args.rank_health:
+            try:
+                health = orca.reconcile_rank_health(args.user_id)
+                if health_publisher is not None and health:
+                    health_publisher.publish(health)
+            except Exception:
+                logger.exception("rank health reconciliation failed")
         if args.once:
             return
         while True:
@@ -486,6 +668,13 @@ def main(argv: list[str] | None = None) -> None:
                 logger.info("applied %s plan(s) for user %s", applied, args.user_id)
             except Exception:
                 logger.exception("orca apply loop failed")
+            if args.rank_health:
+                try:
+                    health = orca.reconcile_rank_health(args.user_id)
+                    if health_publisher is not None and health:
+                        health_publisher.publish(health)
+                except Exception:
+                    logger.exception("rank health reconciliation failed")
     finally:
         if router_manager is not None:
             router_manager.close()
