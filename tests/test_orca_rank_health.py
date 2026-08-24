@@ -201,6 +201,21 @@ def test_zero_replicas_after_serving_fails_even_while_pending(monkeypatch):
     assert store.writes[-1][1] is RankStatus.FAILED
 
 
+def test_persisted_running_rank_fails_after_orca_restart(monkeypatch):
+    store = FakeJobStore(_rank(RankStatus.RUNNING))
+    orca = _orca(monkeypatch, store, FakeK8s([_dgd(worker=0, state="pending")]))
+
+    orca.reconcile_rank_health(USER_ID)
+    orca.reconcile_rank_health(USER_ID)
+
+    assert store.writes[-1] == (
+        RANK_ID,
+        RankStatus.FAILED,
+        [RankStatus.LAUNCHING, RankStatus.RUNNING],
+        ReasonCode.HEARTBEAT_TIMEOUT,
+    )
+
+
 # ----- failure cause ---------------------------------------------------------
 
 

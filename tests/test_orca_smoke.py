@@ -311,7 +311,8 @@ def test_place_transitions_and_launches(monkeypatch):
     assert len(orca._launcher.reconciled[0][1]) == 1
     assert orca._jobs.launched[0].shape_json["target_p99_ttft_ms"] == 500.0
     assert orca._jobs.launched[0].shape_json["target_p99_tpot_ms"] == 50.0
-    assert orca._jobs.rank_status == [(RANK_ID, RankStatus.RUNNING, [RankStatus.LAUNCHING], None)]
+    assert orca._jobs.rows[RANK_ID].status is RankStatus.LAUNCHING
+    assert orca._jobs.rank_status == []
 
 
 def test_swap_launches_new_and_tears_down_old(monkeypatch):
@@ -339,7 +340,6 @@ def test_swap_launches_new_and_tears_down_old(monkeypatch):
     # stale DGDs are deleted by reconcile diff; swap only marks old rows stopped.
     assert orca._launcher.torn_down_jobs == []
     assert orca._jobs.rank_status == [
-        (RANK_ID, RankStatus.RUNNING, [RankStatus.LAUNCHING], None),
         (OLD_RANK_ID, RankStatus.STOPPED, [RankStatus.LAUNCHING, RankStatus.RUNNING], None),
     ]
 
@@ -480,7 +480,6 @@ def test_swap_reuses_rank_with_new_replica_count_and_stops_removed_rank(monkeypa
     assert orca._jobs.rows[RANK_ID].n_replicas == 3
     assert orca._jobs.rows[RANK_ID].status is RankStatus.RUNNING
     assert orca._jobs.rank_status == [
-        (RANK_ID, RankStatus.RUNNING, [RankStatus.RUNNING], None),
         (OLD_RANK_ID, RankStatus.STOPPED, [RankStatus.LAUNCHING, RankStatus.RUNNING], None),
     ]
 
@@ -600,8 +599,8 @@ def test_bad_action_does_not_wedge_the_plan(monkeypatch):
     assert [job for job, _ in orca._launcher.reconciled] == ["job_good"]
     assert orca._jobs.rank_status == [
         (RANK_ID, RankStatus.FAILED, [RankStatus.LAUNCHING], ReasonCode.LAUNCH_FAILED),
-        (NEW_RANK_ID, RankStatus.RUNNING, [RankStatus.LAUNCHING], None),
     ]
+    assert orca._jobs.rows[NEW_RANK_ID].status is RankStatus.LAUNCHING
 
 
 def test_apply_pending_no_plans(monkeypatch):
