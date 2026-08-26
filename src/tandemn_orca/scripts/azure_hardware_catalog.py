@@ -51,9 +51,7 @@ def mi300x_price(region: str) -> float | None:
         "serviceName eq 'Virtual Machines' and "
         f"armSkuName eq '{MI300X_SKU}' and armRegionName eq '{region}'"
     )
-    url = "https://prices.azure.com/api/retail/prices?$filter=" + urllib.parse.quote(
-        filter_value
-    )
+    url = "https://prices.azure.com/api/retail/prices?$filter=" + urllib.parse.quote(filter_value)
     try:
         with urllib.request.urlopen(url, timeout=60) as response:
             items = json.load(response).get("Items", [])
@@ -68,6 +66,8 @@ def mi300x_price(region: str) -> float | None:
         ):
             return as_float(item.get("retailPrice"))
     return None
+
+
 AZURE_A100_SKU_FACTS: dict[str, JsonDict] = {
     "Standard_ND96amsr_A100_v4": {
         "memory_mib_each": 80 * 1024,
@@ -214,11 +214,7 @@ def normalize_gpu(
         else sku_facts.get("memory_mib_each")
     )
     specs = (
-        MI300X_GPU_SPEC
-        if is_mi300x
-        else gpu_spec(name, memory_mib)
-        if vendor
-        else UNKNOWN_GPU_SPEC
+        MI300X_GPU_SPEC if is_mi300x else gpu_spec(name, memory_mib) if vendor else UNKNOWN_GPU_SPEC
     )
     return {
         "kind": "gpu",
@@ -265,13 +261,11 @@ def normalize_sku(
     for region in regions.intersection(str(value) for value in sku.get("locations", [])):
         locations.setdefault(region, [None])
     prices_by_region = {
-        region: as_float(prices.get((name, region), {}).get("Price"))
-        for region in locations
+        region: as_float(prices.get((name, region), {}).get("Price")) for region in locations
     }
     if name == MI300X_SKU:
         prices_by_region = {
-            region: price or mi300x_price(region)
-            for region, price in prices_by_region.items()
+            region: price or mi300x_price(region) for region, price in prices_by_region.items()
         }
     network: JsonDict = {
         "network_performance": caps.get("NetworkBandwidthMbps") or caps.get("NetworkBandwidth"),
