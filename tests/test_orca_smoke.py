@@ -93,6 +93,12 @@ class FakeJobStore:
             if rank.job_id == job_id and rank.status in (RankStatus.LAUNCHING, RankStatus.RUNNING)
         ]
 
+    def list_jobs(self, user_id):
+        return [
+            SimpleNamespace(job_id=job_id, status=status, finish_reason=None)
+            for job_id, status in self.job_statuses.items()
+        ]
+
     def running_jobs(self, user_id):
         return [
             SimpleNamespace(job=SimpleNamespace(job_id=job_id), ranks=self.active_ranks(job_id))
@@ -541,6 +547,31 @@ def test_reconcile_running_restores_active_rank(monkeypatch):
     assert orca.reconcile_running("user_1") == 1
     assert orca._launcher.reconciled[0][0] == "job_B"
     assert [restored.rank_id for restored in orca._launcher.reconciled[0][1]] == [RANK_ID]
+
+
+def test_reconcile_finished_tears_down_active_ranks_once(monkeypatch):
+    rank = Rank(
+        rank_id=RANK_ID,
+        job_id="job_B",
+        plan_id="plan_1",
+        role=RankRole.AGGREGATE,
+        status=RankStatus.RUNNING,
+        shape_json={"count": 1},
+        n_replicas=1,
+    )
+    orca = _build_orca(
+        monkeypatch,
+        [],
+        active=[rank],
+        job_statuses={"job_B": JobStatus.FINISHED},
+    )
+
+    assert orca.reconcile_finished("user_1") == 1
+    assert orca.reconcile_finished("user_1") == 0
+    assert orca._launcher.torn_down_jobs == ["job_B"]
+    assert orca._jobs.rows[RANK_ID].status is RankStatus.STOPPED
+    assert orca._jobs.rows[RANK_ID].reason_code is None
+    assert orca._jobs.job_statuses["job_B"] is JobStatus.FINISHED
 
 
 def test_preempt_tears_down_and_pauses(monkeypatch):

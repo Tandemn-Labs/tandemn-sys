@@ -328,6 +328,21 @@ class Orca:
             return cause
         return health.reason_code or ReasonCode.FAILED, health.detail
 
+    def reconcile_finished(self, user_id: str) -> int:
+        """Tear down active ranks whose owning jobs are already finished."""
+        reconciled = 0
+        # ponytail: list_jobs currently caps this recovery scan at 200 jobs.
+        for job in self._jobs.list_jobs(user_id):
+            if job.status is not JobStatus.FINISHED:
+                continue
+            rank_ids = self._active_rank_ids(job.job_id)
+            if not rank_ids:
+                continue
+            self._launcher.teardown_job(job.job_id)
+            self._stop_ranks(rank_ids, job.finish_reason)
+            reconciled += 1
+        return reconciled
+
     def reconcile_running(self, user_id: str) -> int:
         """Restore infrastructure, local configs, and tunnels after Orca restarts."""
         reconciled = 0
@@ -644,6 +659,11 @@ def main(argv: list[str] | None = None) -> None:
         except Exception:
             logger.exception("initial plan apply failed")
         try:
+            reconciled = orca.reconcile_finished(args.user_id)
+            logger.info("reconciled %s finished job(s)", reconciled)
+        except Exception:
+            logger.exception("finished job reconciliation failed")
+        try:
             reconciled = orca.reconcile_running(args.user_id)
             logger.info("reconciled %s running job(s)", reconciled)
         except Exception:
@@ -669,6 +689,11 @@ def main(argv: list[str] | None = None) -> None:
                 logger.info("applied %s plan(s) for user %s", applied, args.user_id)
             except Exception:
                 logger.exception("orca apply loop failed")
+            try:
+                reconciled = orca.reconcile_finished(args.user_id)
+                logger.info("reconciled %s finished job(s)", reconciled)
+            except Exception:
+                logger.exception("finished job reconciliation failed")
             if args.rank_health:
                 try:
                     health = orca.reconcile_rank_health(args.user_id)
