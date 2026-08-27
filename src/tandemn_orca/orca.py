@@ -36,7 +36,10 @@ from dataclasses import replace
 from typing import Any
 
 from tandemn_system_data.clients import JobStore, ModelCatalogStore, PlanStore, PostgresClient
+from tandemn_system_data.clients.event_log import PostgresEventLog
+from tandemn_system_data.events import JobPlacePayload
 from tandemn_system_data.models.enums import ActionType, JobStatus, RankRole, RankStatus, ReasonCode
+from tandemn_system_data.models.event import Event
 from tandemn_system_data.models.plan import Plan, PlanAction
 from tandemn_system_data.models.rank import Rank
 
@@ -173,6 +176,7 @@ class Orca:
         self._client = client
         self._jobs = JobStore(client)
         self._plans = PlanStore(client)
+        self._events = PostgresEventLog(client)
         self._launcher = launcher or NoopLauncher()
         self._down_polls_before_failed = max(1, down_polls_before_failed)
         # Consecutive DOWN readings per rank. A single bad poll must not fail a
@@ -406,6 +410,19 @@ class Orca:
         )
         if not moved:
             raise ValueError(f"place: job {action.job_id} is not waiting or paused")
+        self._events.append(
+            Event(
+                user_id=plan.user_id,
+                job_id=action.job_id,
+                type="job.place",
+                payload_json=JobPlacePayload(
+                    job_id=action.job_id,
+                    user_id=plan.user_id,
+                    plan_id=plan.plan_id,
+                    action_type="place",
+                ).model_dump(mode="json"),
+            )
+        )
         try:
             self._launch_ranks(action.job_id, ranks)
         except ModelCatalogError as exc:

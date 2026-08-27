@@ -140,6 +140,15 @@ class FakePlanStore:
         return True
 
 
+class FakeEventLog:
+    def __init__(self, client) -> None:
+        self.events = []
+
+    def append(self, event):
+        self.events.append(event)
+        return event.event_id
+
+
 class FakeLauncher:
     def __init__(self) -> None:
         self.reconciled: list[tuple[str, list[Rank]]] = []
@@ -169,6 +178,7 @@ def _build_orca(monkeypatch, plans, active=None, job_statuses=None):
         lambda client: FakeJobStore(active, inferred_statuses),
     )
     monkeypatch.setattr(orca_mod, "PlanStore", lambda client: FakePlanStore(plans))
+    monkeypatch.setattr(orca_mod, "PostgresEventLog", FakeEventLog)
     return Orca(client=object(), launcher=FakeLauncher())
 
 
@@ -319,6 +329,28 @@ def test_place_transitions_and_launches(monkeypatch):
     assert orca._jobs.launched[0].shape_json["target_p99_tpot_ms"] == 50.0
     assert orca._jobs.rows[RANK_ID].status is RankStatus.LAUNCHING
     assert orca._jobs.rank_status == []
+
+
+def test_place_emits_job_place_before_launching_ranks(monkeypatch):
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_B", type=ActionType.PLACE, ladder=EXPLICIT_LADDER)],
+    )
+    orca = _build_orca(monkeypatch, [plan])
+
+    assert orca.apply_pending("user_1") == 1
+
+    placing = [event for event in orca._events.events if event.type == "job.place"]
+    assert len(placing) == 1
+    assert placing[0].user_id == "user_1"
+    assert placing[0].job_id == "job_B"
+    assert placing[0].rank_id is None
+    assert placing[0].payload_json == {
+        "job_id": "job_B",
+        "user_id": "user_1",
+        "plan_id": plan.plan_id,
+        "action_type": "place",
+    }
 
 
 def test_swap_launches_new_and_tears_down_old(monkeypatch):
