@@ -128,8 +128,9 @@ class FakeJobStore:
 
 
 class FakePlanStore:
-    def __init__(self, plans: list[Plan]) -> None:
+    def __init__(self, plans: list[Plan], *, mark_applied: bool = True) -> None:
         self._plans = plans
+        self._mark_applied = mark_applied
         self.applied: list[str] = []
 
     def unapplied(self, user_id):
@@ -137,7 +138,7 @@ class FakePlanStore:
 
     def mark_applied(self, plan_id):
         self.applied.append(plan_id)
-        return True
+        return self._mark_applied
 
 
 class FakeEventLog:
@@ -161,7 +162,7 @@ class FakeLauncher:
         self.torn_down_jobs.append(job_id)
 
 
-def _build_orca(monkeypatch, plans, active=None, job_statuses=None):
+def _build_orca(monkeypatch, plans, active=None, job_statuses=None, *, mark_applied=True):
     inferred_statuses = {
         action.job_id: (
             JobStatus.RUNNING
@@ -177,7 +178,9 @@ def _build_orca(monkeypatch, plans, active=None, job_statuses=None):
         "JobStore",
         lambda client: FakeJobStore(active, inferred_statuses),
     )
-    monkeypatch.setattr(orca_mod, "PlanStore", lambda client: FakePlanStore(plans))
+    monkeypatch.setattr(
+        orca_mod, "PlanStore", lambda client: FakePlanStore(plans, mark_applied=mark_applied)
+    )
     monkeypatch.setattr(orca_mod, "PostgresEventLog", FakeEventLog)
     return Orca(client=object(), launcher=FakeLauncher())
 
@@ -353,6 +356,100 @@ def test_place_emits_job_place_before_launching_ranks(monkeypatch):
     }
 
 
+def test_place_resumes_paused_job_after_rank_reconciliation(monkeypatch):
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_B", type=ActionType.PLACE, ladder=EXPLICIT_LADDER)],
+    )
+    orca = _build_orca(monkeypatch, [plan], job_statuses={"job_B": JobStatus.PAUSED})
+
+    assert orca.apply_pending("user_1") == 1
+
+    resumed = [event for event in orca._events.events if event.type == "job.resumed"]
+    assert len(resumed) == 1
+    assert resumed[0].user_id == "user_1"
+    assert resumed[0].job_id == "job_B"
+    assert resumed[0].payload_json == {
+        "job_id": "job_B",
+        "user_id": "user_1",
+        "plan_id": plan.plan_id,
+    }
+    assert not [event for event in orca._events.events if event.type == "job.placed"]
+
+
+def test_place_emits_job_placed_after_rank_reconciliation(monkeypatch):
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_B", type=ActionType.PLACE, ladder=EXPLICIT_LADDER)],
+    )
+    orca = _build_orca(monkeypatch, [plan])
+
+    assert orca.apply_pending("user_1") == 1
+
+    placed = [event for event in orca._events.events if event.type == "job.placed"]
+    assert len(placed) == 1
+    assert placed[0].user_id == "user_1"
+    assert placed[0].job_id == "job_B"
+    assert placed[0].payload_json == {
+        "job_id": "job_B",
+        "user_id": "user_1",
+        "plan_id": plan.plan_id,
+    }
+    assert not [event for event in orca._events.events if event.type == "job.resumed"]
+
+
+def test_apply_pending_emits_plan_applied_after_store_cas(monkeypatch):
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_B", type=ActionType.KEEP)],
+    )
+    orca = _build_orca(monkeypatch, [plan])
+
+    assert orca.apply_pending("user_1") == 1
+
+    applied = [event for event in orca._events.events if event.type == "plan.applied"]
+    assert len(applied) == 1
+    assert applied[0].user_id == "user_1"
+    assert applied[0].job_id is None
+    assert applied[0].rank_id is None
+    assert applied[0].payload_json == {"plan_id": plan.plan_id, "user_id": "user_1"}
+
+
+def test_apply_pending_does_not_emit_plan_applied_when_cas_fails(monkeypatch):
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_B", type=ActionType.KEEP)],
+    )
+    orca = _build_orca(monkeypatch, [plan], mark_applied=False)
+
+    assert orca.apply_pending("user_1") == 0
+    assert not [event for event in orca._events.events if event.type == "plan.applied"]
+
+
+def test_place_emits_rank_launching_after_rank_persistence(monkeypatch):
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_B", type=ActionType.PLACE, ladder=EXPLICIT_LADDER)],
+    )
+    orca = _build_orca(monkeypatch, [plan])
+
+    assert orca.apply_pending("user_1") == 1
+
+    launching = [event for event in orca._events.events if event.type == "rank.launching"]
+    assert len(launching) == 1
+    assert launching[0].user_id == "user_1"
+    assert launching[0].job_id == "job_B"
+    assert launching[0].rank_id == RANK_ID
+    assert launching[0].payload_json == {
+        "rank_id": RANK_ID,
+        "job_id": "job_B",
+        "plan_id": plan.plan_id,
+        "role": "aggregate",
+        "shape_json": orca._jobs.rows[RANK_ID].shape_json,
+        "n_replicas": 3,
+    }
+
+
 def test_swap_launches_new_and_tears_down_old(monkeypatch):
     old_rank = Rank(
         rank_id=OLD_RANK_ID,
@@ -380,6 +477,13 @@ def test_swap_launches_new_and_tears_down_old(monkeypatch):
     assert orca._jobs.rank_status == [
         (OLD_RANK_ID, RankStatus.STOPPED, [RankStatus.LAUNCHING, RankStatus.RUNNING], None),
     ]
+    stopped = [event for event in orca._events.events if event.type == "rank.stopped"]
+    assert len(stopped) == 1
+    assert stopped[0].payload_json == {
+        "rank_id": OLD_RANK_ID,
+        "job_id": "job_F",
+        "reason_code": None,
+    }
 
 
 def test_swap_failure_restores_reused_rank_and_fails_only_new_rank(monkeypatch):
@@ -437,6 +541,33 @@ def test_place_failure_restores_previous_job_status(monkeypatch, previous_status
     assert orca._jobs.rows[RANK_ID].status is RankStatus.FAILED
 
 
+def test_launch_failure_emits_rank_failed(monkeypatch):
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_B", type=ActionType.PLACE, ladder=EXPLICIT_LADDER)],
+    )
+    orca = _build_orca(monkeypatch, [plan])
+
+    def fail_reconcile(job_id, ranks):
+        raise RuntimeError("launcher unavailable")
+
+    orca._launcher.reconcile = fail_reconcile
+
+    assert orca.apply_pending("user_1") == 1
+
+    failed = [event for event in orca._events.events if event.type == "rank.failed"]
+    assert len(failed) == 1
+    assert failed[0].user_id == "user_1"
+    assert failed[0].job_id == "job_B"
+    assert failed[0].rank_id == RANK_ID
+    assert failed[0].payload_json == {
+        "rank_id": RANK_ID,
+        "job_id": "job_B",
+        "reason_code": ReasonCode.LAUNCH_FAILED,
+        "detail": "launcher unavailable",
+    }
+
+
 def test_place_catalog_failure_finishes_job_with_visible_error(monkeypatch):
     plan = Plan(
         user_id="user_1",
@@ -455,6 +586,16 @@ def test_place_catalog_failure_finishes_job_with_visible_error(monkeypatch):
     assert orca._jobs.job_statuses["job_B"] is JobStatus.FINISHED
     assert orca._jobs.failures == [("job_B", ReasonCode.MODEL_CATALOG_INVALID, message)]
     assert orca._jobs.rows[RANK_ID].reason_code == ReasonCode.MODEL_CATALOG_INVALID
+    finished = [event for event in orca._events.events if event.type == "job.finished"]
+    assert len(finished) == 1
+    assert finished[0].user_id == "user_1"
+    assert finished[0].job_id == "job_B"
+    assert finished[0].payload_json == {
+        "job_id": "job_B",
+        "user_id": "user_1",
+        "finish_reason": ReasonCode.MODEL_CATALOG_INVALID,
+        "detail": message,
+    }
 
 
 def test_swap_catalog_failure_keeps_running_job_and_records_error(monkeypatch):
@@ -604,6 +745,13 @@ def test_reconcile_finished_tears_down_active_ranks_once(monkeypatch):
     assert orca._jobs.rows[RANK_ID].status is RankStatus.STOPPED
     assert orca._jobs.rows[RANK_ID].reason_code is None
     assert orca._jobs.job_statuses["job_B"] is JobStatus.FINISHED
+    stopped = [event for event in orca._events.events if event.type == "rank.stopped"]
+    assert len(stopped) == 1
+    assert stopped[0].payload_json == {
+        "rank_id": RANK_ID,
+        "job_id": "job_B",
+        "reason_code": None,
+    }
 
 
 def test_preempt_tears_down_and_pauses(monkeypatch):
@@ -635,6 +783,22 @@ def test_preempt_tears_down_and_pauses(monkeypatch):
         ),
     ]
     assert orca._jobs.transitions == [("job_E", JobStatus.PAUSED, [JobStatus.RUNNING])]
+    stopped = [event for event in orca._events.events if event.type == "rank.stopped"]
+    assert len(stopped) == 1
+    assert stopped[0].payload_json == {
+        "rank_id": OLD_RANK_ID,
+        "job_id": "job_E",
+        "reason_code": ReasonCode.PREEMPTED,
+    }
+    paused = [event for event in orca._events.events if event.type == "job.paused"]
+    assert len(paused) == 1
+    assert paused[0].user_id == "user_1"
+    assert paused[0].job_id == "job_E"
+    assert paused[0].payload_json == {
+        "job_id": "job_E",
+        "user_id": "user_1",
+        "plan_id": plan.plan_id,
+    }
 
 
 def test_bad_action_does_not_wedge_the_plan(monkeypatch):

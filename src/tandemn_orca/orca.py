@@ -37,7 +37,18 @@ from typing import Any
 
 from tandemn_system_data.clients import JobStore, ModelCatalogStore, PlanStore, PostgresClient
 from tandemn_system_data.clients.event_log import PostgresEventLog
-from tandemn_system_data.events import JobPlacePayload
+from tandemn_system_data.events import (
+    JobFinishedPayload,
+    JobPausedPayload,
+    JobPlacedPayload,
+    JobPlacePayload,
+    JobResumedPayload,
+    PlanAppliedPayload,
+    RankFailedPayload,
+    RankLaunchingPayload,
+    RankRunningPayload,
+    RankStoppedPayload,
+)
 from tandemn_system_data.models.enums import ActionType, JobStatus, RankRole, RankStatus, ReasonCode
 from tandemn_system_data.models.event import Event
 from tandemn_system_data.models.plan import Plan, PlanAction
@@ -193,6 +204,16 @@ class Orca:
         for plan in self._plans.unapplied(user_id):
             self._apply_plan(plan)
             if self._plans.mark_applied(plan.plan_id):
+                self._events.append(
+                    Event(
+                        user_id=plan.user_id,
+                        type="plan.applied",
+                        payload_json=PlanAppliedPayload(
+                            plan_id=plan.plan_id,
+                            user_id=plan.user_id,
+                        ).model_dump(mode="json"),
+                    )
+                )
                 applied += 1
                 logger.info("applied plan %s", plan.plan_id)
             else:
@@ -250,6 +271,7 @@ class Orca:
                     active_rank_ids.add(rank.rank_id)
                     results.append(
                         self._apply_rank_health(
+                            user_id,
                             k8s,
                             rank,
                             rank_health(
@@ -274,7 +296,9 @@ class Orca:
         self._served_rank_ids &= active_rank_ids
         return results
 
-    def _apply_rank_health(self, k8s: Any, rank: Rank, health: RankHealth) -> RankHealth:
+    def _apply_rank_health(
+        self, user_id: str, k8s: Any, rank: Rank, health: RankHealth
+    ) -> RankHealth:
         """Record one rank's health, returning the debounced verdict."""
         if health.verdict is Verdict.SERVING:
             self._served_rank_ids.add(rank.rank_id)
@@ -283,10 +307,27 @@ class Orca:
             # reason_code and updated_at unconditionally, so a no-op CAS would
             # erase failure provenance and reset every age-based rule.
             if rank.status is RankStatus.LAUNCHING:
-                self._jobs.set_rank_status(rank.rank_id, RankStatus.RUNNING, [RankStatus.LAUNCHING])
-                logger.info(
-                    "rank %s serving with %s replica(s)", rank.rank_id, health.serving_replicas
+                promoted = self._jobs.set_rank_status(
+                    rank.rank_id, RankStatus.RUNNING, [RankStatus.LAUNCHING]
                 )
+                if promoted:
+                    self._events.append(
+                        Event(
+                            user_id=user_id,
+                            job_id=rank.job_id,
+                            rank_id=rank.rank_id,
+                            type="rank.running",
+                            payload_json=RankRunningPayload(
+                                rank_id=rank.rank_id,
+                                job_id=rank.job_id,
+                            ).model_dump(mode="json"),
+                        )
+                    )
+                    logger.info(
+                        "rank %s serving with %s replica(s)",
+                        rank.rank_id,
+                        health.serving_replicas,
+                    )
             return health
 
         if health.verdict is Verdict.UNKNOWN:
@@ -306,12 +347,27 @@ class Orca:
             )
 
         reason_code, detail = self._failure_cause(k8s, rank, health)
-        if self._jobs.set_rank_status(
+        failed = self._jobs.set_rank_status(
             rank.rank_id,
             RankStatus.FAILED,
             list(ACTIVE_RANK_STATUSES),
             reason_code=reason_code,
-        ):
+        )
+        if failed:
+            self._events.append(
+                Event(
+                    user_id=user_id,
+                    job_id=rank.job_id,
+                    rank_id=rank.rank_id,
+                    type="rank.failed",
+                    payload_json=RankFailedPayload(
+                        rank_id=rank.rank_id,
+                        job_id=rank.job_id,
+                        reason_code=str(reason_code),
+                        detail=detail,
+                    ).model_dump(mode="json"),
+                )
+            )
             logger.warning("rank %s failed (%s): %s", rank.rank_id, reason_code, detail)
         return replace(health, reason_code=reason_code, detail=detail)
 
@@ -343,7 +399,7 @@ class Orca:
             if not rank_ids:
                 continue
             self._launcher.teardown_job(job.job_id)
-            self._stop_ranks(rank_ids, job.finish_reason)
+            self._stop_ranks(user_id, job.job_id, rank_ids, job.finish_reason)
             reconciled += 1
         return reconciled
 
@@ -424,28 +480,81 @@ class Orca:
             )
         )
         try:
-            self._launch_ranks(action.job_id, ranks)
+            self._launch_ranks(plan, action.job_id, ranks)
         except ModelCatalogError as exc:
-            self._jobs.fail(
+            finished = self._jobs.fail(
                 action.job_id,
                 [JobStatus.RUNNING],
                 finish_reason=ReasonCode.MODEL_CATALOG_INVALID,
                 error_message=str(exc),
             )
+            if finished:
+                self._events.append(
+                    Event(
+                        user_id=plan.user_id,
+                        job_id=action.job_id,
+                        type="job.finished",
+                        payload_json=JobFinishedPayload(
+                            job_id=action.job_id,
+                            user_id=plan.user_id,
+                            finish_reason=ReasonCode.MODEL_CATALOG_INVALID,
+                            detail=str(exc),
+                        ).model_dump(mode="json"),
+                    )
+                )
             raise
         except Exception:
             if moved and previous_status is not None:
                 self._jobs.transition(action.job_id, previous_status, [JobStatus.RUNNING])
             raise
+        if previous_status is JobStatus.PAUSED:
+            self._events.append(
+                Event(
+                    user_id=plan.user_id,
+                    job_id=action.job_id,
+                    type="job.resumed",
+                    payload_json=JobResumedPayload(
+                        job_id=action.job_id,
+                        user_id=plan.user_id,
+                        plan_id=plan.plan_id,
+                    ).model_dump(mode="json"),
+                )
+            )
+        else:
+            self._events.append(
+                Event(
+                    user_id=plan.user_id,
+                    job_id=action.job_id,
+                    type="job.placed",
+                    payload_json=JobPlacedPayload(
+                        job_id=action.job_id,
+                        user_id=plan.user_id,
+                        plan_id=plan.plan_id,
+                    ).model_dump(mode="json"),
+                )
+            )
         logger.info("placed job %s (plan %s)", action.job_id, plan.plan_id)
 
     def _preempt(self, plan: Plan, action: PlanAction) -> None:
         """running -> paused: tear down the job's ranks, keep the job row."""
         # Record why: without it a preempted rank is indistinguishable from one
         # that finished cleanly, since STOPPED is written on both paths.
-        self._teardown_ranks(action.job_id, ReasonCode.PREEMPTED)
+        self._teardown_ranks(plan.user_id, action.job_id, ReasonCode.PREEMPTED)
         moved = self._jobs.transition(action.job_id, JobStatus.PAUSED, [JobStatus.RUNNING])
-        if not moved:
+        if moved:
+            self._events.append(
+                Event(
+                    user_id=plan.user_id,
+                    job_id=action.job_id,
+                    type="job.paused",
+                    payload_json=JobPausedPayload(
+                        job_id=action.job_id,
+                        user_id=plan.user_id,
+                        plan_id=plan.plan_id,
+                    ).model_dump(mode="json"),
+                )
+            )
+        else:
             logger.warning("preempt: job %s was not running", action.job_id)
         logger.info("preempted job %s (plan %s)", action.job_id, plan.plan_id)
 
@@ -473,12 +582,16 @@ class Orca:
             for rank in ranks
         ]
         try:
-            recorded = self._launch_ranks(action.job_id, ranks, old_by_id)
+            recorded = self._launch_ranks(plan, action.job_id, ranks, old_by_id)
         except ModelCatalogError as exc:
             self._jobs.set_error(action.job_id, str(exc))
             raise
         self._jobs.set_error(action.job_id, None)
-        self._stop_ranks(set(old_by_id) - {rank.rank_id for rank in recorded})
+        self._stop_ranks(
+            plan.user_id,
+            action.job_id,
+            set(old_by_id) - {rank.rank_id for rank in recorded},
+        )
         logger.info("swapped job %s (plan %s)", action.job_id, plan.plan_id)
 
     # ----- launcher seam ---------------------------------------------------
@@ -500,12 +613,32 @@ class Orca:
 
     def _launch_ranks(
         self,
+        plan: Plan,
         job_id: str,
         ranks: list[Rank],
         previous: dict[str, Rank] | None = None,
     ) -> list[Rank]:
         previous = previous or {}
         recorded = self._jobs.launch_ranks(ranks)
+        for rank in recorded:
+            if rank.rank_id in previous:
+                continue
+            self._events.append(
+                Event(
+                    user_id=plan.user_id,
+                    job_id=job_id,
+                    rank_id=rank.rank_id,
+                    type="rank.launching",
+                    payload_json=RankLaunchingPayload(
+                        rank_id=rank.rank_id,
+                        job_id=job_id,
+                        plan_id=rank.plan_id,
+                        role=rank.role,
+                        shape_json=rank.shape_json,
+                        n_replicas=rank.n_replicas,
+                    ).model_dump(mode="json"),
+                )
+            )
         try:
             self._launcher.reconcile(job_id, recorded)
         except Exception as exc:
@@ -521,31 +654,64 @@ class Orca:
                 )
                 for rank in recorded:
                     if rank.rank_id not in previous:
-                        self._jobs.set_rank_status(
+                        failed = self._jobs.set_rank_status(
                             rank.rank_id,
                             RankStatus.FAILED,
                             [RankStatus.LAUNCHING],
                             reason_code=reason_code,
                         )
+                        if failed:
+                            self._events.append(
+                                Event(
+                                    user_id=plan.user_id,
+                                    job_id=job_id,
+                                    rank_id=rank.rank_id,
+                                    type="rank.failed",
+                                    payload_json=RankFailedPayload(
+                                        rank_id=rank.rank_id,
+                                        job_id=job_id,
+                                        reason_code=str(reason_code),
+                                        detail=str(exc),
+                                    ).model_dump(mode="json"),
+                                )
+                            )
             raise
         return recorded
 
-    def _teardown_ranks(self, job_id: str, reason_code: str | None = None) -> None:
+    def _teardown_ranks(
+        self, user_id: str, job_id: str, reason_code: str | None = None
+    ) -> None:
         rank_ids = self._active_rank_ids(job_id)
         self._launcher.teardown_job(job_id)
-        self._stop_ranks(rank_ids, reason_code)
+        self._stop_ranks(user_id, job_id, rank_ids, reason_code)
 
     def _active_rank_ids(self, job_id: str) -> set[str]:
         return {rank.rank_id for rank in self._jobs.active_ranks(job_id)}
 
-    def _stop_ranks(self, rank_ids: set[str], reason_code: str | None = None) -> None:
+    def _stop_ranks(
+        self, user_id: str, job_id: str, rank_ids: set[str], reason_code: str | None = None
+    ) -> None:
         for rank_id in rank_ids:
-            self._jobs.set_rank_status(
+            stopped = self._jobs.set_rank_status(
                 rank_id,
                 RankStatus.STOPPED,
                 list(ACTIVE_RANK_STATUSES),
                 reason_code=reason_code,
             )
+            if stopped:
+                self._events.append(
+                    Event(
+                        user_id=user_id,
+                        job_id=job_id,
+                        rank_id=rank_id,
+                        type="rank.stopped",
+                        payload_json=RankStoppedPayload(
+                            rank_id=rank_id,
+                            job_id=job_id,
+                            reason_code=reason_code,
+                        ).model_dump(mode="json"),
+                    )
+                )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
