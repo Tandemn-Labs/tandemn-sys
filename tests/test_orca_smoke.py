@@ -745,6 +745,14 @@ def test_reconcile_finished_tears_down_active_ranks_once(monkeypatch):
     assert orca._jobs.rows[RANK_ID].status is RankStatus.STOPPED
     assert orca._jobs.rows[RANK_ID].reason_code is None
     assert orca._jobs.job_statuses["job_B"] is JobStatus.FINISHED
+    finished = [event for event in orca._events.events if event.type == "job.finished"]
+    assert len(finished) == 1
+    assert finished[0].payload_json == {
+        "job_id": "job_B",
+        "user_id": "user_1",
+        "finish_reason": None,
+        "detail": None,
+    }
     stopped = [event for event in orca._events.events if event.type == "rank.stopped"]
     assert len(stopped) == 1
     assert stopped[0].payload_json == {
