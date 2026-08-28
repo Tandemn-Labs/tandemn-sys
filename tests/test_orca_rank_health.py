@@ -68,6 +68,15 @@ class FakeJobStore:
         return True
 
 
+class FakeEventLog:
+    def __init__(self, client) -> None:
+        self.events = []
+
+    def append(self, event):
+        self.events.append(event)
+        return event.event_id
+
+
 class FakeK8s:
     def __init__(self, dgds: list[dict], pods: list[dict] | None = None) -> None:
         self.dgds = dgds
@@ -99,6 +108,7 @@ class FakeLauncher:
 def _orca(monkeypatch, store: FakeJobStore, k8s: FakeK8s, *, polls: int = 2) -> Orca:
     monkeypatch.setattr(orca_mod, "JobStore", lambda client: store)
     monkeypatch.setattr(orca_mod, "PlanStore", lambda client: object())
+    monkeypatch.setattr(orca_mod, "PostgresEventLog", FakeEventLog)
     return Orca(client=object(), launcher=FakeLauncher(k8s), down_polls_before_failed=polls)
 
 
@@ -113,6 +123,21 @@ def test_serving_promotes_a_launching_rank(monkeypatch):
 
     assert [item.verdict for item in health] == [Verdict.SERVING]
     assert store.writes == [(RANK_ID, RankStatus.RUNNING, [RankStatus.LAUNCHING], None)]
+
+
+def test_serving_emits_rank_running_once(monkeypatch):
+    store = FakeJobStore(_rank(RankStatus.LAUNCHING))
+    orca = _orca(monkeypatch, store, FakeK8s([_dgd(worker=2)]))
+
+    orca.reconcile_rank_health(USER_ID)
+    orca.reconcile_rank_health(USER_ID)
+
+    running = [event for event in orca._events.events if event.type == "rank.running"]
+    assert len(running) == 1
+    assert running[0].user_id == USER_ID
+    assert running[0].job_id == JOB_ID
+    assert running[0].rank_id == RANK_ID
+    assert running[0].payload_json == {"rank_id": RANK_ID, "job_id": JOB_ID}
 
 
 def test_serving_does_not_rewrite_an_already_running_rank(monkeypatch):
@@ -157,6 +182,26 @@ def test_consecutive_down_polls_fail_the_rank(monkeypatch):
             ReasonCode.HEARTBEAT_TIMEOUT,
         )
     ]
+
+
+def test_consecutive_down_polls_emit_rank_failed(monkeypatch):
+    store = FakeJobStore(_rank())
+    orca = _orca(monkeypatch, store, FakeK8s([_dgd(worker=0)]))
+
+    orca.reconcile_rank_health(USER_ID)
+    orca.reconcile_rank_health(USER_ID)
+
+    failed = [event for event in orca._events.events if event.type == "rank.failed"]
+    assert len(failed) == 1
+    assert failed[0].user_id == USER_ID
+    assert failed[0].job_id == JOB_ID
+    assert failed[0].rank_id == RANK_ID
+    assert failed[0].payload_json == {
+        "rank_id": RANK_ID,
+        "job_id": JOB_ID,
+        "reason_code": ReasonCode.HEARTBEAT_TIMEOUT,
+        "detail": "0 worker replicas ready (DGD state=successful)",
+    }
 
 
 def test_a_recovered_rank_resets_the_streak(monkeypatch):
