@@ -399,6 +399,18 @@ class Orca:
             if not rank_ids:
                 continue
             self._launcher.teardown_job(job.job_id)
+            self._events.append(
+                Event(
+                    user_id=user_id,
+                    job_id=job.job_id,
+                    type="job.finished",
+                    payload_json=JobFinishedPayload(
+                        job_id=job.job_id,
+                        user_id=user_id,
+                        finish_reason=job.finish_reason,
+                    ).model_dump(mode="json"),
+                )
+            )
             self._stop_ranks(user_id, job.job_id, rank_ids, job.finish_reason)
             reconciled += 1
         return reconciled
@@ -678,9 +690,7 @@ class Orca:
             raise
         return recorded
 
-    def _teardown_ranks(
-        self, user_id: str, job_id: str, reason_code: str | None = None
-    ) -> None:
+    def _teardown_ranks(self, user_id: str, job_id: str, reason_code: str | None = None) -> None:
         rank_ids = self._active_rank_ids(job_id)
         self._launcher.teardown_job(job_id)
         self._stop_ranks(user_id, job_id, rank_ids, reason_code)
