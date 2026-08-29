@@ -33,7 +33,7 @@ import re
 import signal
 import time
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from tandemn_system_data.clients import JobStore, ModelCatalogStore, PlanStore, PostgresClient
 from tandemn_system_data.clients.event_log import PostgresEventLog
@@ -49,7 +49,14 @@ from tandemn_system_data.events import (
     RankRunningPayload,
     RankStoppedPayload,
 )
-from tandemn_system_data.models.enums import ActionType, JobStatus, RankRole, RankStatus, ReasonCode
+from tandemn_system_data.models.enums import (
+    ActionType,
+    JobKind,
+    JobStatus,
+    RankRole,
+    RankStatus,
+    ReasonCode,
+)
 from tandemn_system_data.models.event import Event
 from tandemn_system_data.models.plan import Plan, PlanAction
 from tandemn_system_data.models.rank import Rank
@@ -72,6 +79,9 @@ from tandemn_orca.rank_health import (
 from tandemn_orca.router_health import RankHealthPublisher
 from tandemn_orca.scripts.resource_map_from_aws import CapacityRefresher, parse_region_csv
 from tandemn_orca.tunnels import PortForwardManager, RouterProcessManager
+
+if TYPE_CHECKING:
+    from tandemn_orca.chunk_manager import ChunkManagerClient
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +192,7 @@ class Orca:
         client: PostgresClient,
         launcher: Launcher | None = None,
         *,
+        chunk_manager: ChunkManagerClient | None = None,
         down_polls_before_failed: int = 2,
     ) -> None:
         self._client = client
@@ -189,6 +200,8 @@ class Orca:
         self._plans = PlanStore(client)
         self._events = PostgresEventLog(client)
         self._launcher = launcher or NoopLauncher()
+        self._chunk_manager = chunk_manager
+        self._cancelled_chunk_jobs: set[str] = set()
         self._down_polls_before_failed = max(1, down_polls_before_failed)
         # Consecutive DOWN readings per rank. A single bad poll must not fail a
         # rank: the operator recomputes status on its own cadence and a rolling
@@ -395,6 +408,14 @@ class Orca:
         for job in self._jobs.list_jobs(user_id):
             if job.status is not JobStatus.FINISHED:
                 continue
+            if (
+                self._chunk_manager is not None
+                and job.kind is JobKind.BATCH
+                and job.finish_reason == ReasonCode.CANCELLED
+                and job.job_id not in self._cancelled_chunk_jobs
+            ):
+                self._chunk_manager.cancel_job(job.job_id)
+                self._cancelled_chunk_jobs.add(job.job_id)
             rank_ids = self._active_rank_ids(job.job_id)
             if not rank_ids:
                 continue
@@ -433,6 +454,7 @@ class Orca:
                 for allocation in running.ranks
             ]
             if ranks:
+                self._add_chain_associations(ranks)
                 self._launcher.reconcile(running.job.job_id, ranks)
                 reconciled += 1
         return reconciled
@@ -599,6 +621,19 @@ class Orca:
             self._jobs.set_error(action.job_id, str(exc))
             raise
         self._jobs.set_error(action.job_id, None)
+        recorded_by_id = {rank.rank_id: rank for rank in recorded}
+        removed = [rank for rank in old_ranks if rank.rank_id not in recorded_by_id]
+        self._drain_chain_associations(removed)
+        if self._uses_chunk_manager(action.job_id):
+            assert self._chunk_manager is not None
+            for old_rank in old_ranks:
+                replacement = recorded_by_id.get(old_rank.rank_id)
+                if replacement is None:
+                    continue
+                for chain_id in range(replacement.n_replicas, old_rank.n_replicas):
+                    self._chunk_manager.drain_chain_association(
+                        action.job_id, old_rank.rank_id, chain_id
+                    )
         self._stop_ranks(
             plan.user_id,
             action.job_id,
@@ -652,6 +687,7 @@ class Orca:
                 )
             )
         try:
+            self._add_chain_associations(recorded)
             self._launcher.reconcile(job_id, recorded)
         except Exception as exc:
             try:
@@ -691,9 +727,31 @@ class Orca:
         return recorded
 
     def _teardown_ranks(self, user_id: str, job_id: str, reason_code: str | None = None) -> None:
-        rank_ids = self._active_rank_ids(job_id)
+        ranks = self._jobs.active_ranks(job_id)
+        rank_ids = {rank.rank_id for rank in ranks}
+        self._drain_chain_associations(ranks)
         self._launcher.teardown_job(job_id)
         self._stop_ranks(user_id, job_id, rank_ids, reason_code)
+
+    def _add_chain_associations(self, ranks: list[Rank]) -> None:
+        if not ranks or not self._uses_chunk_manager(ranks[0].job_id):
+            return
+        assert self._chunk_manager is not None
+        for rank in ranks:
+            for chain_id in range(rank.n_replicas):
+                self._chunk_manager.add_chain_association(rank.job_id, rank.rank_id, chain_id)
+
+    def _drain_chain_associations(self, ranks: list[Rank]) -> None:
+        if not ranks or not self._uses_chunk_manager(ranks[0].job_id):
+            return
+        assert self._chunk_manager is not None
+        for rank in ranks:
+            for chain_id in range(rank.n_replicas):
+                self._chunk_manager.drain_chain_association(rank.job_id, rank.rank_id, chain_id)
+
+    def _uses_chunk_manager(self, job_id: str) -> bool:
+        job = self._jobs.get(job_id)
+        return self._chunk_manager is not None and job is not None and job.kind is JobKind.BATCH
 
     def _active_rank_ids(self, job_id: str) -> set[str]:
         return {rank.rank_id for rank in self._jobs.active_ranks(job_id)}
@@ -731,6 +789,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--router-config-dir", default=os.getenv("TANDEMN_ROUTER_CONFIG_DIR"))
     parser.add_argument("--router-binary", default=os.getenv("TANDEMN_ROUTER_BINARY"))
     parser.add_argument("--cluster-contexts", default=os.getenv("TANDEMN_CLUSTER_CONTEXTS"))
+    parser.add_argument(
+        "--chunk-manager-target",
+        default=os.getenv("TANDEMN_CHUNK_MANAGER_TARGET"),
+        help="chunk-manager gRPC target, for example chunk-manager:9090",
+    )
     parser.add_argument(
         "--router-port-base",
         type=int,
@@ -833,7 +896,17 @@ def main(argv: list[str] | None = None) -> None:
         tunnels=tunnel_manager,
         routers=router_manager,
     )
-    orca = Orca(client, launcher=launcher, down_polls_before_failed=args.down_polls_before_failed)
+    chunk_manager = None
+    if args.chunk_manager_target:
+        from tandemn_orca.chunk_manager import ChunkManagerClient
+
+        chunk_manager = ChunkManagerClient(args.chunk_manager_target)
+    orca = Orca(
+        client,
+        launcher=launcher,
+        chunk_manager=chunk_manager,
+        down_polls_before_failed=args.down_polls_before_failed,
+    )
     telemetry_token = os.getenv("TANDEMN_ROUTER_TELEMETRY_TOKEN")
     health_publisher = (
         RankHealthPublisher(telemetry_token) if telemetry_token and args.rank_health else None
@@ -895,6 +968,8 @@ def main(argv: list[str] | None = None) -> None:
                 except Exception:
                     logger.exception("rank health reconciliation failed")
     finally:
+        if chunk_manager is not None:
+            chunk_manager.close()
         if router_manager is not None:
             router_manager.close()
         if tunnel_manager is not None:
