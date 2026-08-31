@@ -15,6 +15,15 @@ class FakePlanner:
     def CancelJob(self, request, *, timeout):  # noqa: N802
         self.calls.append(("cancel", request, timeout))
 
+    def GetJob(self, request, *, timeout):  # noqa: N802
+        self.calls.append(("get", request, timeout))
+        return chunk_manager_pb2.GetJobResponse(
+            job=chunk_manager_pb2.Job(
+                job_id=request.job_id,
+                state=chunk_manager_pb2.JOB_STATE_SUCCEEDED,
+            )
+        )
+
 
 def test_planner_calls_strip_orca_id_prefixes():
     client = ChunkManagerClient.__new__(ChunkManagerClient)
@@ -27,8 +36,9 @@ def test_planner_calls_strip_orca_id_prefixes():
         "job_01JBM2YQYZ1KQ9C8GZP1XB6V5T", "rank_01JBM30YQ7X3WQAR6HF8C2Q9T8", 2
     )
     client.cancel_job("job_01JBM2YQYZ1KQ9C8GZP1XB6V5T")
+    job = client.get_job("job_01JBM2YQYZ1KQ9C8GZP1XB6V5T")
 
-    add, drain, cancel = client._planner.calls
+    add, drain, cancel, get = client._planner.calls
     assert add == (
         "add",
         chunk_manager_pb2.AddChainAssociationRequest(
@@ -48,3 +58,9 @@ def test_planner_calls_strip_orca_id_prefixes():
         chunk_manager_pb2.CancelJobRequest(job_id="01JBM2YQYZ1KQ9C8GZP1XB6V5T"),
         5,
     )
+    assert get == (
+        "get",
+        chunk_manager_pb2.GetJobRequest(job_id="01JBM2YQYZ1KQ9C8GZP1XB6V5T"),
+        5,
+    )
+    assert job.state == chunk_manager_pb2.JOB_STATE_SUCCEEDED

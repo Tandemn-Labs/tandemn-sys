@@ -16,6 +16,7 @@ class FakeOrca:
         self.kwargs = kwargs
         self.applied_users: list[str] = []
         self.finished_users: list[str] = []
+        self.chunk_users: list[str] = []
         self.reconciled_users: list[str] = []
         self.health_users: list[str] = []
         FakeOrca.instances.append(self)
@@ -30,6 +31,10 @@ class FakeOrca:
 
     def reconcile_finished(self, user_id: str) -> int:
         self.finished_users.append(user_id)
+        return 0
+
+    def reconcile_chunk_jobs(self, user_id: str) -> int:
+        self.chunk_users.append(user_id)
         return 0
 
     def reconcile_rank_health(self, user_id: str) -> list:
@@ -118,6 +123,7 @@ def test_main_once_uses_dynamo_launcher(monkeypatch):
     assert FakeMultiClusterLauncher.instances[0].default_cluster == "default"
     assert FakeOrca.instances[0].applied_users == ["default"]
     assert FakeOrca.instances[0].finished_users == ["default"]
+    assert FakeOrca.instances[0].chunk_users == ["default"]
     assert FakeOrca.instances[0].reconciled_users == ["default"]
     assert FakeRefresher.instances[0].client == "client"
     assert FakeRefresher.instances[0].regions == [

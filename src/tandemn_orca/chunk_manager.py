@@ -40,5 +40,11 @@ class ChunkManagerClient:
             timeout=RPC_TIMEOUT_SECONDS,
         )
 
+    def get_job(self, job_id: str) -> chunk_manager_pb2.Job:
+        return self._planner.GetJob(
+            chunk_manager_pb2.GetJobRequest(job_id=job_id.removeprefix("job_")),
+            timeout=RPC_TIMEOUT_SECONDS,
+        ).job
+
     def close(self) -> None:
         self._channel.close()

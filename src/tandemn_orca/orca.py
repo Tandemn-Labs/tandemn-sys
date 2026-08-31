@@ -33,7 +33,7 @@ import re
 import signal
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from tandemn_system_data.clients import JobStore, ModelCatalogStore, PlanStore, PostgresClient
 from tandemn_system_data.clients.event_log import PostgresEventLog
@@ -61,6 +61,8 @@ from tandemn_system_data.models.event import Event
 from tandemn_system_data.models.plan import Plan, PlanAction
 from tandemn_system_data.models.rank import Rank
 
+from tandemn.chunkmanager.v1 import chunk_manager_pb2
+from tandemn_orca.chunk_manager import ChunkManagerClient
 from tandemn_orca.dynamo_kubernetes import load_kube_client
 from tandemn_orca.launcher import (
     DynamoLauncher,
@@ -79,9 +81,6 @@ from tandemn_orca.rank_health import (
 from tandemn_orca.router_health import RankHealthPublisher
 from tandemn_orca.scripts.resource_map_from_aws import CapacityRefresher, parse_region_csv
 from tandemn_orca.tunnels import PortForwardManager, RouterProcessManager
-
-if TYPE_CHECKING:
-    from tandemn_orca.chunk_manager import ChunkManagerClient
 
 logger = logging.getLogger(__name__)
 
@@ -434,6 +433,36 @@ class Orca:
             )
             self._stop_ranks(user_id, job.job_id, rank_ids, job.finish_reason)
             reconciled += 1
+        return reconciled
+
+    def reconcile_chunk_jobs(self, user_id: str) -> int:
+        """Copy terminal chunk-manager state into the canonical Store job."""
+        if self._chunk_manager is None:
+            return 0
+        reconciled = 0
+        for running in self._jobs.running_jobs(user_id):
+            if running.job.kind is not JobKind.BATCH:
+                continue
+            try:
+                chunk_job = self._chunk_manager.get_job(running.job.job_id)
+            except Exception:
+                logger.exception("chunk job reconciliation failed for %s", running.job.job_id)
+                continue
+            if chunk_job.state == chunk_manager_pb2.JOB_STATE_SUCCEEDED:
+                finish_reason = None
+            elif chunk_job.state == chunk_manager_pb2.JOB_STATE_FAILED:
+                finish_reason = ReasonCode.FAILED
+            elif chunk_job.state == chunk_manager_pb2.JOB_STATE_CANCELLED:
+                finish_reason = ReasonCode.CANCELLED
+            else:
+                continue
+            if self._jobs.transition(
+                running.job.job_id,
+                JobStatus.FINISHED,
+                [JobStatus.RUNNING],
+                finish_reason=finish_reason,
+            ):
+                reconciled += 1
         return reconciled
 
     def reconcile_running(self, user_id: str) -> int:
@@ -898,8 +927,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     chunk_manager = None
     if args.chunk_manager_target:
-        from tandemn_orca.chunk_manager import ChunkManagerClient
-
         chunk_manager = ChunkManagerClient(args.chunk_manager_target)
     orca = Orca(
         client,
@@ -924,6 +951,11 @@ def main(argv: list[str] | None = None) -> None:
             logger.info("applied %s pending plan(s) at startup", applied)
         except Exception:
             logger.exception("initial plan apply failed")
+        try:
+            reconciled = orca.reconcile_chunk_jobs(args.user_id)
+            logger.info("reconciled %s terminal chunk job(s)", reconciled)
+        except Exception:
+            logger.exception("chunk job reconciliation failed")
         try:
             reconciled = orca.reconcile_finished(args.user_id)
             logger.info("reconciled %s finished job(s)", reconciled)
@@ -955,6 +987,11 @@ def main(argv: list[str] | None = None) -> None:
                 logger.info("applied %s plan(s) for user %s", applied, args.user_id)
             except Exception:
                 logger.exception("orca apply loop failed")
+            try:
+                reconciled = orca.reconcile_chunk_jobs(args.user_id)
+                logger.info("reconciled %s terminal chunk job(s)", reconciled)
+            except Exception:
+                logger.exception("chunk job reconciliation failed")
             try:
                 reconciled = orca.reconcile_finished(args.user_id)
                 logger.info("reconciled %s finished job(s)", reconciled)

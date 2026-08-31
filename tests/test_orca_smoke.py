@@ -22,6 +22,7 @@ from tandemn_system_data.models.plan import Plan, PlanAction
 from tandemn_system_data.models.rank import Rank
 
 import tandemn_orca.orca as orca_mod
+from tandemn.chunkmanager.v1 import chunk_manager_pb2
 from tandemn_orca.launcher import ModelCatalogError
 from tandemn_orca.orca import Orca, ladder_to_ranks
 
@@ -71,6 +72,8 @@ class FakeJobStore:
         if self.job_statuses.get(job_id) not in expected:
             return False
         self.job_statuses[job_id] = to
+        if to is JobStatus.FINISHED:
+            self.finish_reasons[job_id] = finish_reason
         return True
 
     def get(self, job_id):
@@ -109,7 +112,10 @@ class FakeJobStore:
 
     def running_jobs(self, user_id):
         return [
-            SimpleNamespace(job=SimpleNamespace(job_id=job_id), ranks=self.active_ranks(job_id))
+            SimpleNamespace(
+                job=SimpleNamespace(job_id=job_id, kind=JobKind.BATCH),
+                ranks=self.active_ranks(job_id),
+            )
             for job_id, status in self.job_statuses.items()
             if status is JobStatus.RUNNING
         ]
@@ -171,10 +177,12 @@ class FakeLauncher:
 
 
 class FakeChunkManager:
-    def __init__(self) -> None:
+    def __init__(self, states=None) -> None:
         self.added: list[tuple[str, str, int]] = []
         self.drained: list[tuple[str, str, int]] = []
         self.cancelled: list[str] = []
+        self.states = states or {}
+        self.requested: list[str] = []
 
     def add_chain_association(self, job_id, rank_id, chain_id):
         self.added.append((job_id, rank_id, chain_id))
@@ -184,6 +192,10 @@ class FakeChunkManager:
 
     def cancel_job(self, job_id):
         self.cancelled.append(job_id)
+
+    def get_job(self, job_id):
+        self.requested.append(job_id)
+        return chunk_manager_pb2.Job(state=self.states[job_id])
 
 
 def _build_orca(
@@ -810,6 +822,42 @@ def test_reconcile_running_restores_active_rank(monkeypatch):
     assert orca.reconcile_running("user_1") == 1
     assert orca._launcher.reconciled[0][0] == "job_B"
     assert [restored.rank_id for restored in orca._launcher.reconciled[0][1]] == [RANK_ID]
+
+
+@pytest.mark.parametrize(
+    ("chunk_state", "finish_reason"),
+    [
+        (chunk_manager_pb2.JOB_STATE_SUCCEEDED, None),
+        (chunk_manager_pb2.JOB_STATE_FAILED, ReasonCode.FAILED),
+        (chunk_manager_pb2.JOB_STATE_CANCELLED, ReasonCode.CANCELLED),
+    ],
+)
+def test_reconcile_chunk_jobs_finishes_terminal_batch_job(monkeypatch, chunk_state, finish_reason):
+    chunk_manager = FakeChunkManager({"job_B": chunk_state})
+    orca = _build_orca(
+        monkeypatch,
+        [],
+        job_statuses={"job_B": JobStatus.RUNNING},
+        chunk_manager=chunk_manager,
+    )
+
+    assert orca.reconcile_chunk_jobs("user_1") == 1
+    assert chunk_manager.requested == ["job_B"]
+    assert orca._jobs.job_statuses["job_B"] is JobStatus.FINISHED
+    assert orca._jobs.finish_reasons["job_B"] == finish_reason
+
+
+def test_reconcile_chunk_jobs_leaves_running_batch_job_unchanged(monkeypatch):
+    chunk_manager = FakeChunkManager({"job_B": chunk_manager_pb2.JOB_STATE_RUNNING})
+    orca = _build_orca(
+        monkeypatch,
+        [],
+        job_statuses={"job_B": JobStatus.RUNNING},
+        chunk_manager=chunk_manager,
+    )
+
+    assert orca.reconcile_chunk_jobs("user_1") == 0
+    assert orca._jobs.job_statuses["job_B"] is JobStatus.RUNNING
 
 
 def test_reconcile_finished_tears_down_active_ranks_once(monkeypatch):
