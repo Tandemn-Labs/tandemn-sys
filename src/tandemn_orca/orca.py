@@ -818,7 +818,12 @@ class Orca:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Orca against Tandemn Store plans.")
     parser.add_argument("--user-id", default=os.getenv("TANDEMN_USER_ID"))
-    parser.add_argument("--namespace", default=os.getenv("TANDEMN_K8S_NAMESPACE", "default"))
+    parser.add_argument("--namespace", default=os.getenv("TANDEMN_K8S_NAMESPACE", "dynamo-system"))
+    parser.add_argument(
+        "--batch-namespace",
+        default=os.getenv("TANDEMN_BATCH_K8S_NAMESPACE", "tandemn-system"),
+        help="Kubernetes namespace for batch workers (defaults to --namespace)",
+    )
     parser.add_argument("--router-config-dir", default=os.getenv("TANDEMN_ROUTER_CONFIG_DIR"))
     parser.add_argument("--router-binary", default=os.getenv("TANDEMN_ROUTER_BINARY"))
     parser.add_argument("--cluster-contexts", default=os.getenv("TANDEMN_CLUSTER_CONTEXTS"))
@@ -884,6 +889,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if not args.user_id:
         raise SystemExit("--user-id or TANDEMN_USER_ID is required")
+    batch_namespace = args.batch_namespace or args.namespace
     client = PostgresClient()
     refresher = CapacityRefresher(
         client,
@@ -899,21 +905,29 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.cluster_contexts:
         contexts = load_cluster_contexts(args.cluster_contexts)
-        launchers = {
-            key: DynamoLauncher(
+        launchers = {}
+        for key, context in contexts.items():
+            online_k8s = load_kube_client(args.namespace, context=context)
+            batch_k8s = (
+                online_k8s
+                if batch_namespace == args.namespace
+                else load_kube_client(batch_namespace, context=context)
+            )
+            launchers[key] = DynamoLauncher(
                 namespace=args.namespace,
-                k8s=load_kube_client(args.namespace, context=context),
+                k8s=online_k8s,
                 context=context,
                 batch_chunk_manager_address=args.chunk_manager_target,
+                batch_namespace=batch_namespace,
+                batch_k8s=batch_k8s,
             )
-            for key, context in contexts.items()
-        }
         default_cluster = None
     else:
         launchers = {
             "default": DynamoLauncher(
                 namespace=args.namespace,
                 batch_chunk_manager_address=args.chunk_manager_target,
+                batch_namespace=batch_namespace,
             )
         }
         default_cluster = "default"

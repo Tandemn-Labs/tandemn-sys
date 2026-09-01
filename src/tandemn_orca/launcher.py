@@ -104,41 +104,52 @@ class DynamoLauncher:
         k8s: DynamoKubernetesClient | None = None,
         context: str | None = None,
         batch_chunk_manager_address: str | None = None,
+        batch_namespace: str | None = None,
+        batch_k8s: DynamoKubernetesClient | None = None,
     ) -> None:
         self.namespace = namespace
         self.k8s = k8s or load_kube_client(namespace)
         self.context = context
         self.batch_chunk_manager_address = batch_chunk_manager_address
+        self.batch_namespace = batch_namespace or namespace
+        self.batch_k8s = batch_k8s or (
+            self.k8s
+            if self.batch_namespace == namespace
+            else load_kube_client(self.batch_namespace, context=context)
+        )
 
     def reconcile(
         self, job_id: str, ranks: list[Rank], *, job_kind: JobKind = JobKind.ONLINE
     ) -> None:
-        desired = (
-            compile_batch_job(
+        if job_kind is JobKind.BATCH:
+            desired = compile_batch_job(
                 job_id,
                 ranks,
-                self.namespace,
+                self.batch_namespace,
                 self.batch_chunk_manager_address,
             )
-            if job_kind is JobKind.BATCH
-            else compile_job(job_id, ranks, self.namespace)
-        )
+            k8s = self.batch_k8s
+        else:
+            desired = compile_job(job_id, ranks, self.namespace)
+            k8s = self.k8s
         desired_keys = {object_key(obj) for obj in desired}
-        stale = self.k8s.list_job_objects(job_id) - desired_keys
-        apply_error = _call(self.k8s.apply_many, desired)
+        stale = k8s.list_job_objects(job_id) - desired_keys
+        apply_error = _call(k8s.apply_many, desired)
         if apply_error:
             raise ReconcileError(apply_error, None)
-        self._delete_stale(stale)
+        self._delete_stale(k8s, stale)
 
     def teardown_job(self, job_id: str) -> None:
         self.k8s.delete_all_for_job(job_id)
+        if self.batch_k8s is not self.k8s:
+            self.batch_k8s.delete_all_for_job(job_id)
 
     def k8s_for_rank(self, rank: Rank) -> DynamoKubernetesClient:
         """Cluster client that owns this rank's objects."""
         return self.k8s
 
-    def _delete_stale(self, stale: set[ObjectKey]) -> None:
-        delete_error = _call(self.k8s.delete_many, stale)
+    def _delete_stale(self, k8s: DynamoKubernetesClient, stale: set[ObjectKey]) -> None:
+        delete_error = _call(k8s.delete_many, stale)
         if delete_error:
             raise ReconcileError(None, delete_error)
 

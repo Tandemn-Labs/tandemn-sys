@@ -6,7 +6,14 @@ from typing import Any
 
 from tandemn_system_data.models.rank import Rank
 
-from tandemn_orca.dynamo_compiler import dgd_name, labels, required, worker_gpu_count
+from tandemn_orca.compiler_common import (
+    labels,
+    rank_node_count,
+    required,
+    validate_unique_ranks,
+    worker_gpu_count,
+    workload_name,
+)
 
 BATCH_WORKER_IMAGE = "us-docker.pkg.dev/tandemn/tandemn-worker/tandemn-worker:v0.0.1-vllm0.28.0"
 VLLM_IMAGE = (
@@ -23,8 +30,7 @@ def compile_batch_job(
 ) -> list[dict[str, Any]]:
     if not chunk_manager_address:
         raise ValueError("batch jobs require a chunk-manager address")
-    if len({rank.rank_id for rank in ranks}) != len(ranks):
-        raise ValueError("duplicate rank_id")
+    validate_unique_ranks(ranks)
     return [
         render_chain(job_id, rank, chain_id, namespace, chunk_manager_address)
         for rank in ranks
@@ -39,16 +45,14 @@ def render_chain(
     namespace: str,
     chunk_manager_address: str,
 ) -> dict[str, Any]:
-    node_count = rank.shape_json.get("node_count", rank.shape_json.get("num_nodes_per_chain", 1))
-    if type(node_count) is not int or node_count < 1:
-        raise ValueError(f"rank {rank.rank_id} node_count must be a positive int")
+    node_count = rank_node_count(rank)
     gpu_count = worker_gpu_count(rank)
     if gpu_count % node_count:
         raise ValueError(
             f"rank {rank.rank_id}: count={gpu_count} does not divide evenly "
             f"across node_count={node_count}"
         )
-    name = dgd_name(job_id, f"{rank.rank_id}-{rank.plan_id or 'unplanned'}-{chain_id}")
+    name = workload_name(job_id, f"{rank.rank_id}-{rank.plan_id or 'unplanned'}-{chain_id}")
     pod_labels = {
         "tandemn.com/job-type": "batched-inference",
         "tandemn.com/job-id": job_id,

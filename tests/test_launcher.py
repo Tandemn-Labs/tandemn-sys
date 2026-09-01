@@ -105,6 +105,41 @@ def test_dynamo_launcher_compiles_batch_jobs_per_chain():
     assert [obj["kind"] for obj in k8s.applied[0]] == ["Job", "Job"]
 
 
+def test_dynamo_launcher_uses_separate_batch_namespace():
+    online = FakeK8s(namespace="online")
+    batch = FakeK8s(namespace="batch")
+    rank = _rank()
+    rank.shape_json["instance_type"] = "g2-standard-48"
+    launcher = DynamoLauncher(
+        namespace="online",
+        k8s=online,
+        batch_namespace="batch",
+        batch_k8s=batch,
+        batch_chunk_manager_address="chunk-manager:9090",
+    )
+
+    launcher.reconcile("job_online_001", [rank], job_kind=JobKind.BATCH)
+
+    assert online.applied == []
+    assert batch.applied[0][0]["metadata"]["namespace"] == "batch"
+
+
+def test_dynamo_launcher_teardown_cleans_both_namespaces():
+    online = FakeK8s(namespace="online")
+    batch = FakeK8s(namespace="batch")
+    launcher = DynamoLauncher(
+        namespace="online",
+        k8s=online,
+        batch_namespace="batch",
+        batch_k8s=batch,
+    )
+
+    launcher.teardown_job("job_1")
+
+    assert online.deleted_jobs == ["job_1"]
+    assert batch.deleted_jobs == ["job_1"]
+
+
 def test_dynamo_launcher_keeps_stale_when_apply_fails():
     k8s = FakeK8s(apply_error=RuntimeError("boom"))
 

@@ -54,12 +54,20 @@ class FakeLauncher:
     instances: ClassVar[list[FakeLauncher]] = []
 
     def __init__(
-        self, namespace: str, k8s=None, context=None, batch_chunk_manager_address=None
+        self,
+        namespace: str,
+        k8s=None,
+        context=None,
+        batch_chunk_manager_address=None,
+        batch_namespace=None,
+        batch_k8s=None,
     ) -> None:
         self.namespace = namespace
         self.k8s = k8s
         self.context = context
         self.batch_chunk_manager_address = batch_chunk_manager_address
+        self.batch_namespace = batch_namespace
+        self.batch_k8s = batch_k8s
         FakeLauncher.instances.append(self)
 
 
@@ -118,9 +126,20 @@ def _patch_runner(monkeypatch, orca_cls=FakeOrca):
 def test_main_once_uses_dynamo_launcher(monkeypatch):
     _patch_runner(monkeypatch)
 
-    mod.main(["--user-id", "default", "--namespace", "koi", "--once"])
+    mod.main(
+        [
+            "--user-id",
+            "default",
+            "--namespace",
+            "online",
+            "--batch-namespace",
+            "batch",
+            "--once",
+        ]
+    )
 
-    assert FakeLauncher.instances[0].namespace == "koi"
+    assert FakeLauncher.instances[0].namespace == "online"
+    assert FakeLauncher.instances[0].batch_namespace == "batch"
     assert FakeOrca.instances[0].client == "client"
     assert FakeOrca.instances[0].launcher is FakeMultiClusterLauncher.instances[0]
     assert FakeMultiClusterLauncher.instances[0].default_cluster == "default"
@@ -142,6 +161,7 @@ def test_main_uses_env_defaults(monkeypatch):
     _patch_runner(monkeypatch)
     monkeypatch.setenv("TANDEMN_USER_ID", "env-user")
     monkeypatch.setenv("TANDEMN_K8S_NAMESPACE", "env-ns")
+    monkeypatch.setenv("TANDEMN_BATCH_K8S_NAMESPACE", "env-batch-ns")
     monkeypatch.setenv("TANDEMN_ORCA_POLL_SECONDS", "7")
     monkeypatch.setenv("TANDEMN_AWS_REGIONS", "us-west-2,us-east-2")
     monkeypatch.setenv("TANDEMN_CAPACITY_REFRESH_SECONDS", "12")
@@ -150,6 +170,7 @@ def test_main_uses_env_defaults(monkeypatch):
 
     assert args.user_id == "env-user"
     assert args.namespace == "env-ns"
+    assert args.batch_namespace == "env-batch-ns"
     assert args.interval_seconds == 7
     assert args.aws_regions == "us-west-2,us-east-2"
     assert args.capacity_refresh_seconds == 12
@@ -202,7 +223,7 @@ def test_main_maps_cloud_regions_to_kube_contexts(monkeypatch, tmp_path):
         "eks-east",
         "gke-central",
     ]
-    assert FakeLauncher.instances[0].k8s == (("default",), {"context": "eks-east"})
+    assert FakeLauncher.instances[0].k8s == (("dynamo-system",), {"context": "eks-east"})
     assert multi.default_cluster is None
 
 
