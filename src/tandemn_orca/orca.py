@@ -70,9 +70,9 @@ from tandemn_orca.rank_health import (
     termination_reason_code,
 )
 from tandemn_orca.router_health import RankHealthPublisher
-from tandemn_orca.scripts.resource_map_from_aws import CapacityRefresher, parse_region_csv
 from tandemn_orca.tunnels import PortForwardManager, RouterProcessManager
 
+# AWS capacity refresh is disabled pending the GCP ResourceMap refresher.
 logger = logging.getLogger(__name__)
 
 ACTIVE_RANK_STATUSES = (RankStatus.LAUNCHING, RankStatus.RUNNING)
@@ -741,15 +741,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=int(os.getenv("TANDEMN_ROUTER_PORT_SPAN", "10000")),
     )
-    parser.add_argument(
-        "--aws-regions",
-        default=os.getenv("TANDEMN_AWS_REGIONS", "us-east-1,us-east-2,us-west-1,us-west-2"),
-    )
-    parser.add_argument(
-        "--capacity-refresh-seconds",
-        type=float,
-        default=float(os.getenv("TANDEMN_CAPACITY_REFRESH_SECONDS", "86400")),
-    )
+    # AWS capacity refresh is disabled pending the GCP ResourceMap refresher.
+    # parser.add_argument(
+    #     "--aws-regions",
+    #     default=os.getenv("TANDEMN_AWS_REGIONS", "us-east-1,us-east-2,us-west-1,us-west-2"),
+    # )
+    # parser.add_argument(
+    #     "--capacity-refresh-seconds",
+    #     type=float,
+    #     default=float(os.getenv("TANDEMN_CAPACITY_REFRESH_SECONDS", "86400")),
+    # )
     parser.add_argument(
         "--interval-seconds",
         type=float,
@@ -768,7 +769,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="skip the DGD-status rank health poll (leaves ranks.status at plan-apply values)",
     )
     parser.add_argument("--once", action="store_true")
-    parser.add_argument("--skip-capacity-refresh", action="store_true")
+    # parser.add_argument("--skip-capacity-refresh", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -789,17 +790,17 @@ def main(argv: list[str] | None = None) -> None:
     if not args.user_id:
         raise SystemExit("--user-id or TANDEMN_USER_ID is required")
     client = PostgresClient()
-    refresher = CapacityRefresher(
-        client,
-        args.user_id,
-        parse_region_csv(args.aws_regions),
-        refresh_seconds=args.capacity_refresh_seconds,
-    )
-    if not args.skip_capacity_refresh:
-        try:
-            refresher.refresh_if_due(force=True)
-        except Exception:
-            logger.exception("capacity refresh failed")
+    # AWS capacity refresh is disabled pending the GCP ResourceMap refresher.
+    # refresher = CapacityRefresher(
+    #     client,
+    #     args.user_id,
+    #     parse_region_csv(args.aws_regions),
+    #     refresh_seconds=args.capacity_refresh_seconds,
+    # )
+    # try:
+    #     refresher.refresh_if_due(force=True)
+    # except Exception:
+    #     logger.exception("capacity refresh failed")
 
     if args.cluster_contexts:
         contexts = load_cluster_contexts(args.cluster_contexts)
@@ -872,11 +873,11 @@ def main(argv: list[str] | None = None) -> None:
             return
         while True:
             time.sleep(args.interval_seconds)
-            if not args.skip_capacity_refresh:
-                try:
-                    refresher.refresh_if_due()
-                except Exception:
-                    logger.exception("capacity refresh failed")
+            # AWS capacity refresh is disabled pending the GCP ResourceMap refresher.
+            # try:
+            #     refresher.refresh_if_due()
+            # except Exception:
+            #     logger.exception("capacity refresh failed")
             try:
                 applied = orca.apply_pending(args.user_id)
                 logger.info("applied %s plan(s) for user %s", applied, args.user_id)
