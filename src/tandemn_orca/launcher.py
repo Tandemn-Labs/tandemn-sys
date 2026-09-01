@@ -20,8 +20,10 @@ from pathlib import Path
 from typing import Protocol
 
 from tandemn_system_data.clients import ModelCatalogStore
+from tandemn_system_data.models.enums import JobKind
 from tandemn_system_data.models.rank import Rank
 
+from tandemn_orca.batch_compiler import compile_batch_job
 from tandemn_orca.dynamo_compiler import (
     compile_job,
     pool_dgd_name,
@@ -41,7 +43,9 @@ logger = logging.getLogger(__name__)
 class Launcher(Protocol):
     """Reconciles job infrastructure to match Orca's Rank rows."""
 
-    def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
+    def reconcile(
+        self, job_id: str, ranks: list[Rank], *, job_kind: JobKind = JobKind.ONLINE
+    ) -> None:
         """Make infrastructure match the desired ranks for one job."""
         ...
 
@@ -77,7 +81,9 @@ class NoopLauncher:
     (tests, dry runs); production uses DynamoLauncher.
     """
 
-    def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
+    def reconcile(
+        self, job_id: str, ranks: list[Rank], *, job_kind: JobKind = JobKind.ONLINE
+    ) -> None:
         for rank in ranks:
             logger.info(
                 "noop reconcile: job=%s rank=%s role=%s shape=%s",
@@ -97,13 +103,26 @@ class DynamoLauncher:
         namespace: str = "default",
         k8s: DynamoKubernetesClient | None = None,
         context: str | None = None,
+        batch_chunk_manager_address: str | None = None,
     ) -> None:
         self.namespace = namespace
         self.k8s = k8s or load_kube_client(namespace)
         self.context = context
+        self.batch_chunk_manager_address = batch_chunk_manager_address
 
-    def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
-        desired = compile_job(job_id, ranks, self.namespace)
+    def reconcile(
+        self, job_id: str, ranks: list[Rank], *, job_kind: JobKind = JobKind.ONLINE
+    ) -> None:
+        desired = (
+            compile_batch_job(
+                job_id,
+                ranks,
+                self.namespace,
+                self.batch_chunk_manager_address,
+            )
+            if job_kind is JobKind.BATCH
+            else compile_job(job_id, ranks, self.namespace)
+        )
         desired_keys = {object_key(obj) for obj in desired}
         stale = self.k8s.list_job_objects(job_id) - desired_keys
         apply_error = _call(self.k8s.apply_many, desired)
@@ -150,7 +169,9 @@ class MultiClusterLauncher:
         self.tunnels = tunnels
         self.routers = routers
 
-    def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
+    def reconcile(
+        self, job_id: str, ranks: list[Rank], *, job_kind: JobKind = JobKind.ONLINE
+    ) -> None:
         groups: dict[str, list[Rank]] = {key: [] for key in self.launchers}
         for rank in ranks:
             key = self.default_cluster or _rank_cluster_key(rank)
@@ -160,13 +181,13 @@ class MultiClusterLauncher:
 
         router_config = None
         ports: dict[str, int] = {}
-        if self.router_config_dir is not None:
+        if job_kind is JobKind.ONLINE and self.router_config_dir is not None:
             max_num_seq = _max_num_seq_by_rank(ranks, self.model_catalogs)
             ports = _ports_by_rank(ranks, self.router_port_base, self.router_port_span)
             router_config = render_router_config(job_id, ranks, max_num_seq, ports)
 
         for key, launcher in self.launchers.items():
-            launcher.reconcile(job_id, groups[key])
+            launcher.reconcile(job_id, groups[key], job_kind=job_kind)
 
         if router_config is not None:
             assert self.router_config_dir is not None

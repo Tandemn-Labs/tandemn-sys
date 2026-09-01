@@ -167,10 +167,12 @@ class FakeEventLog:
 class FakeLauncher:
     def __init__(self) -> None:
         self.reconciled: list[tuple[str, list[Rank]]] = []
+        self.job_kinds: list[JobKind] = []
         self.torn_down_jobs: list[str] = []
 
-    def reconcile(self, job_id, ranks):
+    def reconcile(self, job_id, ranks, *, job_kind=JobKind.ONLINE):
         self.reconciled.append((job_id, list(ranks)))
+        self.job_kinds.append(job_kind)
 
     def teardown_job(self, job_id):
         self.torn_down_jobs.append(job_id)
@@ -371,6 +373,7 @@ def test_place_transitions_and_launches(monkeypatch):
     # rows recorded in the store AND workers brought up via the launcher
     assert len(orca._jobs.launched) == 1
     assert len(orca._launcher.reconciled) == 1
+    assert orca._launcher.job_kinds == [JobKind.BATCH]
     assert orca._launcher.reconciled[0][0] == "job_B"
     assert len(orca._launcher.reconciled[0][1]) == 1
     assert orca._jobs.launched[0].shape_json["target_p99_ttft_ms"] == 500.0
@@ -567,7 +570,7 @@ def test_swap_failure_restores_reused_rank_and_fails_only_new_rank(monkeypatch):
     )
     orca = _build_orca(monkeypatch, [plan], active=[reused_rank])
 
-    def fail_reconcile(job_id, ranks):
+    def fail_reconcile(job_id, ranks, **kwargs):
         raise RuntimeError("boom")
 
     orca._launcher.reconcile = fail_reconcile
@@ -588,7 +591,7 @@ def test_place_failure_restores_previous_job_status(monkeypatch, previous_status
     )
     orca = _build_orca(monkeypatch, [plan], job_statuses={"job_B": previous_status})
 
-    def fail_reconcile(job_id, ranks):
+    def fail_reconcile(job_id, ranks, **kwargs):
         raise RuntimeError("boom")
 
     orca._launcher.reconcile = fail_reconcile
@@ -609,7 +612,7 @@ def test_launch_failure_emits_rank_failed(monkeypatch):
     )
     orca = _build_orca(monkeypatch, [plan])
 
-    def fail_reconcile(job_id, ranks):
+    def fail_reconcile(job_id, ranks, **kwargs):
         raise RuntimeError("launcher unavailable")
 
     orca._launcher.reconcile = fail_reconcile
@@ -637,7 +640,7 @@ def test_place_catalog_failure_finishes_job_with_visible_error(monkeypatch):
     orca = _build_orca(monkeypatch, [plan])
     message = "ModelCatalog 'model' field 'max_num_seq' is missing for gpu_type 'L40S'"
 
-    def fail_catalog(*_):
+    def fail_catalog(*_, **__):
         raise ModelCatalogError(message)
 
     orca._launcher.reconcile = fail_catalog
@@ -676,7 +679,7 @@ def test_swap_catalog_failure_keeps_running_job_and_records_error(monkeypatch):
     orca = _build_orca(monkeypatch, [plan], active=[old_rank])
     message = "ModelCatalog 'model' is missing"
 
-    def fail_catalog(*_):
+    def fail_catalog(*_, **__):
         raise ModelCatalogError(message)
 
     orca._launcher.reconcile = fail_catalog
@@ -999,10 +1002,10 @@ def test_bad_action_does_not_wedge_the_plan(monkeypatch):
     orca = _build_orca(monkeypatch, [plan])
     original = orca._launcher.reconcile
 
-    def explode_for_bad_job(job_id, ranks):
+    def explode_for_bad_job(job_id, ranks, **kwargs):
         if job_id == "job_bad":
             raise RuntimeError("boom")
-        original(job_id, ranks)
+        original(job_id, ranks, **kwargs)
 
     orca._launcher.reconcile = explode_for_bad_job
 

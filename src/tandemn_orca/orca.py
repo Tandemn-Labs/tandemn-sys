@@ -251,6 +251,8 @@ class Orca:
         results: list[RankHealth] = []
         active_rank_ids: set[str] = set()
         for running in self._jobs.running_jobs(user_id):
+            if running.job.kind is JobKind.BATCH:
+                continue
             job_id = running.job.job_id
             # One DGD list per cluster, not per rank: a job's ranks may span
             # kube contexts but usually share one.
@@ -484,7 +486,7 @@ class Orca:
             ]
             if ranks:
                 self._add_chain_associations(ranks)
-                self._launcher.reconcile(running.job.job_id, ranks)
+                self._launcher.reconcile(running.job.job_id, ranks, job_kind=running.job.kind)
                 reconciled += 1
         return reconciled
 
@@ -543,7 +545,8 @@ class Orca:
             )
         )
         try:
-            self._launch_ranks(plan, action.job_id, ranks)
+            assert job is not None
+            self._launch_ranks(plan, action.job_id, ranks, job.kind)
         except ModelCatalogError as exc:
             finished = self._jobs.fail(
                 action.job_id,
@@ -645,7 +648,7 @@ class Orca:
             for rank in ranks
         ]
         try:
-            recorded = self._launch_ranks(plan, action.job_id, ranks, old_by_id)
+            recorded = self._launch_ranks(plan, action.job_id, ranks, job.kind, old_by_id)
         except ModelCatalogError as exc:
             self._jobs.set_error(action.job_id, str(exc))
             raise
@@ -692,6 +695,7 @@ class Orca:
         plan: Plan,
         job_id: str,
         ranks: list[Rank],
+        job_kind: JobKind,
         previous: dict[str, Rank] | None = None,
     ) -> list[Rank]:
         previous = previous or {}
@@ -717,7 +721,7 @@ class Orca:
             )
         try:
             self._add_chain_associations(recorded)
-            self._launcher.reconcile(job_id, recorded)
+            self._launcher.reconcile(job_id, recorded, job_kind=job_kind)
         except Exception as exc:
             try:
                 reused = [previous[rank.rank_id] for rank in recorded if rank.rank_id in previous]
@@ -900,12 +904,18 @@ def main(argv: list[str] | None = None) -> None:
                 namespace=args.namespace,
                 k8s=load_kube_client(args.namespace, context=context),
                 context=context,
+                batch_chunk_manager_address=args.chunk_manager_target,
             )
             for key, context in contexts.items()
         }
         default_cluster = None
     else:
-        launchers = {"default": DynamoLauncher(namespace=args.namespace)}
+        launchers = {
+            "default": DynamoLauncher(
+                namespace=args.namespace,
+                batch_chunk_manager_address=args.chunk_manager_target,
+            )
+        }
         default_cluster = "default"
     tunnel_manager = PortForwardManager() if args.router_config_dir else None
     router_manager = None

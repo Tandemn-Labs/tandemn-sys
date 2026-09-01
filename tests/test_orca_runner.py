@@ -53,10 +53,13 @@ class FailingOnceOrca(FakeOrca):
 class FakeLauncher:
     instances: ClassVar[list[FakeLauncher]] = []
 
-    def __init__(self, namespace: str, k8s=None, context=None) -> None:
+    def __init__(
+        self, namespace: str, k8s=None, context=None, batch_chunk_manager_address=None
+    ) -> None:
         self.namespace = namespace
         self.k8s = k8s
         self.context = context
+        self.batch_chunk_manager_address = batch_chunk_manager_address
         FakeLauncher.instances.append(self)
 
 

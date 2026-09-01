@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from kubernetes.client.rest import ApiException
 
 from tandemn_orca.dynamo_kubernetes import (
@@ -7,6 +9,9 @@ from tandemn_orca.dynamo_kubernetes import (
     DGD_PLURAL,
     FIELD_MANAGER,
     GROUP,
+    LWS_GROUP,
+    LWS_PLURAL,
+    LWS_VERSION,
     REQUEST_TIMEOUT_SECONDS,
     VERSION,
     DynamoKubernetesClient,
@@ -30,13 +35,33 @@ class FakeCustom:
         self.deleted: list[tuple] = []
 
     def list_namespaced_custom_object(self, *args, **kwargs):
-        self.selector = (args, kwargs)
-        return {"items": [{"metadata": {"name": "dgd"}}]}
+        self.selectors = getattr(self, "selectors", [])
+        self.selectors.append((args, kwargs))
+        return {"items": [{"metadata": {"name": "dgd"}}] if args[3] == DGD_PLURAL else []}
 
     def patch_namespaced_custom_object(self, *args, **kwargs):
         self.applied.append((args, kwargs))
 
     def delete_namespaced_custom_object(self, *args, **kwargs):
+        self.deleted.append((args, kwargs))
+
+
+class FakeBatch:
+    def __init__(self, names=()) -> None:
+        self.names = names
+        self.applied: list[tuple] = []
+        self.deleted: list[tuple] = []
+
+    def list_namespaced_job(self, *args, **kwargs):
+        self.selector = (args, kwargs)
+        return SimpleNamespace(
+            items=[SimpleNamespace(metadata=SimpleNamespace(name=name)) for name in self.names]
+        )
+
+    def patch_namespaced_job(self, *args, **kwargs):
+        self.applied.append((args, kwargs))
+
+    def delete_namespaced_job(self, *args, **kwargs):
         self.deleted.append((args, kwargs))
 
 
@@ -47,16 +72,21 @@ def test_object_key_and_selector():
 
 def test_list_job_objects_reads_dgds():
     custom = FakeCustom()
-    client = DynamoKubernetesClient("ns", custom=custom)
+    batch = FakeBatch(["batch"])
+    client = DynamoKubernetesClient("ns", custom=custom, batch=batch)
 
-    assert client.list_job_objects("job_1") == {("DynamoGraphDeployment", "dgd")}
-    assert custom.selector == (
+    assert client.list_job_objects("job_1") == {
+        ("DynamoGraphDeployment", "dgd"),
+        ("Job", "batch"),
+    }
+    assert custom.selectors[0] == (
         (GROUP, VERSION, "ns", DGD_PLURAL),
         {
             "label_selector": "tandemn.com/managed-by=orca,tandemn.com/job-id=job_1",
             "_request_timeout": REQUEST_TIMEOUT_SECONDS,
         },
     )
+    assert custom.selectors[1][0] == (LWS_GROUP, LWS_VERSION, "ns", LWS_PLURAL)
 
 
 def test_apply_many_uses_server_side_apply():
@@ -77,6 +107,30 @@ def test_apply_many_uses_server_side_apply():
     ]
 
 
+def test_apply_supports_job_and_lws():
+    custom = FakeCustom()
+    batch = FakeBatch()
+    client = DynamoKubernetesClient("ns", custom=custom, batch=batch)
+    job = {"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": "batch"}}
+    lws = {
+        "apiVersion": "leaderworkerset.x-k8s.io/v1",
+        "kind": "LeaderWorkerSet",
+        "metadata": {"name": "multinode"},
+    }
+
+    client.apply_many([job, lws])
+
+    assert batch.applied[0][0] == ("batch", "ns", job)
+    assert custom.applied[0][0] == (
+        LWS_GROUP,
+        LWS_VERSION,
+        "ns",
+        LWS_PLURAL,
+        "multinode",
+        lws,
+    )
+
+
 def test_delete_many_deletes_dgds():
     custom = FakeCustom()
     client = DynamoKubernetesClient("ns", custom=custom)
@@ -89,6 +143,23 @@ def test_delete_many_deletes_dgds():
             {"_request_timeout": REQUEST_TIMEOUT_SECONDS},
         )
     ]
+
+
+def test_delete_many_supports_job_and_lws():
+    custom = FakeCustom()
+    batch = FakeBatch()
+    client = DynamoKubernetesClient("ns", custom=custom, batch=batch)
+
+    client.delete_many({("Job", "batch"), ("LeaderWorkerSet", "multinode")})
+
+    assert batch.deleted[0][0] == ("batch", "ns")
+    assert custom.deleted[0][0] == (
+        LWS_GROUP,
+        LWS_VERSION,
+        "ns",
+        LWS_PLURAL,
+        "multinode",
+    )
 
 
 def test_delete_ignores_not_found():
@@ -137,12 +208,17 @@ def test_load_kube_client_uses_explicit_context(monkeypatch):
         "tandemn_orca.dynamo_kubernetes.client.CoreV1Api",
         lambda loaded: ("core", loaded),
     )
+    monkeypatch.setattr(
+        "tandemn_orca.dynamo_kubernetes.client.BatchV1Api",
+        lambda loaded: ("batch", loaded),
+    )
 
     loaded = load_kube_client("serving", context="cloud-region")
 
     assert loaded.namespace == "serving"
     assert loaded.custom == ("custom", api_client)
     assert loaded.core == ("core", api_client)
+    assert loaded.batch == ("batch", api_client)
 
 
 def test_job_dgds_keeps_status():
@@ -150,7 +226,7 @@ def test_job_dgds_keeps_status():
 
     class StatusCustom(FakeCustom):
         def list_namespaced_custom_object(self, *args, **kwargs):
-            self.selector = (args, kwargs)
+            self.selectors = [(args, kwargs)]
             return {
                 "items": [
                     {"metadata": {"name": "dgd"}, "status": {"state": "successful"}},

@@ -4,7 +4,7 @@ import json
 
 import pytest
 from tandemn_system_data.models import ModelCatalog
-from tandemn_system_data.models.enums import RankRole
+from tandemn_system_data.models.enums import JobKind, RankRole
 from tandemn_system_data.models.rank import Rank
 
 from tandemn_orca.launcher import (
@@ -93,6 +93,18 @@ def test_dynamo_launcher_applies_desired_and_deletes_stale():
     assert k8s.deleted == [{("DynamoGraphDeployment", "job-online-001-aggregate-old")}]
 
 
+def test_dynamo_launcher_compiles_batch_jobs_per_chain():
+    k8s = FakeK8s()
+    rank = _rank().model_copy(update={"n_replicas": 2})
+    rank.shape_json["instance_type"] = "g2-standard-48"
+
+    DynamoLauncher(k8s=k8s, batch_chunk_manager_address="chunk-manager:9090").reconcile(
+        "job_online_001", [rank], job_kind=JobKind.BATCH
+    )
+
+    assert [obj["kind"] for obj in k8s.applied[0]] == ["Job", "Job"]
+
+
 def test_dynamo_launcher_keeps_stale_when_apply_fails():
     k8s = FakeK8s(apply_error=RuntimeError("boom"))
 
@@ -159,6 +171,31 @@ def test_dynamo_launcher_writes_and_deletes_local_router_config(tmp_path):
     assert workload.deleted_jobs == ["job_online_001"]
     assert not config_path.exists()
     assert routers.calls[-1] == ("job_online_001", None)
+
+
+def test_batch_job_does_not_create_router_config(tmp_path):
+    workload = FakeK8s()
+    rank = _rank()
+    rank.shape_json["instance_type"] = "g2-standard-48"
+    routers = FakeRouters()
+    launcher = MultiClusterLauncher(
+        {
+            "default": DynamoLauncher(
+                k8s=workload,
+                batch_chunk_manager_address="chunk-manager:9090",
+            )
+        },
+        router_config_dir=str(tmp_path),
+        model_catalogs=FakeCatalogs(),
+        default_cluster="default",
+        routers=routers,
+    )
+
+    launcher.reconcile("job_online_001", [rank], job_kind=JobKind.BATCH)
+
+    assert [obj["kind"] for obj in workload.applied[0]] == ["Job"]
+    assert routers.calls == []
+    assert not (tmp_path / "job_online_001.json").exists()
 
 
 def test_dynamo_launcher_does_not_write_config_when_apply_fails(tmp_path):

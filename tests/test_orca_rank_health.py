@@ -10,7 +10,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from tandemn_system_data.models.enums import RankRole, RankStatus, ReasonCode
+from tandemn_system_data.models.enums import JobKind, RankRole, RankStatus, ReasonCode
 from tandemn_system_data.models.rank import Rank
 
 import tandemn_orca.orca as orca_mod
@@ -58,7 +58,11 @@ class FakeJobStore:
         self.writes: list[tuple[str, RankStatus, list[RankStatus], str | None]] = []
 
     def running_jobs(self, user_id):
-        return [SimpleNamespace(job=SimpleNamespace(job_id=JOB_ID), ranks=[self.rank])]
+        return [
+            SimpleNamespace(
+                job=SimpleNamespace(job_id=JOB_ID, kind=JobKind.ONLINE), ranks=[self.rank]
+            )
+        ]
 
     def set_rank_status(self, rank_id, to, expected, *, reason_code=None):
         self.writes.append((rank_id, to, list(expected), reason_code))
@@ -98,7 +102,7 @@ class FakeLauncher:
     def k8s_for_rank(self, rank):
         return self.k8s
 
-    def reconcile(self, job_id, ranks):  # pragma: no cover - unused here
+    def reconcile(self, job_id, ranks, **kwargs):  # pragma: no cover - unused here
         pass
 
     def teardown_job(self, job_id):  # pragma: no cover - unused here
@@ -123,6 +127,18 @@ def test_serving_promotes_a_launching_rank(monkeypatch):
 
     assert [item.verdict for item in health] == [Verdict.SERVING]
     assert store.writes == [(RANK_ID, RankStatus.RUNNING, [RankStatus.LAUNCHING], None)]
+
+
+def test_batch_rank_skips_dgd_health(monkeypatch):
+    store = FakeJobStore(_rank(RankStatus.LAUNCHING))
+    store.running_jobs = lambda user_id: [
+        SimpleNamespace(job=SimpleNamespace(job_id=JOB_ID, kind=JobKind.BATCH), ranks=[store.rank])
+    ]
+    k8s = FakeK8s([])
+    orca = _orca(monkeypatch, store, k8s)
+
+    assert orca.reconcile_rank_health(USER_ID) == []
+    assert store.writes == []
 
 
 def test_serving_emits_rank_running_once(monkeypatch):
