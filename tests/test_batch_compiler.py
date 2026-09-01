@@ -43,6 +43,7 @@ def test_compile_single_node_job_per_chain():
     container = pod["containers"][0]
     assert pod["nodeSelector"] == {"cloud.google.com/gke-nodepool": "g2-standard-48"}
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "4"
+    assert container["readinessProbe"]["httpGet"] == {"path": "/health", "port": "vllm"}
     assert _env(container) == {
         "TD_VLLM_MODEL": "microsoft/phi-4",
         "TD_VLLM_HOST": "0.0.0.0",

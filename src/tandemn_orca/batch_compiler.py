@@ -77,6 +77,11 @@ def render_chain(
             {"name": "metrics", "containerPort": 9000},
             {"name": "vllm", "containerPort": 8000},
         ],
+        "readinessProbe": {
+            "httpGet": {"path": "/health", "port": "vllm"},
+            "periodSeconds": 10,
+            "timeoutSeconds": 2,
+        },
         "volumeMounts": [{"name": "dshm", "mountPath": "/dev/shm"}],
     }
     gpus_per_node = gpu_count // node_count

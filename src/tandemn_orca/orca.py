@@ -63,6 +63,7 @@ from tandemn_system_data.models.rank import Rank
 
 from tandemn.chunkmanager.v1 import chunk_manager_pb2
 from tandemn_orca.chunk_manager import ChunkManagerClient
+from tandemn_orca.compiler_common import rank_node_count
 from tandemn_orca.dynamo_kubernetes import load_kube_client
 from tandemn_orca.launcher import (
     DynamoLauncher,
@@ -74,6 +75,7 @@ from tandemn_orca.launcher import (
 from tandemn_orca.rank_health import (
     RankHealth,
     Verdict,
+    batch_rank_health,
     dgd_by_rank_id,
     rank_health,
     termination_reason_code,
@@ -251,8 +253,6 @@ class Orca:
         results: list[RankHealth] = []
         active_rank_ids: set[str] = set()
         for running in self._jobs.running_jobs(user_id):
-            if running.job.kind is JobKind.BATCH:
-                continue
             job_id = running.job.job_id
             # One DGD list per cluster, not per rank: a job's ranks may span
             # kube contexts but usually share one.
@@ -269,13 +269,41 @@ class Orca:
                     reason_code=allocation.reason_code,
                 )
                 try:
-                    k8s = k8s_for_rank(rank)
+                    k8s = k8s_for_rank(rank, job_kind=running.job.kind)
                 except ValueError:
                     logger.exception("no cluster client for rank %s", rank.rank_id)
                     continue
                 by_cluster.setdefault(id(k8s), (k8s, []))[1].append(rank)
 
             for k8s, ranks in by_cluster.values():
+                if running.job.kind is JobKind.BATCH:
+                    for rank in ranks:
+                        active_rank_ids.add(rank.rank_id)
+                        try:
+                            pods = k8s.rank_pods(job_id, rank.rank_id)
+                        except Exception:
+                            logger.exception(
+                                "batch pod status read failed for rank %s", rank.rank_id
+                            )
+                            continue
+                        self._apply_rank_health(
+                            user_id,
+                            k8s,
+                            rank,
+                            batch_rank_health(
+                                job_id,
+                                rank.rank_id,
+                                pods,
+                                expected_replicas=rank.n_replicas,
+                                nodes_per_chain=rank_node_count(rank),
+                                plan_id=rank.plan_id,
+                                ever_served=(
+                                    rank.status is RankStatus.RUNNING
+                                    or rank.rank_id in self._served_rank_ids
+                                ),
+                            ),
+                        )
+                    continue
                 try:
                     deployments = dgd_by_rank_id(k8s.job_dgds(job_id))
                 except Exception:

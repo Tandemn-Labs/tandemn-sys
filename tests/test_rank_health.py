@@ -11,6 +11,7 @@ from tandemn_system_data.models.enums import ReasonCode
 
 from tandemn_orca.rank_health import (
     Verdict,
+    batch_rank_health,
     dgd_by_rank_id,
     rank_health,
     serving_replicas,
@@ -53,6 +54,21 @@ def _dgd(
             "labels": {"tandemn.com/rank-id": RANK_ID},
         },
         "status": status,
+    }
+
+
+def _pod(chain: int, *, ready: bool = False, failed: bool = False, plan: str = "plan-1") -> dict:
+    return {
+        "metadata": {
+            "labels": {
+                "tandemn.com/chain-id": str(chain),
+                "tandemn.com/plan-id": plan,
+            }
+        },
+        "status": {
+            "phase": "Failed" if failed else "Running",
+            "conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+        },
     }
 
 
@@ -164,6 +180,65 @@ def test_dead_local_router_is_down_despite_ready_workers():
 def test_absent_local_router_entry_does_not_veto():
     health = rank_health(JOB_ID, RANK_ID, _dgd(worker=1, router=None))
     assert health.verdict is Verdict.SERVING
+
+
+# ----- batch pods -------------------------------------------------------------
+
+
+def test_batch_counts_only_fully_ready_chains():
+    health = batch_rank_health(
+        JOB_ID,
+        RANK_ID,
+        [_pod(0, ready=True), _pod(0, ready=True), _pod(1, ready=True), _pod(1)],
+        expected_replicas=2,
+        nodes_per_chain=2,
+        plan_id="plan-1",
+    )
+
+    assert health.verdict is Verdict.SERVING
+    assert health.serving_replicas == 1
+
+
+def test_batch_ignores_pods_from_old_plan():
+    health = batch_rank_health(
+        JOB_ID,
+        RANK_ID,
+        [_pod(0, ready=True, plan="old-plan")],
+        expected_replicas=1,
+        nodes_per_chain=1,
+        plan_id="plan-1",
+    )
+
+    assert health.verdict is Verdict.UNKNOWN
+
+
+def test_batch_all_failed_is_down():
+    health = batch_rank_health(
+        JOB_ID,
+        RANK_ID,
+        [_pod(0, failed=True), _pod(1, failed=True)],
+        expected_replicas=2,
+        nodes_per_chain=1,
+        plan_id="plan-1",
+    )
+
+    assert health.verdict is Verdict.DOWN
+    assert health.reason_code == ReasonCode.PROCESS_CRASH
+
+
+def test_batch_zero_ready_after_serving_is_down():
+    health = batch_rank_health(
+        JOB_ID,
+        RANK_ID,
+        [_pod(0)],
+        expected_replicas=1,
+        nodes_per_chain=1,
+        plan_id="plan-1",
+        ever_served=True,
+    )
+
+    assert health.verdict is Verdict.DOWN
+    assert health.reason_code == ReasonCode.HEARTBEAT_TIMEOUT
 
 
 # ----- helpers ---------------------------------------------------------------

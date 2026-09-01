@@ -144,9 +144,11 @@ class DynamoLauncher:
         if self.batch_k8s is not self.k8s:
             self.batch_k8s.delete_all_for_job(job_id)
 
-    def k8s_for_rank(self, rank: Rank) -> DynamoKubernetesClient:
+    def k8s_for_rank(
+        self, rank: Rank, *, job_kind: JobKind = JobKind.ONLINE
+    ) -> DynamoKubernetesClient:
         """Cluster client that owns this rank's objects."""
-        return self.k8s
+        return self.batch_k8s if job_kind is JobKind.BATCH else self.k8s
 
     def _delete_stale(self, k8s: DynamoKubernetesClient, stale: set[ObjectKey]) -> None:
         delete_error = _call(k8s.delete_many, stale)
@@ -232,13 +234,15 @@ class MultiClusterLauncher:
                         ports[rank.rank_id],
                     )
 
-    def k8s_for_rank(self, rank: Rank) -> DynamoKubernetesClient:
+    def k8s_for_rank(
+        self, rank: Rank, *, job_kind: JobKind = JobKind.ONLINE
+    ) -> DynamoKubernetesClient:
         """Cluster client that owns this rank's objects."""
         key = self.default_cluster or _rank_cluster_key(rank)
         launcher = self.launchers.get(key)
         if launcher is None:
             raise ValueError(f"no kube context configured for rank environment {key!r}")
-        return launcher.k8s
+        return launcher.k8s_for_rank(rank, job_kind=job_kind)
 
     def teardown_job(self, job_id: str) -> None:
         for launcher in self.launchers.values():
