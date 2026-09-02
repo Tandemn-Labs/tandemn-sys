@@ -27,12 +27,22 @@ def compile_batch_job(
     ranks: list[Rank],
     namespace: str,
     chunk_manager_address: str | None,
+    worker_secret: str | None = None,
+    aws_region: str | None = None,
 ) -> list[dict[str, Any]]:
     if not chunk_manager_address:
         raise ValueError("batch jobs require a chunk-manager address")
     validate_unique_ranks(ranks)
     return [
-        render_chain(job_id, rank, chain_id, namespace, chunk_manager_address)
+        render_chain(
+            job_id,
+            rank,
+            chain_id,
+            namespace,
+            chunk_manager_address,
+            worker_secret,
+            aws_region,
+        )
         for rank in ranks
         for chain_id in range(rank.n_replicas)
     ]
@@ -44,6 +54,8 @@ def render_chain(
     chain_id: int,
     namespace: str,
     chunk_manager_address: str,
+    worker_secret: str | None,
+    aws_region: str | None,
 ) -> dict[str, Any]:
     node_count = rank_node_count(rank)
     gpu_count = worker_gpu_count(rank)
@@ -55,6 +67,7 @@ def render_chain(
     name = workload_name(job_id, f"{rank.rank_id}-{rank.plan_id or 'unplanned'}-{chain_id}")
     pod_labels = {
         "tandemn.com/job-type": "batched-inference",
+        "tandemn.com/pods-discovery": "batch-worker",
         "tandemn.com/job-id": job_id,
         "tandemn.com/rank-id": rank.rank_id,
         "tandemn.com/chain-id": str(chain_id),
@@ -72,7 +85,7 @@ def render_chain(
         "name": "tandemn-worker",
         "image": BATCH_WORKER_IMAGE,
         "imagePullPolicy": "IfNotPresent",
-        "env": _leader_env(rank, chain_id, chunk_manager_address, node_count),
+        "env": _leader_env(rank, chain_id, chunk_manager_address, node_count, aws_region),
         "ports": [
             {"name": "metrics", "containerPort": 9000},
             {"name": "vllm", "containerPort": 8000},
@@ -84,6 +97,8 @@ def render_chain(
         },
         "volumeMounts": [{"name": "dshm", "mountPath": "/dev/shm"}],
     }
+    if worker_secret:
+        common["envFrom"] = [{"secretRef": {"name": worker_secret, "optional": False}}]
     gpus_per_node = gpu_count // node_count
     if node_count == 1:
         common["resources"] = _resources(gpus_per_node, memory=True)
@@ -156,7 +171,11 @@ def render_chain(
 
 
 def _leader_env(
-    rank: Rank, chain_id: int, chunk_manager_address: str, node_count: int
+    rank: Rank,
+    chain_id: int,
+    chunk_manager_address: str,
+    node_count: int,
+    aws_region: str | None,
 ) -> list[dict[str, Any]]:
     args = _parallel_args(rank)
     if node_count > 1:
@@ -164,7 +183,7 @@ def _leader_env(
             " --nnodes $(LWS_GROUP_SIZE) --node-rank $(LWS_WORKER_INDEX) "
             "--master-addr $(LWS_LEADER_ADDRESS)"
         )
-    return [
+    env = [
         {"name": "TD_VLLM_MODEL", "value": required(rank.shape_json, "model_id")},
         {"name": "TD_VLLM_HOST", "value": "0.0.0.0"},
         {"name": "TD_VLLM_EXTRA_ARGS", "value": args},
@@ -173,6 +192,9 @@ def _leader_env(
         {"name": "TD_RANK_ID", "value": rank.rank_id.removeprefix("rank_")},
         {"name": "TD_CHAIN_ID", "value": str(chain_id)},
     ]
+    if aws_region:
+        env.append({"name": "AWS_DEFAULT_REGION", "value": aws_region})
+    return env
 
 
 def _parallel_args(rank: Rank) -> str:

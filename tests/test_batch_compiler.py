@@ -33,6 +33,10 @@ def test_compile_single_node_job_per_chain():
     objects = compile_batch_job(JOB_ID, [_rank()], "tandemn-system", "chunk-manager:9090")
 
     assert [obj["kind"] for obj in objects] == ["Job", "Job"]
+    assert (
+        objects[0]["spec"]["template"]["metadata"]["labels"]["tandemn.com/pods-discovery"]
+        == "batch-worker"
+    )
     assert {
         obj["spec"]["template"]["metadata"]["labels"]["tandemn.com/chain-id"] for obj in objects
     } == {
@@ -67,6 +71,12 @@ def test_compile_multinode_lws_per_chain():
     assert lws["leaderWorkerTemplate"]["size"] == 2
     leader = lws["leaderWorkerTemplate"]["leaderTemplate"]["spec"]["containers"][0]
     worker = lws["leaderWorkerTemplate"]["workerTemplate"]["spec"]["containers"][0]
+    assert (
+        lws["leaderWorkerTemplate"]["workerTemplate"]["metadata"]["labels"][
+            "tandemn.com/pods-discovery"
+        ]
+        == "batch-worker"
+    )
     assert leader["resources"]["limits"]["nvidia.com/gpu"] == "2"
     assert worker["resources"]["limits"]["nvidia.com/gpu"] == "2"
     assert "--nnodes $(LWS_GROUP_SIZE)" in _env(leader)["TD_VLLM_EXTRA_ARGS"]
@@ -84,3 +94,20 @@ def test_batch_workload_name_changes_with_plan():
     )[0]
 
     assert first["metadata"]["name"] != second["metadata"]["name"]
+
+
+def test_batch_worker_accepts_secret_and_aws_region():
+    job = compile_batch_job(
+        JOB_ID,
+        [_rank(replicas=1)],
+        "ns",
+        "chunk-manager:9090",
+        worker_secret="tandemn-worker-secrets",
+        aws_region="us-east-2",
+    )[0]
+    container = job["spec"]["template"]["spec"]["containers"][0]
+
+    assert container["envFrom"] == [
+        {"secretRef": {"name": "tandemn-worker-secrets", "optional": False}}
+    ]
+    assert _env(container)["AWS_DEFAULT_REGION"] == "us-east-2"

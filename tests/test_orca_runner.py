@@ -61,6 +61,8 @@ class FakeLauncher:
         batch_chunk_manager_address=None,
         batch_namespace=None,
         batch_k8s=None,
+        batch_worker_secret=None,
+        batch_aws_region=None,
     ) -> None:
         self.namespace = namespace
         self.k8s = k8s
@@ -68,6 +70,8 @@ class FakeLauncher:
         self.batch_chunk_manager_address = batch_chunk_manager_address
         self.batch_namespace = batch_namespace
         self.batch_k8s = batch_k8s
+        self.batch_worker_secret = batch_worker_secret
+        self.batch_aws_region = batch_aws_region
         FakeLauncher.instances.append(self)
 
 
@@ -134,12 +138,18 @@ def test_main_once_uses_dynamo_launcher(monkeypatch):
             "online",
             "--batch-namespace",
             "batch",
+            "--batch-worker-secret",
+            "tandemn-worker-secrets",
+            "--batch-aws-region",
+            "us-east-2",
             "--once",
         ]
     )
 
     assert FakeLauncher.instances[0].namespace == "online"
     assert FakeLauncher.instances[0].batch_namespace == "batch"
+    assert FakeLauncher.instances[0].batch_worker_secret == "tandemn-worker-secrets"
+    assert FakeLauncher.instances[0].batch_aws_region == "us-east-2"
     assert FakeOrca.instances[0].client == "client"
     assert FakeOrca.instances[0].launcher is FakeMultiClusterLauncher.instances[0]
     assert FakeMultiClusterLauncher.instances[0].default_cluster == "default"

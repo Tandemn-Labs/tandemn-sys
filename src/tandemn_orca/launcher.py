@@ -106,12 +106,16 @@ class DynamoLauncher:
         batch_chunk_manager_address: str | None = None,
         batch_namespace: str | None = None,
         batch_k8s: DynamoKubernetesClient | None = None,
+        batch_worker_secret: str | None = None,
+        batch_aws_region: str | None = None,
     ) -> None:
         self.namespace = namespace
         self.k8s = k8s or load_kube_client(namespace)
         self.context = context
         self.batch_chunk_manager_address = batch_chunk_manager_address
         self.batch_namespace = batch_namespace or namespace
+        self.batch_worker_secret = batch_worker_secret
+        self.batch_aws_region = batch_aws_region
         self.batch_k8s = batch_k8s or (
             self.k8s
             if self.batch_namespace == namespace
@@ -127,6 +131,8 @@ class DynamoLauncher:
                 ranks,
                 self.batch_namespace,
                 self.batch_chunk_manager_address,
+                self.batch_worker_secret,
+                self.batch_aws_region,
             )
             k8s = self.batch_k8s
         else:

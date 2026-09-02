@@ -1,11 +1,10 @@
 """Collect GPU/inference telemetry from Prometheus into Tandemn Store.
 
-One collector per cluster ("fleet mode"): every Dynamo worker pod in
-``--namespace`` is tracked, across all DGDs and jobs. Identity is discovered,
+One collector per cluster ("fleet mode"): every online and batch worker pod in
+the configured namespaces is tracked across all jobs. Identity is discovered,
 not configured: ``job_id`` + ``rank_id`` from the ``tandemn.com/*`` pod labels
-Orca stamps, the served
-model from the worker's ``--model`` arg, the node's instance type from its
-``node.kubernetes.io/instance-type`` label.
+Orca stamps, the served model from ``--model`` or ``TD_VLLM_MODEL``, and the
+node's instance type from its ``node.kubernetes.io/instance-type`` label.
 
 Writes one ``GpuMetric`` row per physical GPU per tick. Granularity:
 
@@ -15,7 +14,8 @@ Writes one ``GpuMetric`` row per physical GPU per tick. Granularity:
   numbers instead of a deployment-wide sum.
 
 Tandemn job model, coarse -> fine: a ``rank_id`` is a persisted ladder rung and
-``chain_index`` is Grove's runtime DP-replica index within that rank. A replica
+``chain_index`` is Grove's runtime replica index or a batch worker's explicit
+chain label within that rank. A replica
 spans N GPUs, each with a ``local_rank``. Pod identity is accepted only when its
 job, plan, rank, and chain index match an active Rank row.
 
@@ -137,6 +137,13 @@ WORKER_QUERIES: dict[str, str] = {
     ),
 }
 
+BATCH_WORKER_QUERIES: dict[str, str] = {
+    "batched_reqs_inflight": "batched_reqs_inflight{{{worker}}}",
+    "batched_reqs_processed_total": "batched_reqs_processed_total{{{worker}}}",
+    "batched_chunks_input_pulled_total": "batched_chunks_input_pulled_total{{{worker}}}",
+    "batched_chunks_output_written_total": "batched_chunks_output_written_total{{{worker}}}",
+}
+
 # Inputs to derived metrics, not GpuMetric fields themselves (WORKER_QUERIES
 # keys map 1:1 onto row fields; these must stay out of that mapping).
 AUX_WORKER_QUERIES: dict[str, str] = {
@@ -215,7 +222,9 @@ class PrometheusClient:
                     # "pod"; the scrape's own pod label (the exporter pod)
                     # wins that name, so the GPU owner arrives as
                     # "exported_pod". Empty = unallocated GPU or mapping off.
-                    "owner_pod": metric.get("exported_pod", ""),
+                    "owner_pod": metric.get("exported_pod")
+                    or (metric.get("pod", "") if metric.get("container") != "exporter" else ""),
+                    "hostname": metric.get("Hostname") or metric.get("hostname", ""),
                 }
             )
         return targets
@@ -278,12 +287,16 @@ _LABEL_DYN_NS = "nvidia.com/dynamo-namespace"
 # PD-disaggregation role of the worker: "prefill" | "decode" (absent = aggregated).
 _LABEL_SUBCOMPONENT = "nvidia.com/dynamo-sub-component-type"
 _LABEL_DISCOVERY = "tandemn.com/pods-discovery"
+_LABEL_CHAIN = "tandemn.com/chain-id"
 _LABEL_JOB = "tandemn.com/job-id"
 _LABEL_RANK = "tandemn.com/rank-id"
 _LABEL_PLAN = "tandemn.com/plan-id"
 _LABEL_PCSG_INDEX = "grove.io/podcliquescalinggroup-replica-index"
 _LABEL_POD_CLIQUE = "grove.io/podclique"
 _LABEL_POD_INDEX = "grove.io/podclique-pod-index"
+_LABEL_LWS_WORKER_INDEX = "leaderworkerset.sigs.k8s.io/worker-index"
+
+_WORKER_KINDS = {"dynamo-worker", "batch-worker"}
 
 # Node label carrying the EC2 instance type (standard on EKS/Karpenter nodes).
 _NODE_LABEL_INSTANCE_TYPE = "node.kubernetes.io/instance-type"
@@ -306,6 +319,7 @@ class WorkerInfo:
         dynamo_namespace: str | None,
         rank_id: str | None,
         role: str | None,
+        worker_kind: str = "dynamo-worker",
         job_id: str | None = None,
         plan_id: str | None = None,
         chain_index: int | None = None,
@@ -321,6 +335,7 @@ class WorkerInfo:
         self.rank_id = rank_id
         self.chain_index = chain_index
         self.role = role
+        self.worker_kind = worker_kind
         self.job_id = job_id
         self.plan_id = plan_id
         self.member_index = member_index
@@ -335,6 +350,9 @@ class WorkerInfo:
 def _model_from_pod(pod: Any) -> str | None:
     """The worker's served model, from its container ``--model <id>`` arg."""
     for container in pod.spec.containers or []:
+        for env in container.env or []:
+            if env.name == "TD_VLLM_MODEL" and env.value:
+                return str(env.value)
         args = list(container.args or [])
         for i, arg in enumerate(args[:-1]):
             if arg == "--model":
@@ -351,7 +369,7 @@ def _index(value: str | None) -> int | None:
 
 
 class KubeWorkerIndex:
-    """Indexes every Dynamo worker pod in the namespace by pod name.
+    """Indexes every online and batch worker pod in the namespaces by pod name.
 
     dcgm-exporter's PodResources mapping names the pod that owns each GPU
     (``exported_pod``); this index supplies that pod's identity labels. The
@@ -360,7 +378,10 @@ class KubeWorkerIndex:
     """
 
     def __init__(
-        self, namespace: str = "default", core: Any = None, context: str | None = None
+        self,
+        namespace: str | list[str] = "default",
+        core: Any = None,
+        context: str | None = None,
     ) -> None:
         from kubernetes import client, config
 
@@ -375,7 +396,7 @@ class KubeWorkerIndex:
                     config.load_kube_config()
                 core = client.CoreV1Api()
         self._core = core
-        self._namespace = namespace
+        self._namespaces = [namespace] if isinstance(namespace, str) else namespace
 
     def nodes(self) -> tuple[dict[str, str], dict[str, str]]:
         """(InternalIP -> node name, node name -> instance type)."""
@@ -392,21 +413,34 @@ class KubeWorkerIndex:
         return names_by_ip, instance_types
 
     def by_pod(self) -> dict[str, WorkerInfo]:
-        """All Dynamo worker pods in the namespace, keyed by pod name."""
-        selector = f"{_LABEL_DISCOVERY}=dynamo-worker"
-        pods = self._core.list_namespaced_pod(self._namespace, label_selector=selector).items
+        """All recognized worker pods in the namespaces, keyed by pod name."""
+        pods = [
+            pod
+            for namespace in self._namespaces
+            for pod in self._core.list_namespaced_pod(
+                namespace, label_selector=_LABEL_DISCOVERY
+            ).items
+        ]
         index: dict[str, WorkerInfo] = {}
         for pod in pods:
             labels = pod.metadata.labels or {}
+            worker_kind = labels.get(_LABEL_DISCOVERY)
+            if worker_kind not in _WORKER_KINDS:
+                continue
             pod_index = _index(labels.get(_LABEL_POD_INDEX))
             scaling_group_index = _index(labels.get(_LABEL_PCSG_INDEX))
+            chain_index = scaling_group_index if scaling_group_index is not None else pod_index
+            if chain_index is None:
+                chain_index = _index(labels.get(_LABEL_CHAIN))
             clique = labels.get(_LABEL_POD_CLIQUE, "")
             ready = any(
                 condition.type == "Ready" and condition.status == "True"
                 for condition in (getattr(getattr(pod, "status", None), "conditions", None) or [])
             )
             member_index = None
-            if scaling_group_index is not None:
+            if worker_kind == "batch-worker":
+                member_index = _index(labels.get(_LABEL_LWS_WORKER_INDEX))
+            elif scaling_group_index is not None:
                 if clique.endswith("-ldr"):
                     member_index = 0
                 elif clique.endswith("-wkr") and pod_index is not None:
@@ -417,9 +451,10 @@ class KubeWorkerIndex:
                 dynamo_namespace=labels.get(_LABEL_DYN_NS),
                 rank_id=labels.get(_LABEL_RANK),
                 role=labels.get(_LABEL_SUBCOMPONENT),
+                worker_kind=worker_kind,
                 job_id=labels.get(_LABEL_JOB),
                 plan_id=labels.get(_LABEL_PLAN),
-                chain_index=scaling_group_index if scaling_group_index is not None else pod_index,
+                chain_index=chain_index,
                 member_index=member_index,
                 pod_index=pod_index,
                 model_name=_model_from_pod(pod),
@@ -515,6 +550,14 @@ def _worker_inference_values(
         field: prom.query_scalar(query.format(worker=selector))
         for field, query in WORKER_QUERIES.items()
     }
+    values.update(
+        {
+            field: prom.query_scalar(query.format(worker=selector))
+            if worker.worker_kind == "batch-worker"
+            else None
+            for field, query in BATCH_WORKER_QUERIES.items()
+        }
+    )
 
     aux = {
         field: prom.query_scalar(query.format(worker=selector))
@@ -565,7 +608,12 @@ def collect_rank_telemetry(
     observed_at = observed_at or datetime.now(UTC)
     workers_by_rank: dict[tuple[str, str], list[WorkerInfo]] = {}
     for worker in workers_by_pod.values():
-        if worker.job_id and worker.rank_id and worker.chain_index is not None:
+        if (
+            worker.worker_kind == "dynamo-worker"
+            and worker.job_id
+            and worker.rank_id
+            and worker.chain_index is not None
+        ):
             workers_by_rank.setdefault((worker.job_id, worker.rank_id), []).append(worker)
 
     snapshots = []
@@ -616,7 +664,10 @@ def local_ranks_for_workers(ranks: list[Rank], workers_by_pod: dict[str, WorkerI
     local = {
         (worker.job_id, worker.rank_id)
         for worker in workers_by_pod.values()
-        if worker.job_id and worker.rank_id and worker.chain_index is not None
+        if worker.worker_kind == "dynamo-worker"
+        and worker.job_id
+        and worker.rank_id
+        and worker.chain_index is not None
     }
     return [rank for rank in ranks if (rank.job_id, rank.rank_id) in local]
 
@@ -646,10 +697,37 @@ def collect_once(
     # reuse one query pass.
     worker_cache: dict[str, dict[str, float | None]] = {}
     none_inference: dict[str, float | None] = dict.fromkeys(
-        [*WORKER_QUERIES, "kv_pressure_score", "cost_per_token", "slo_margin"]
+        [
+            *WORKER_QUERIES,
+            *BATCH_WORKER_QUERIES,
+            "kv_pressure_score",
+            "cost_per_token",
+            "slo_margin",
+        ]
     )
 
     targets = prom.gpu_targets()
+
+    def target_node_name(target: dict[str, str]) -> str:
+        node_ip = target.get("instance", "").split(":", 1)[0]
+        return target.get("hostname") or (node_names_by_ip or {}).get(node_ip, "")
+
+    workers_by_node: dict[str, list[WorkerInfo]] = {}
+    for indexed_worker in workers_by_pod.values():
+        if indexed_worker.node_name:
+            workers_by_node.setdefault(indexed_worker.node_name, []).append(indexed_worker)
+    targets_by_node: dict[str, list[dict[str, str]]] = {}
+    for target in targets:
+        targets_by_node.setdefault(target_node_name(target), []).append(target)
+    for target in targets:
+        if target.get("owner_pod"):
+            continue
+        target_node = target_node_name(target)
+        candidates = workers_by_node.get(target_node, [])
+        node_targets = targets_by_node.get(target_node, [])
+        # ponytail: infer only when one worker accounts for every GPU on the node.
+        if len(candidates) == 1 and len(node_targets) == candidates[0].gpus_per_node:
+            target["owner_pod"] = candidates[0].worker_id
     if targets and workers_by_pod and not any(t.get("owner_pod") for t in targets):
         logger.warning(
             "no DCGM series carries exported_pod; is DCGM_EXPORTER_KUBERNETES enabled? "
@@ -692,6 +770,16 @@ def collect_once(
             else None
         )
 
+    batch_metrics_workers = {
+        (worker.job_id, worker.rank_id, worker.chain_index): worker
+        for worker in workers_by_pod.values()
+        if worker.worker_kind == "batch-worker"
+        and worker.job_id
+        and worker.rank_id
+        and worker.chain_index is not None
+        and worker.member_index in (None, 0)
+    }
+
     samples = []
     for target in targets:
         worker = workers_by_pod.get(target.get("owner_pod", ""))
@@ -707,20 +795,23 @@ def collect_once(
             assert worker.job_id and worker.rank_id and worker.chain_index is not None
             node_name: str | None = worker.node_name or None
             instance_type = (instance_types_by_node or {}).get(node_name or "")
-            if worker.worker_id not in worker_cache:
+            metrics_worker = batch_metrics_workers.get(
+                (worker.job_id, worker.rank_id, worker.chain_index), worker
+            )
+            if metrics_worker.worker_id not in worker_cache:
                 price = chain_prices.get((worker.job_id, worker.rank_id, worker.chain_index))
-                worker_cache[worker.worker_id] = _worker_inference_values(
+                worker_cache[metrics_worker.worker_id] = _worker_inference_values(
                     prom,
-                    worker,
+                    metrics_worker,
                     price_per_hour=price,
                     ttft_target_ms=worker.ttft_target_ms,
                 )
-            inference_values = worker_cache[worker.worker_id]
+            inference_values = worker_cache[metrics_worker.worker_id]
         else:
             # dcgm-exporter runs with hostNetwork, so the instance IP is the
             # node's InternalIP.
             node_ip = target.get("instance", "").split(":", 1)[0]
-            node_name = (node_names_by_ip or {}).get(node_ip)
+            node_name = target.get("hostname") or (node_names_by_ip or {}).get(node_ip)
             instance_type = (instance_types_by_node or {}).get(node_name or "")
             inference_values = none_inference
 
@@ -739,7 +830,7 @@ def collect_once(
                 role=worker.role if worker else None,
                 node_name=node_name,
                 instance_type=instance_type,
-                model_name=worker.model_name if worker else None,
+                model_name=metrics_worker.model_name if worker else None,
                 **gpu_values,
                 **inference_values,
             )
@@ -792,7 +883,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Bearer token shared with job routers",
     )
     parser.add_argument(
-        "--namespace", default="default", help="Kubernetes namespace of the worker pods"
+        "--namespace",
+        default=os.getenv("TANDEMN_K8S_NAMESPACE", "dynamo-system"),
+        help="Kubernetes namespace of online worker pods",
+    )
+    parser.add_argument(
+        "--batch-namespace",
+        default=os.getenv("TANDEMN_BATCH_K8S_NAMESPACE", "tandemn-system"),
+        help="Kubernetes namespace of batch worker pods",
     )
     parser.add_argument(
         "--kube-context",
@@ -825,7 +923,10 @@ def main(argv: list[str] | None = None) -> int:
     resource_maps = (
         ResourceMapStore(client, user_id=args.user_id) if args.user_id is not None else None
     )
-    kube = KubeWorkerIndex(namespace=args.namespace, context=args.kube_context)
+    kube = KubeWorkerIndex(
+        namespace=list(dict.fromkeys([args.namespace, args.batch_namespace])),
+        context=args.kube_context,
+    )
     # With a token but no template, the client derives each job's router URL
     # from its deterministic listen_port — one collector, N job routers.
     router_telemetry = (
