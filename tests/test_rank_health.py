@@ -169,9 +169,15 @@ def test_missing_worker_service_after_serving_is_down():
     assert health.verdict is Verdict.DOWN
 
 
-def test_dead_local_router_is_down_despite_ready_workers():
+def test_local_router_still_starting_is_unknown():
     """Orca inserts the LocalRouter hop, so ready workers alone serve nothing."""
     health = rank_health(JOB_ID, RANK_ID, _dgd(worker=4, router=0))
+    assert health.verdict is Verdict.UNKNOWN
+    assert health.serving_replicas is None
+
+
+def test_dead_local_router_is_down_after_rank_served():
+    health = rank_health(JOB_ID, RANK_ID, _dgd(worker=4, router=0), ever_served=True)
     assert health.verdict is Verdict.DOWN
     assert health.reason_code == ReasonCode.PROCESS_CRASH
     assert health.serving_replicas == 4

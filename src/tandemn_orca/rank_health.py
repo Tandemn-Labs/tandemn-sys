@@ -176,6 +176,12 @@ def rank_health(
     if router_status is not None:
         routers = serving_replicas(router_status)
         if routers == 0:
+            if not ever_served:
+                return _unknown(
+                    job_id,
+                    rank_id,
+                    f"{workers} worker replica(s) ready; LocalRouter is still starting",
+                )
             return RankHealth(
                 rank_id,
                 job_id,
