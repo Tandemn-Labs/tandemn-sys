@@ -85,22 +85,6 @@ class FakeMultiClusterLauncher:
         FakeMultiClusterLauncher.instances.append(self)
 
 
-class FakeRefresher:
-    instances: ClassVar[list[FakeRefresher]] = []
-
-    def __init__(self, client, user_id, regions, refresh_seconds) -> None:
-        self.client = client
-        self.user_id = user_id
-        self.regions = regions
-        self.refresh_seconds = refresh_seconds
-        self.calls: list[bool] = []
-        FakeRefresher.instances.append(self)
-
-    def refresh_if_due(self, *, force=False):
-        self.calls.append(force)
-        return True
-
-
 class FakeTunnels:
     def __init__(self) -> None:
         self.closed = False
@@ -113,7 +97,6 @@ def _patch_runner(monkeypatch, orca_cls=FakeOrca):
     FakeOrca.instances.clear()
     FakeLauncher.instances.clear()
     FakeMultiClusterLauncher.instances.clear()
-    FakeRefresher.instances.clear()
     sleeps: list[float] = []
     monkeypatch.setattr(mod, "PostgresClient", lambda: "client")
     monkeypatch.setattr(mod, "DynamoLauncher", FakeLauncher)
@@ -121,7 +104,6 @@ def _patch_runner(monkeypatch, orca_cls=FakeOrca):
     monkeypatch.setattr(mod, "load_kube_client", lambda *args, **kwargs: (args, kwargs))
     monkeypatch.setattr(mod, "ModelCatalogStore", lambda client: ("catalogs", client))
     monkeypatch.setattr(mod, "PortForwardManager", FakeTunnels)
-    monkeypatch.setattr(mod, "CapacityRefresher", FakeRefresher)
     monkeypatch.setattr(mod, "Orca", orca_cls)
     monkeypatch.setattr(mod.time, "sleep", lambda seconds: sleeps.append(seconds))
     return sleeps
@@ -157,14 +139,6 @@ def test_main_once_uses_dynamo_launcher(monkeypatch):
     assert FakeOrca.instances[0].finished_users == ["default"]
     assert FakeOrca.instances[0].chunk_users == ["default"]
     assert FakeOrca.instances[0].reconciled_users == ["default"]
-    assert FakeRefresher.instances[0].client == "client"
-    assert FakeRefresher.instances[0].regions == [
-        "us-east-1",
-        "us-east-2",
-        "us-west-1",
-        "us-west-2",
-    ]
-    assert FakeRefresher.instances[0].calls == [True]
 
 
 def test_main_uses_env_defaults(monkeypatch):
@@ -173,8 +147,6 @@ def test_main_uses_env_defaults(monkeypatch):
     monkeypatch.setenv("TANDEMN_K8S_NAMESPACE", "env-ns")
     monkeypatch.setenv("TANDEMN_BATCH_K8S_NAMESPACE", "env-batch-ns")
     monkeypatch.setenv("TANDEMN_ORCA_POLL_SECONDS", "7")
-    monkeypatch.setenv("TANDEMN_AWS_REGIONS", "us-west-2,us-east-2")
-    monkeypatch.setenv("TANDEMN_CAPACITY_REFRESH_SECONDS", "12")
 
     args = mod.parse_args([])
 
@@ -182,8 +154,6 @@ def test_main_uses_env_defaults(monkeypatch):
     assert args.namespace == "env-ns"
     assert args.batch_namespace == "env-batch-ns"
     assert args.interval_seconds == 7
-    assert args.aws_regions == "us-west-2,us-east-2"
-    assert args.capacity_refresh_seconds == 12
 
 
 def test_main_enables_local_router_config(monkeypatch):
@@ -245,12 +215,12 @@ def test_main_requires_user_id(monkeypatch):
         mod.main(["--once"])
 
 
-def test_main_can_skip_capacity_refresh(monkeypatch):
+def test_main_accepts_legacy_skip_capacity_refresh_flag(monkeypatch):
     _patch_runner(monkeypatch)
 
     mod.main(["--user-id", "default", "--skip-capacity-refresh", "--once"])
 
-    assert FakeRefresher.instances[0].calls == []
+    assert mod.parse_args(["--skip-capacity-refresh"]).skip_capacity_refresh
 
 
 def test_runner_logs_error_and_retries(monkeypatch):
