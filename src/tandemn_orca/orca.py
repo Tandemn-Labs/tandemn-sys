@@ -49,11 +49,21 @@ from tandemn_system_data.events import (
     RankRunningPayload,
     RankStoppedPayload,
 )
-from tandemn_system_data.models.enums import ActionType, JobStatus, RankRole, RankStatus, ReasonCode
+from tandemn_system_data.models.enums import (
+    ActionType,
+    JobKind,
+    JobStatus,
+    RankRole,
+    RankStatus,
+    ReasonCode,
+)
 from tandemn_system_data.models.event import Event
 from tandemn_system_data.models.plan import Plan, PlanAction
 from tandemn_system_data.models.rank import Rank
 
+from tandemn.chunkmanager.v1 import chunk_manager_pb2
+from tandemn_orca.chunk_manager import ChunkManagerClient
+from tandemn_orca.compiler_common import rank_node_count
 from tandemn_orca.dynamo_kubernetes import load_kube_client
 from tandemn_orca.launcher import (
     DynamoLauncher,
@@ -65,6 +75,7 @@ from tandemn_orca.launcher import (
 from tandemn_orca.rank_health import (
     RankHealth,
     Verdict,
+    batch_rank_health,
     dgd_by_rank_id,
     rank_health,
     termination_reason_code,
@@ -182,6 +193,7 @@ class Orca:
         client: PostgresClient,
         launcher: Launcher | None = None,
         *,
+        chunk_manager: ChunkManagerClient | None = None,
         down_polls_before_failed: int = 2,
     ) -> None:
         self._client = client
@@ -189,6 +201,8 @@ class Orca:
         self._plans = PlanStore(client)
         self._events = PostgresEventLog(client)
         self._launcher = launcher or NoopLauncher()
+        self._chunk_manager = chunk_manager
+        self._cancelled_chunk_jobs: set[str] = set()
         self._down_polls_before_failed = max(1, down_polls_before_failed)
         # Consecutive DOWN readings per rank. A single bad poll must not fail a
         # rank: the operator recomputes status on its own cadence and a rolling
@@ -255,13 +269,41 @@ class Orca:
                     reason_code=allocation.reason_code,
                 )
                 try:
-                    k8s = k8s_for_rank(rank)
+                    k8s = k8s_for_rank(rank, job_kind=running.job.kind)
                 except ValueError:
                     logger.exception("no cluster client for rank %s", rank.rank_id)
                     continue
                 by_cluster.setdefault(id(k8s), (k8s, []))[1].append(rank)
 
             for k8s, ranks in by_cluster.values():
+                if running.job.kind is JobKind.BATCH:
+                    for rank in ranks:
+                        active_rank_ids.add(rank.rank_id)
+                        try:
+                            pods = k8s.rank_pods(job_id, rank.rank_id)
+                        except Exception:
+                            logger.exception(
+                                "batch pod status read failed for rank %s", rank.rank_id
+                            )
+                            continue
+                        self._apply_rank_health(
+                            user_id,
+                            k8s,
+                            rank,
+                            batch_rank_health(
+                                job_id,
+                                rank.rank_id,
+                                pods,
+                                expected_replicas=rank.n_replicas,
+                                nodes_per_chain=rank_node_count(rank),
+                                plan_id=rank.plan_id,
+                                ever_served=(
+                                    rank.status is RankStatus.RUNNING
+                                    or rank.rank_id in self._served_rank_ids
+                                ),
+                            ),
+                        )
+                    continue
                 try:
                     deployments = dgd_by_rank_id(k8s.job_dgds(job_id))
                 except Exception:
@@ -395,6 +437,14 @@ class Orca:
         for job in self._jobs.list_jobs(user_id):
             if job.status is not JobStatus.FINISHED:
                 continue
+            if (
+                self._chunk_manager is not None
+                and job.kind is JobKind.BATCH
+                and job.finish_reason == ReasonCode.CANCELLED
+                and job.job_id not in self._cancelled_chunk_jobs
+            ):
+                self._chunk_manager.cancel_job(job.job_id)
+                self._cancelled_chunk_jobs.add(job.job_id)
             rank_ids = self._active_rank_ids(job.job_id)
             if not rank_ids:
                 continue
@@ -415,6 +465,36 @@ class Orca:
             reconciled += 1
         return reconciled
 
+    def reconcile_chunk_jobs(self, user_id: str) -> int:
+        """Copy terminal chunk-manager state into the canonical Store job."""
+        if self._chunk_manager is None:
+            return 0
+        reconciled = 0
+        for running in self._jobs.running_jobs(user_id):
+            if running.job.kind is not JobKind.BATCH:
+                continue
+            try:
+                chunk_job = self._chunk_manager.get_job(running.job.job_id)
+            except Exception:
+                logger.exception("chunk job reconciliation failed for %s", running.job.job_id)
+                continue
+            if chunk_job.state == chunk_manager_pb2.JOB_STATE_SUCCEEDED:
+                finish_reason = None
+            elif chunk_job.state == chunk_manager_pb2.JOB_STATE_FAILED:
+                finish_reason = ReasonCode.FAILED
+            elif chunk_job.state == chunk_manager_pb2.JOB_STATE_CANCELLED:
+                finish_reason = ReasonCode.CANCELLED
+            else:
+                continue
+            if self._jobs.transition(
+                running.job.job_id,
+                JobStatus.FINISHED,
+                [JobStatus.RUNNING],
+                finish_reason=finish_reason,
+            ):
+                reconciled += 1
+        return reconciled
+
     def reconcile_running(self, user_id: str) -> int:
         """Restore infrastructure, local configs, and tunnels after Orca restarts."""
         reconciled = 0
@@ -433,7 +513,8 @@ class Orca:
                 for allocation in running.ranks
             ]
             if ranks:
-                self._launcher.reconcile(running.job.job_id, ranks)
+                self._add_chain_associations(ranks)
+                self._launcher.reconcile(running.job.job_id, ranks, job_kind=running.job.kind)
                 reconciled += 1
         return reconciled
 
@@ -492,7 +573,8 @@ class Orca:
             )
         )
         try:
-            self._launch_ranks(plan, action.job_id, ranks)
+            assert job is not None
+            self._launch_ranks(plan, action.job_id, ranks, job.kind)
         except ModelCatalogError as exc:
             finished = self._jobs.fail(
                 action.job_id,
@@ -594,11 +676,24 @@ class Orca:
             for rank in ranks
         ]
         try:
-            recorded = self._launch_ranks(plan, action.job_id, ranks, old_by_id)
+            recorded = self._launch_ranks(plan, action.job_id, ranks, job.kind, old_by_id)
         except ModelCatalogError as exc:
             self._jobs.set_error(action.job_id, str(exc))
             raise
         self._jobs.set_error(action.job_id, None)
+        recorded_by_id = {rank.rank_id: rank for rank in recorded}
+        removed = [rank for rank in old_ranks if rank.rank_id not in recorded_by_id]
+        self._drain_chain_associations(removed)
+        if self._uses_chunk_manager(action.job_id):
+            assert self._chunk_manager is not None
+            for old_rank in old_ranks:
+                replacement = recorded_by_id.get(old_rank.rank_id)
+                if replacement is None:
+                    continue
+                for chain_id in range(replacement.n_replicas, old_rank.n_replicas):
+                    self._chunk_manager.drain_chain_association(
+                        action.job_id, old_rank.rank_id, chain_id
+                    )
         self._stop_ranks(
             plan.user_id,
             action.job_id,
@@ -628,6 +723,7 @@ class Orca:
         plan: Plan,
         job_id: str,
         ranks: list[Rank],
+        job_kind: JobKind,
         previous: dict[str, Rank] | None = None,
     ) -> list[Rank]:
         previous = previous or {}
@@ -652,7 +748,8 @@ class Orca:
                 )
             )
         try:
-            self._launcher.reconcile(job_id, recorded)
+            self._add_chain_associations(recorded)
+            self._launcher.reconcile(job_id, recorded, job_kind=job_kind)
         except Exception as exc:
             try:
                 reused = [previous[rank.rank_id] for rank in recorded if rank.rank_id in previous]
@@ -691,9 +788,31 @@ class Orca:
         return recorded
 
     def _teardown_ranks(self, user_id: str, job_id: str, reason_code: str | None = None) -> None:
-        rank_ids = self._active_rank_ids(job_id)
+        ranks = self._jobs.active_ranks(job_id)
+        rank_ids = {rank.rank_id for rank in ranks}
+        self._drain_chain_associations(ranks)
         self._launcher.teardown_job(job_id)
         self._stop_ranks(user_id, job_id, rank_ids, reason_code)
+
+    def _add_chain_associations(self, ranks: list[Rank]) -> None:
+        if not ranks or not self._uses_chunk_manager(ranks[0].job_id):
+            return
+        assert self._chunk_manager is not None
+        for rank in ranks:
+            for chain_id in range(rank.n_replicas):
+                self._chunk_manager.add_chain_association(rank.job_id, rank.rank_id, chain_id)
+
+    def _drain_chain_associations(self, ranks: list[Rank]) -> None:
+        if not ranks or not self._uses_chunk_manager(ranks[0].job_id):
+            return
+        assert self._chunk_manager is not None
+        for rank in ranks:
+            for chain_id in range(rank.n_replicas):
+                self._chunk_manager.drain_chain_association(rank.job_id, rank.rank_id, chain_id)
+
+    def _uses_chunk_manager(self, job_id: str) -> bool:
+        job = self._jobs.get(job_id)
+        return self._chunk_manager is not None and job is not None and job.kind is JobKind.BATCH
 
     def _active_rank_ids(self, job_id: str) -> set[str]:
         return {rank.rank_id for rank in self._jobs.active_ranks(job_id)}
@@ -727,10 +846,30 @@ class Orca:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Orca against Tandemn Store plans.")
     parser.add_argument("--user-id", default=os.getenv("TANDEMN_USER_ID"))
-    parser.add_argument("--namespace", default=os.getenv("TANDEMN_K8S_NAMESPACE", "default"))
+    parser.add_argument("--namespace", default=os.getenv("TANDEMN_K8S_NAMESPACE", "dynamo-system"))
+    parser.add_argument(
+        "--batch-namespace",
+        default=os.getenv("TANDEMN_BATCH_K8S_NAMESPACE", "tandemn-system"),
+        help="Kubernetes namespace for batch workers (defaults to --namespace)",
+    )
     parser.add_argument("--router-config-dir", default=os.getenv("TANDEMN_ROUTER_CONFIG_DIR"))
     parser.add_argument("--router-binary", default=os.getenv("TANDEMN_ROUTER_BINARY"))
     parser.add_argument("--cluster-contexts", default=os.getenv("TANDEMN_CLUSTER_CONTEXTS"))
+    parser.add_argument(
+        "--chunk-manager-target",
+        default=os.getenv("TANDEMN_CHUNK_MANAGER_TARGET"),
+        help="chunk-manager gRPC target, for example chunk-manager:9090",
+    )
+    parser.add_argument(
+        "--batch-worker-secret",
+        default=os.getenv("TANDEMN_BATCH_WORKER_SECRET"),
+        help="optional Secret exposed to batch worker containers via envFrom",
+    )
+    parser.add_argument(
+        "--batch-aws-region",
+        default=os.getenv("TANDEMN_BATCH_AWS_REGION"),
+        help="optional AWS_DEFAULT_REGION for batch workers",
+    )
     parser.add_argument(
         "--router-port-base",
         type=int,
@@ -769,7 +908,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="skip the DGD-status rank health poll (leaves ranks.status at plan-apply values)",
     )
     parser.add_argument("--once", action="store_true")
-    # parser.add_argument("--skip-capacity-refresh", action="store_true")
+    parser.add_argument(
+        "--skip-capacity-refresh",
+        action="store_true",
+        help="deprecated no-op; AWS capacity refresh is currently disabled",
+    )
     return parser.parse_args(argv)
 
 
@@ -789,6 +932,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if not args.user_id:
         raise SystemExit("--user-id or TANDEMN_USER_ID is required")
+    batch_namespace = args.batch_namespace or args.namespace
     client = PostgresClient()
     # AWS capacity refresh is disabled pending the GCP ResourceMap refresher.
     # refresher = CapacityRefresher(
@@ -804,17 +948,35 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.cluster_contexts:
         contexts = load_cluster_contexts(args.cluster_contexts)
-        launchers = {
-            key: DynamoLauncher(
-                namespace=args.namespace,
-                k8s=load_kube_client(args.namespace, context=context),
-                context=context,
+        launchers = {}
+        for key, context in contexts.items():
+            online_k8s = load_kube_client(args.namespace, context=context)
+            batch_k8s = (
+                online_k8s
+                if batch_namespace == args.namespace
+                else load_kube_client(batch_namespace, context=context)
             )
-            for key, context in contexts.items()
-        }
+            launchers[key] = DynamoLauncher(
+                namespace=args.namespace,
+                k8s=online_k8s,
+                context=context,
+                batch_chunk_manager_address=args.chunk_manager_target,
+                batch_namespace=batch_namespace,
+                batch_k8s=batch_k8s,
+                batch_worker_secret=args.batch_worker_secret,
+                batch_aws_region=args.batch_aws_region,
+            )
         default_cluster = None
     else:
-        launchers = {"default": DynamoLauncher(namespace=args.namespace)}
+        launchers = {
+            "default": DynamoLauncher(
+                namespace=args.namespace,
+                batch_chunk_manager_address=args.chunk_manager_target,
+                batch_namespace=batch_namespace,
+                batch_worker_secret=args.batch_worker_secret,
+                batch_aws_region=args.batch_aws_region,
+            )
+        }
         default_cluster = "default"
     tunnel_manager = PortForwardManager() if args.router_config_dir else None
     router_manager = None
@@ -834,7 +996,15 @@ def main(argv: list[str] | None = None) -> None:
         tunnels=tunnel_manager,
         routers=router_manager,
     )
-    orca = Orca(client, launcher=launcher, down_polls_before_failed=args.down_polls_before_failed)
+    chunk_manager = None
+    if args.chunk_manager_target:
+        chunk_manager = ChunkManagerClient(args.chunk_manager_target)
+    orca = Orca(
+        client,
+        launcher=launcher,
+        chunk_manager=chunk_manager,
+        down_polls_before_failed=args.down_polls_before_failed,
+    )
     telemetry_token = os.getenv("TANDEMN_ROUTER_TELEMETRY_TOKEN")
     health_publisher = (
         RankHealthPublisher(telemetry_token) if telemetry_token and args.rank_health else None
@@ -852,6 +1022,11 @@ def main(argv: list[str] | None = None) -> None:
             logger.info("applied %s pending plan(s) at startup", applied)
         except Exception:
             logger.exception("initial plan apply failed")
+        try:
+            reconciled = orca.reconcile_chunk_jobs(args.user_id)
+            logger.info("reconciled %s terminal chunk job(s)", reconciled)
+        except Exception:
+            logger.exception("chunk job reconciliation failed")
         try:
             reconciled = orca.reconcile_finished(args.user_id)
             logger.info("reconciled %s finished job(s)", reconciled)
@@ -884,6 +1059,11 @@ def main(argv: list[str] | None = None) -> None:
             except Exception:
                 logger.exception("orca apply loop failed")
             try:
+                reconciled = orca.reconcile_chunk_jobs(args.user_id)
+                logger.info("reconciled %s terminal chunk job(s)", reconciled)
+            except Exception:
+                logger.exception("chunk job reconciliation failed")
+            try:
                 reconciled = orca.reconcile_finished(args.user_id)
                 logger.info("reconciled %s finished job(s)", reconciled)
             except Exception:
@@ -896,6 +1076,8 @@ def main(argv: list[str] | None = None) -> None:
                 except Exception:
                     logger.exception("rank health reconciliation failed")
     finally:
+        if chunk_manager is not None:
+            chunk_manager.close()
         if router_manager is not None:
             router_manager.close()
         if tunnel_manager is not None:

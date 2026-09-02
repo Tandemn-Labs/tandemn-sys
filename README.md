@@ -16,6 +16,18 @@ uv sync
 
 `tandemn-store` is wired as a local editable dependency (`../tandemn-store`).
 
+Initialize a batch job in chunk-manager before starting an experiment:
+
+```bash
+tandemn-init-chunk-job \
+  --job-id job_01J... \
+  --chunks chunks.json \
+  --target chunk-manager:9090
+```
+
+`chunks.json` is a non-empty array of integer `chunk_id` values and either
+`input_ref` or the existing `s3_input_path` field.
+
 ## The loop
 
 `Orca.apply_pending(user_id)`:

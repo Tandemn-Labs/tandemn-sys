@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from io import BytesIO
 from types import SimpleNamespace
 
 from tandemn_system_data.models import Rank, RankRole, ResourceMap
@@ -69,7 +70,7 @@ def test_worker_index_uses_single_and_multinode_grove_indexes():
     core = Core()
     workers = KubeWorkerIndex(core=core).by_pod()
 
-    assert core.query == ("default", "tandemn.com/pods-discovery=dynamo-worker")
+    assert core.query == ("default", "tandemn.com/pods-discovery")
     assert (workers["single"].plan_id, workers["single"].chain_index) == ("plan_1", 1)
     assert (
         workers["single"].member_index,
@@ -77,6 +78,45 @@ def test_worker_index_uses_single_and_multinode_grove_indexes():
         workers["multi-worker"].member_index,
     ) == (None, 0, 1)
     assert (workers["multi-leader"].chain_index, workers["multi-worker"].chain_index) == (2, 2)
+
+
+def test_worker_index_discovers_batch_jobs_and_lws_members():
+    def pod(name, labels):
+        return SimpleNamespace(
+            metadata=SimpleNamespace(
+                name=name,
+                labels={
+                    "tandemn.com/job-id": "job_1",
+                    "tandemn.com/rank-id": "rank_0",
+                    "tandemn.com/plan-id": "plan_1",
+                    "tandemn.com/pods-discovery": "batch-worker",
+                    "tandemn.com/chain-id": "3",
+                    **labels,
+                },
+            ),
+            spec=SimpleNamespace(node_name="node-1", containers=[]),
+        )
+
+    pods = [
+        pod("leader", {"leaderworkerset.sigs.k8s.io/worker-index": "0"}),
+        pod("worker", {"leaderworkerset.sigs.k8s.io/worker-index": "1"}),
+    ]
+
+    class Core:
+        def list_namespaced_pod(self, namespace, label_selector):
+            self.queries = [*getattr(self, "queries", []), (namespace, label_selector)]
+            return SimpleNamespace(items=pods if namespace == "tandemn-system" else [])
+
+    core = Core()
+    workers = KubeWorkerIndex(namespace=["dynamo-system", "tandemn-system"], core=core).by_pod()
+
+    assert core.queries == [
+        ("dynamo-system", "tandemn.com/pods-discovery"),
+        ("tandemn-system", "tandemn.com/pods-discovery"),
+    ]
+    assert workers["leader"].worker_kind == "batch-worker"
+    assert workers["leader"].chain_index == workers["worker"].chain_index == 3
+    assert (workers["leader"].member_index, workers["worker"].member_index) == (0, 1)
 
 
 def test_worker_index_uses_explicit_kube_context(monkeypatch):
@@ -165,6 +205,7 @@ def test_collect_once_attributes_owned_and_unowned_gpus():
     assert owned.local_rank == "0"
     assert by_uuid["GPU-b"].local_rank == "1"
     assert owned.throughput_token_per_sec == 1.5
+    assert owned.batched_reqs_inflight is None
     # Instance $/hr over the replica's throughput, repeated on each GPU row.
     assert owned.cost_per_token == 3.6 / (1.5 * 3600)
     assert by_uuid["GPU-b"].cost_per_token == owned.cost_per_token
@@ -184,6 +225,39 @@ def test_collect_once_attributes_owned_and_unowned_gpus():
     assert idle.gpu_mem_used_fraction == 1.5
     assert idle.throughput_token_per_sec is None
     assert idle.cost_per_token is None
+
+
+def test_collect_once_infers_owner_from_unique_worker_on_node():
+    class NodeProm(FakeProm):
+        def gpu_targets(self):
+            return [
+                {
+                    "gpu_uuid": "GPU-1",
+                    "uuid_label": "GPU-1",
+                    "instance": "10.0.0.1:9400",
+                    "hostname": "node-1",
+                    "gpu_index": "0",
+                    "owner_pod": "",
+                }
+            ]
+
+    worker = WorkerInfo(
+        worker_id="batch-worker",
+        node_name="node-1",
+        dynamo_namespace=None,
+        rank_id="rank_0",
+        chain_index=0,
+        role=None,
+        worker_kind="batch-worker",
+        job_id="job_1",
+        plan_id="plan_1",
+    )
+
+    sample = collect_once(NodeProm(), {worker.worker_id: worker})[0]
+
+    assert sample.job_id == "job_1"
+    assert sample.rank_id == "rank_0"
+    assert sample.chain_index == 0
 
 
 def test_multinode_local_rank_and_cost_cover_the_full_chain():
@@ -230,6 +304,67 @@ def test_multinode_local_rank_and_cost_cover_the_full_chain():
     assert by_uuid["GPU-1"].local_rank == "1"
     assert by_uuid["GPU-0"].cost_per_token == 5.0 / (1.5 * 3600)
     assert by_uuid["GPU-1"].cost_per_token == by_uuid["GPU-0"].cost_per_token
+
+
+def test_batch_metrics_use_the_lws_leader_for_every_member():
+    class BatchProm:
+        def __init__(self):
+            self.queries = []
+
+        def gpu_targets(self):
+            return [
+                {
+                    "gpu_uuid": f"GPU-{member}",
+                    "uuid_label": f"GPU-{member}",
+                    "instance": f"10.0.0.{member + 1}:9400",
+                    "gpu_index": "0",
+                    "owner_pod": "batch-leader" if member == 0 else "batch-worker",
+                }
+                for member in range(2)
+            ]
+
+        def query_scalar(self, query):
+            self.queries.append(query)
+            assert 'pod="batch-worker"' not in query
+            if "batched_reqs_inflight" in query:
+                return 100.0
+            if "batched_reqs_processed_total" in query:
+                return 387.0
+            if "batched_chunks_input_pulled_total" in query:
+                return 7.0
+            if "batched_chunks_output_written_total" in query:
+                return 2.0
+            return 1.0
+
+    workers = {
+        pod: WorkerInfo(
+            worker_id=pod,
+            node_name=f"node-{member}",
+            dynamo_namespace=None,
+            rank_id="rank_0",
+            chain_index=0,
+            member_index=member,
+            role=None,
+            worker_kind="batch-worker",
+            job_id="job_1",
+            plan_id="plan_1",
+            model_name="microsoft/phi-4" if member == 0 else None,
+        )
+        for member, pod in enumerate(("batch-leader", "batch-worker"))
+    }
+    rank = _rank(1)
+    rank.shape_json.update({"count": 2, "node_count": 2})
+    validate_rank_identity(workers, [rank])
+    prom = BatchProm()
+
+    samples = collect_once(prom, workers)
+
+    assert {sample.model_name for sample in samples} == {"microsoft/phi-4"}
+    for sample in samples:
+        assert sample.batched_reqs_inflight == 100.0
+        assert sample.batched_reqs_processed_total == 387.0
+        assert sample.batched_chunks_input_pulled_total == 7.0
+        assert sample.batched_chunks_output_written_total == 2.0
 
 
 def _worker(
@@ -305,6 +440,9 @@ def test_collect_rank_telemetry_deduplicates_multinode_members():
             worker.ready = chain_index < 2 or member_index == 0
             workers[worker.worker_id] = worker
     rank = _rank(3)
+    batch = _worker("batch-chain", 0)
+    batch.worker_kind = "batch-worker"
+    workers[batch.worker_id] = batch
     observed_at = datetime(2026, 8, 4, tzinfo=UTC)
 
     snapshots = collect_rank_telemetry(Prom(), workers, [rank], observed_at)
@@ -383,6 +521,32 @@ def test_prometheus_client_treats_connection_reset_as_missing_data(monkeypatch):
 
     assert client.query_scalar("up") is None
     assert client.gpu_targets() == []
+
+
+def test_gpu_discovery_accepts_unrenamed_owner_pod_and_hostname(monkeypatch):
+    payload = {
+        "data": {
+            "result": [
+                {
+                    "metric": {
+                        "UUID": "GPU-1",
+                        "gpu": "0",
+                        "pod": "batch-worker-0",
+                        "Hostname": "gke-node-1",
+                    }
+                }
+            ]
+        }
+    }
+    monkeypatch.setattr(
+        "tandemn_orca.scripts.gpu_metrics_collector.urllib.request.urlopen",
+        lambda *args, **kwargs: BytesIO(json.dumps(payload).encode()),
+    )
+
+    targets = PrometheusClient("http://prometheus").gpu_targets()
+
+    assert targets[0]["owner_pod"] == "batch-worker-0"
+    assert targets[0]["hostname"] == "gke-node-1"
 
 
 def test_validate_rank_identity_fails_closed():

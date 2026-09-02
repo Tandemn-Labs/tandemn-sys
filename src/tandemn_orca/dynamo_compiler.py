@@ -19,14 +19,19 @@ from typing import Any
 
 from tandemn_system_data.models.rank import Rank
 
-FRONTEND_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.2.1"
-RUNTIME_IMAGE = "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1"
-PLANNER_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.1"
+from tandemn_orca.compiler_common import (
+    k8s_name,
+    labels,
+    rank_node_count,
+    required,
+    validate_unique_ranks,
+    worker_gpu_count,
+    workload_name,
+)
 
-# The Dynamo operator's admission webhook requires len(DGD name) +
-# len(service name) <= 45 for pod naming; our longest service is
-# "VllmDecodeWorker" (16), so DGD names must stay within 29.
-MAX_DGD_NAME = 29
+FRONTEND_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.4.2"
+RUNTIME_IMAGE = "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.2"
+PLANNER_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.4.2"
 
 # Per-job router listen ports live above the rank tunnel range
 # (launcher: 18000 + span 10000) so a router never collides with a tunnel.
@@ -41,8 +46,7 @@ def router_listen_port(job_id: str) -> int:
 
 
 def compile_job(job_id: str, ranks: list[Rank], namespace: str = "default") -> list[dict[str, Any]]:
-    if len({rank.rank_id for rank in ranks}) != len(ranks):
-        raise ValueError("duplicate rank_id")
+    validate_unique_ranks(ranks)
     return [render_rank_dgd(job_id, rank, namespace) for rank in ranks]
 
 
@@ -103,50 +107,9 @@ def pool_key(rank: Rank) -> str:
     )
 
 
-def dgd_name(job_id: str, suffix: str) -> str:
-    """Short DGD name: ``tdm-{job tag}-{suffix}``, capped at MAX_DGD_NAME.
-
-    The job tag is the ULID tail, not the full job id (a full
-    ``job-01kwwez...`` already busts the operator's 45-char pod-naming
-    budget); the full job_id lives in the tandemn.com/job-id label. A suffix
-    that would not fit is replaced by an 8-char hash of itself.
-    """
-    tag = k8s_name(job_id).removeprefix("job-")[-10:].strip("-")
-    name = k8s_name(f"tdm-{tag}-{suffix}")
-    if len(name) > MAX_DGD_NAME:
-        digest = hashlib.sha1(suffix.encode()).hexdigest()[:8]
-        name = k8s_name(f"tdm-{tag}-{digest}")
-    return name
-
-
-def k8s_name(value: str) -> str:
-    value = value.lower().replace("_", "-").replace(".", "-")
-    return "".join(ch for ch in value if ch.isalnum() or ch == "-")[:63].strip("-")
-
-
 def pool_dgd_name(job_id: str, rank: Rank) -> str:
     """Pool DGD name using the canonical rank ID."""
-    return dgd_name(job_id, rank.rank_id)
-
-
-def labels(
-    job_id: str,
-    rank_id: str,
-    plan_id: str | None,
-    resource_kind: str,
-    pool: str | None = None,
-) -> dict[str, str]:
-    result = {
-        "tandemn.com/managed-by": "orca",
-        "tandemn.com/job-id": job_id,
-        "tandemn.com/rank-id": rank_id,
-        "tandemn.com/resource-kind": resource_kind,
-    }
-    if plan_id:
-        result["tandemn.com/plan-id"] = plan_id
-    if pool:
-        result["tandemn.com/pool-key"] = pool
-    return result
+    return workload_name(job_id, rank.rank_id)
 
 
 def pod_metadata(
@@ -387,30 +350,8 @@ def capacity_type_for(shape: dict[str, Any]) -> str:
     return {"reserved": "reserved", "on_demand": "on-demand"}.get(str(market), str(market))
 
 
-def worker_gpu_count(rank: Rank) -> int:
-    count = rank.shape_json.get("count")
-    if type(count) is not int or count <= 0:
-        raise ValueError(f"rank {rank.rank_id} missing positive int count")
-    return count
-
-
-def rank_node_count(rank: Rank) -> int:
-    """Physical nodes one replica's worker pod-group spans; 1 = single node."""
-    node_count = rank.shape_json.get("node_count", 1)
-    if type(node_count) is not int or node_count < 1:
-        raise ValueError(f"rank {rank.rank_id} node_count must be a positive int")
-    return node_count
-
-
 def max_gpu_budget(rank: Rank) -> int:
     return worker_gpu_count(rank) * rank.n_replicas
-
-
-def required(shape: dict[str, Any], key: str) -> str:
-    value = shape.get(key)
-    if value is None:
-        raise ValueError(f"shape missing {key!r}")
-    return str(value)
 
 
 def required_float(shape: dict[str, Any], key: str) -> float:

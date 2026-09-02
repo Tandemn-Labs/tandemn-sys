@@ -1,4 +1,4 @@
-"""Derive rank serving health from DynamoGraphDeployment status.
+"""Derive rank serving health from DGD status or batch worker pods.
 
 Why the DGD is the source of truth for "is this rank up":
 
@@ -176,6 +176,12 @@ def rank_health(
     if router_status is not None:
         routers = serving_replicas(router_status)
         if routers == 0:
+            if not ever_served:
+                return _unknown(
+                    job_id,
+                    rank_id,
+                    f"{workers} worker replica(s) ready; LocalRouter is still starting",
+                )
             return RankHealth(
                 rank_id,
                 job_id,
@@ -186,6 +192,67 @@ def rank_health(
             )
 
     return RankHealth(rank_id, job_id, Verdict.SERVING, workers, None, "")
+
+
+def batch_rank_health(
+    job_id: str,
+    rank_id: str,
+    pods: list[dict[str, Any]],
+    *,
+    expected_replicas: int,
+    nodes_per_chain: int,
+    plan_id: str | None,
+    ever_served: bool = False,
+) -> RankHealth:
+    """Count batch chains whose pods are all ready."""
+    chains: dict[str, list[dict[str, Any]]] = {}
+    for pod in pods:
+        metadata = pod.get("metadata") or {}
+        pod_labels = metadata.get("labels") or {}
+        if plan_id and pod_labels.get("tandemn.com/plan-id") != plan_id:
+            continue
+        chain_id = pod_labels.get("tandemn.com/chain-id")
+        if chain_id is not None:
+            chains.setdefault(str(chain_id), []).append(pod)
+
+    ready = sum(
+        len([pod for pod in members if _pod_ready(pod)]) >= nodes_per_chain
+        for members in chains.values()
+    )
+    if ready:
+        return RankHealth(rank_id, job_id, Verdict.SERVING, ready, None, "")
+    if not chains:
+        if ever_served:
+            return RankHealth(
+                rank_id,
+                job_id,
+                Verdict.DOWN,
+                0,
+                ReasonCode.NODE_LOST,
+                "no batch worker pods carry this rank and plan",
+            )
+        return _unknown(job_id, rank_id, "no batch worker pods ready yet")
+
+    failed = sum(any(_pod_failed(pod) for pod in members) for members in chains.values())
+    if failed >= expected_replicas:
+        return RankHealth(
+            rank_id,
+            job_id,
+            Verdict.DOWN,
+            0,
+            ReasonCode.PROCESS_CRASH,
+            f"all {failed} batch chain(s) failed",
+        )
+    if ever_served:
+        return RankHealth(
+            rank_id,
+            job_id,
+            Verdict.DOWN,
+            0,
+            ReasonCode.HEARTBEAT_TIMEOUT,
+            "0 batch chains ready",
+        )
+    return _unknown(job_id, rank_id, "batch workers are still starting")
 
 
 def serving_replicas(service_status: Mapping[str, Any]) -> int | None:
@@ -210,6 +277,26 @@ def dgd_by_rank_id(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         if rank_id:
             indexed[str(rank_id)] = item
     return indexed
+
+
+def _pod_ready(pod: Mapping[str, Any]) -> bool:
+    conditions = (pod.get("status") or {}).get("conditions") or []
+    return any(
+        condition.get("type") == "Ready" and condition.get("status") == "True"
+        for condition in conditions
+        if isinstance(condition, dict)
+    )
+
+
+def _pod_failed(pod: Mapping[str, Any]) -> bool:
+    status = pod.get("status") or {}
+    if status.get("phase") == "Failed":
+        return True
+    return any(
+        ((container.get("state") or {}).get("waiting") or {}).get("reason") == "CrashLoopBackOff"
+        for container in status.get("containerStatuses") or []
+        if isinstance(container, dict)
+    )
 
 
 def termination_reason_code(pods: list[dict[str, Any]]) -> tuple[str, str] | None:

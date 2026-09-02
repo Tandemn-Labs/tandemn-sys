@@ -10,7 +10,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from tandemn_system_data.models.enums import RankRole, RankStatus, ReasonCode
+from tandemn_system_data.models.enums import JobKind, RankRole, RankStatus, ReasonCode
 from tandemn_system_data.models.rank import Rank
 
 import tandemn_orca.orca as orca_mod
@@ -52,13 +52,33 @@ def _dgd(worker: int, *, state: str = "successful", router: int = 1) -> dict:
     }
 
 
+def _batch_pod(chain: int, *, ready: bool = True) -> dict:
+    return {
+        "metadata": {
+            "name": f"batch-{chain}",
+            "labels": {
+                "tandemn.com/chain-id": str(chain),
+                "tandemn.com/plan-id": "plan-1",
+            },
+        },
+        "status": {
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+        },
+    }
+
+
 class FakeJobStore:
     def __init__(self, rank: Rank) -> None:
         self.rank = rank
         self.writes: list[tuple[str, RankStatus, list[RankStatus], str | None]] = []
 
     def running_jobs(self, user_id):
-        return [SimpleNamespace(job=SimpleNamespace(job_id=JOB_ID), ranks=[self.rank])]
+        return [
+            SimpleNamespace(
+                job=SimpleNamespace(job_id=JOB_ID, kind=JobKind.ONLINE), ranks=[self.rank]
+            )
+        ]
 
     def set_rank_status(self, rank_id, to, expected, *, reason_code=None):
         self.writes.append((rank_id, to, list(expected), reason_code))
@@ -95,10 +115,13 @@ class FakeLauncher:
     def __init__(self, k8s: FakeK8s) -> None:
         self.k8s = k8s
 
-    def k8s_for_rank(self, rank):
+        self.job_kinds = []
+
+    def k8s_for_rank(self, rank, *, job_kind=JobKind.ONLINE):
+        self.job_kinds.append(job_kind)
         return self.k8s
 
-    def reconcile(self, job_id, ranks):  # pragma: no cover - unused here
+    def reconcile(self, job_id, ranks, **kwargs):  # pragma: no cover - unused here
         pass
 
     def teardown_job(self, job_id):  # pragma: no cover - unused here
@@ -123,6 +146,19 @@ def test_serving_promotes_a_launching_rank(monkeypatch):
 
     assert [item.verdict for item in health] == [Verdict.SERVING]
     assert store.writes == [(RANK_ID, RankStatus.RUNNING, [RankStatus.LAUNCHING], None)]
+
+
+def test_batch_rank_uses_pods_but_is_not_returned_to_router(monkeypatch):
+    store = FakeJobStore(_rank(RankStatus.LAUNCHING))
+    store.running_jobs = lambda user_id: [
+        SimpleNamespace(job=SimpleNamespace(job_id=JOB_ID, kind=JobKind.BATCH), ranks=[store.rank])
+    ]
+    k8s = FakeK8s([], [_batch_pod(0), _batch_pod(1)])
+    orca = _orca(monkeypatch, store, k8s)
+
+    assert orca.reconcile_rank_health(USER_ID) == []
+    assert store.writes == [(RANK_ID, RankStatus.RUNNING, [RankStatus.LAUNCHING], None)]
+    assert orca._launcher.job_kinds == [JobKind.BATCH]
 
 
 def test_serving_emits_rank_running_once(monkeypatch):

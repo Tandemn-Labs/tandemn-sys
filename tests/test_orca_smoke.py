@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from tandemn_system_data.models.enums import (
     ActionType,
+    JobKind,
     JobStatus,
     RankRole,
     RankStatus,
@@ -21,6 +22,7 @@ from tandemn_system_data.models.plan import Plan, PlanAction
 from tandemn_system_data.models.rank import Rank
 
 import tandemn_orca.orca as orca_mod
+from tandemn.chunkmanager.v1 import chunk_manager_pb2
 from tandemn_orca.launcher import ModelCatalogError
 from tandemn_orca.orca import Orca, ladder_to_ranks
 
@@ -54,12 +56,14 @@ class FakeJobStore:
         self,
         active: list[Rank] | None = None,
         job_statuses: dict[str, JobStatus] | None = None,
+        finish_reasons: dict[str, str | None] | None = None,
     ) -> None:
         self.transitions: list[tuple[str, JobStatus, list[JobStatus]]] = []
         self.launched: list[Rank] = []
         self.rank_status: list[tuple[str, RankStatus, list[RankStatus], str | None]] = []
         self.rows = {rank.rank_id: rank.model_copy(deep=True) for rank in active or []}
         self.job_statuses = dict(job_statuses or {})
+        self.finish_reasons = dict(finish_reasons or {})
         self.failures: list[tuple[str, str, str]] = []
         self.errors: dict[str, str | None] = {}
 
@@ -68,11 +72,13 @@ class FakeJobStore:
         if self.job_statuses.get(job_id) not in expected:
             return False
         self.job_statuses[job_id] = to
+        if to is JobStatus.FINISHED:
+            self.finish_reasons[job_id] = finish_reason
         return True
 
     def get(self, job_id):
         status = self.job_statuses.get(job_id)
-        return SimpleNamespace(spec_json={}, status=status) if status else None
+        return SimpleNamespace(spec_json={}, status=status, kind=JobKind.BATCH) if status else None
 
     def launch_ranks(self, ranks):
         self.launched.extend(ranks)
@@ -95,13 +101,21 @@ class FakeJobStore:
 
     def list_jobs(self, user_id):
         return [
-            SimpleNamespace(job_id=job_id, status=status, finish_reason=None)
+            SimpleNamespace(
+                job_id=job_id,
+                kind=JobKind.BATCH,
+                status=status,
+                finish_reason=self.finish_reasons.get(job_id),
+            )
             for job_id, status in self.job_statuses.items()
         ]
 
     def running_jobs(self, user_id):
         return [
-            SimpleNamespace(job=SimpleNamespace(job_id=job_id), ranks=self.active_ranks(job_id))
+            SimpleNamespace(
+                job=SimpleNamespace(job_id=job_id, kind=JobKind.BATCH),
+                ranks=self.active_ranks(job_id),
+            )
             for job_id, status in self.job_statuses.items()
             if status is JobStatus.RUNNING
         ]
@@ -153,16 +167,49 @@ class FakeEventLog:
 class FakeLauncher:
     def __init__(self) -> None:
         self.reconciled: list[tuple[str, list[Rank]]] = []
+        self.job_kinds: list[JobKind] = []
         self.torn_down_jobs: list[str] = []
 
-    def reconcile(self, job_id, ranks):
+    def reconcile(self, job_id, ranks, *, job_kind=JobKind.ONLINE):
         self.reconciled.append((job_id, list(ranks)))
+        self.job_kinds.append(job_kind)
 
     def teardown_job(self, job_id):
         self.torn_down_jobs.append(job_id)
 
 
-def _build_orca(monkeypatch, plans, active=None, job_statuses=None, *, mark_applied=True):
+class FakeChunkManager:
+    def __init__(self, states=None) -> None:
+        self.added: list[tuple[str, str, int]] = []
+        self.drained: list[tuple[str, str, int]] = []
+        self.cancelled: list[str] = []
+        self.states = states or {}
+        self.requested: list[str] = []
+
+    def add_chain_association(self, job_id, rank_id, chain_id):
+        self.added.append((job_id, rank_id, chain_id))
+
+    def drain_chain_association(self, job_id, rank_id, chain_id):
+        self.drained.append((job_id, rank_id, chain_id))
+
+    def cancel_job(self, job_id):
+        self.cancelled.append(job_id)
+
+    def get_job(self, job_id):
+        self.requested.append(job_id)
+        return chunk_manager_pb2.Job(state=self.states[job_id])
+
+
+def _build_orca(
+    monkeypatch,
+    plans,
+    active=None,
+    job_statuses=None,
+    *,
+    finish_reasons=None,
+    chunk_manager=None,
+    mark_applied=True,
+):
     inferred_statuses = {
         action.job_id: (
             JobStatus.RUNNING
@@ -176,13 +223,13 @@ def _build_orca(monkeypatch, plans, active=None, job_statuses=None, *, mark_appl
     monkeypatch.setattr(
         orca_mod,
         "JobStore",
-        lambda client: FakeJobStore(active, inferred_statuses),
+        lambda client: FakeJobStore(active, inferred_statuses, finish_reasons),
     )
     monkeypatch.setattr(
         orca_mod, "PlanStore", lambda client: FakePlanStore(plans, mark_applied=mark_applied)
     )
     monkeypatch.setattr(orca_mod, "PostgresEventLog", FakeEventLog)
-    return Orca(client=object(), launcher=FakeLauncher())
+    return Orca(client=object(), launcher=FakeLauncher(), chunk_manager=chunk_manager)
 
 
 # ----- ladder_to_ranks -------------------------------------------------------
@@ -326,12 +373,29 @@ def test_place_transitions_and_launches(monkeypatch):
     # rows recorded in the store AND workers brought up via the launcher
     assert len(orca._jobs.launched) == 1
     assert len(orca._launcher.reconciled) == 1
+    assert orca._launcher.job_kinds == [JobKind.BATCH]
     assert orca._launcher.reconciled[0][0] == "job_B"
     assert len(orca._launcher.reconciled[0][1]) == 1
     assert orca._jobs.launched[0].shape_json["target_p99_ttft_ms"] == 500.0
     assert orca._jobs.launched[0].shape_json["target_p99_tpot_ms"] == 50.0
     assert orca._jobs.rows[RANK_ID].status is RankStatus.LAUNCHING
     assert orca._jobs.rank_status == []
+
+
+def test_place_adds_each_chain_association(monkeypatch):
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_B", type=ActionType.PLACE, ladder=EXPLICIT_LADDER)],
+    )
+    chunk_manager = FakeChunkManager()
+    orca = _build_orca(monkeypatch, [plan], chunk_manager=chunk_manager)
+
+    assert orca.apply_pending("user_1") == 1
+    assert chunk_manager.added == [
+        ("job_B", RANK_ID, 0),
+        ("job_B", RANK_ID, 1),
+        ("job_B", RANK_ID, 2),
+    ]
 
 
 def test_place_emits_job_place_before_launching_ranks(monkeypatch):
@@ -506,7 +570,7 @@ def test_swap_failure_restores_reused_rank_and_fails_only_new_rank(monkeypatch):
     )
     orca = _build_orca(monkeypatch, [plan], active=[reused_rank])
 
-    def fail_reconcile(job_id, ranks):
+    def fail_reconcile(job_id, ranks, **kwargs):
         raise RuntimeError("boom")
 
     orca._launcher.reconcile = fail_reconcile
@@ -527,7 +591,7 @@ def test_place_failure_restores_previous_job_status(monkeypatch, previous_status
     )
     orca = _build_orca(monkeypatch, [plan], job_statuses={"job_B": previous_status})
 
-    def fail_reconcile(job_id, ranks):
+    def fail_reconcile(job_id, ranks, **kwargs):
         raise RuntimeError("boom")
 
     orca._launcher.reconcile = fail_reconcile
@@ -548,7 +612,7 @@ def test_launch_failure_emits_rank_failed(monkeypatch):
     )
     orca = _build_orca(monkeypatch, [plan])
 
-    def fail_reconcile(job_id, ranks):
+    def fail_reconcile(job_id, ranks, **kwargs):
         raise RuntimeError("launcher unavailable")
 
     orca._launcher.reconcile = fail_reconcile
@@ -576,7 +640,7 @@ def test_place_catalog_failure_finishes_job_with_visible_error(monkeypatch):
     orca = _build_orca(monkeypatch, [plan])
     message = "ModelCatalog 'model' field 'max_num_seq' is missing for gpu_type 'L40S'"
 
-    def fail_catalog(*_):
+    def fail_catalog(*_, **__):
         raise ModelCatalogError(message)
 
     orca._launcher.reconcile = fail_catalog
@@ -615,7 +679,7 @@ def test_swap_catalog_failure_keeps_running_job_and_records_error(monkeypatch):
     orca = _build_orca(monkeypatch, [plan], active=[old_rank])
     message = "ModelCatalog 'model' is missing"
 
-    def fail_catalog(*_):
+    def fail_catalog(*_, **__):
         raise ModelCatalogError(message)
 
     orca._launcher.reconcile = fail_catalog
@@ -660,6 +724,47 @@ def test_swap_reuses_rank_with_new_replica_count_and_stops_removed_rank(monkeypa
     assert orca._jobs.rows[RANK_ID].status is RankStatus.RUNNING
     assert orca._jobs.rank_status == [
         (OLD_RANK_ID, RankStatus.STOPPED, [RankStatus.LAUNCHING, RankStatus.RUNNING], None),
+    ]
+
+
+def test_swap_drains_removed_and_excess_chains(monkeypatch):
+    reused_rank = Rank(
+        rank_id=RANK_ID,
+        job_id="job_F",
+        plan_id="plan_prev",
+        role=RankRole.AGGREGATE,
+        status=RankStatus.RUNNING,
+        shape_json={"count": 1},
+        n_replicas=3,
+    )
+    removed_rank = Rank(
+        rank_id=OLD_RANK_ID,
+        job_id="job_F",
+        plan_id="plan_prev",
+        role=RankRole.PREFILL,
+        status=RankStatus.RUNNING,
+        shape_json={"count": 1},
+        n_replicas=2,
+    )
+    ladder = [{**EXPLICIT_LADDER[0], "n_replicas": 1}]
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_F", type=ActionType.SWAP, ladder=ladder)],
+    )
+    chunk_manager = FakeChunkManager()
+    orca = _build_orca(
+        monkeypatch,
+        [plan],
+        active=[reused_rank, removed_rank],
+        chunk_manager=chunk_manager,
+    )
+
+    assert orca.apply_pending("user_1") == 1
+    assert chunk_manager.drained == [
+        ("job_F", OLD_RANK_ID, 0),
+        ("job_F", OLD_RANK_ID, 1),
+        ("job_F", RANK_ID, 1),
+        ("job_F", RANK_ID, 2),
     ]
 
 
@@ -722,6 +827,42 @@ def test_reconcile_running_restores_active_rank(monkeypatch):
     assert [restored.rank_id for restored in orca._launcher.reconciled[0][1]] == [RANK_ID]
 
 
+@pytest.mark.parametrize(
+    ("chunk_state", "finish_reason"),
+    [
+        (chunk_manager_pb2.JOB_STATE_SUCCEEDED, None),
+        (chunk_manager_pb2.JOB_STATE_FAILED, ReasonCode.FAILED),
+        (chunk_manager_pb2.JOB_STATE_CANCELLED, ReasonCode.CANCELLED),
+    ],
+)
+def test_reconcile_chunk_jobs_finishes_terminal_batch_job(monkeypatch, chunk_state, finish_reason):
+    chunk_manager = FakeChunkManager({"job_B": chunk_state})
+    orca = _build_orca(
+        monkeypatch,
+        [],
+        job_statuses={"job_B": JobStatus.RUNNING},
+        chunk_manager=chunk_manager,
+    )
+
+    assert orca.reconcile_chunk_jobs("user_1") == 1
+    assert chunk_manager.requested == ["job_B"]
+    assert orca._jobs.job_statuses["job_B"] is JobStatus.FINISHED
+    assert orca._jobs.finish_reasons["job_B"] == finish_reason
+
+
+def test_reconcile_chunk_jobs_leaves_running_batch_job_unchanged(monkeypatch):
+    chunk_manager = FakeChunkManager({"job_B": chunk_manager_pb2.JOB_STATE_RUNNING})
+    orca = _build_orca(
+        monkeypatch,
+        [],
+        job_statuses={"job_B": JobStatus.RUNNING},
+        chunk_manager=chunk_manager,
+    )
+
+    assert orca.reconcile_chunk_jobs("user_1") == 0
+    assert orca._jobs.job_statuses["job_B"] is JobStatus.RUNNING
+
+
 def test_reconcile_finished_tears_down_active_ranks_once(monkeypatch):
     rank = Rank(
         rank_id=RANK_ID,
@@ -760,6 +901,21 @@ def test_reconcile_finished_tears_down_active_ranks_once(monkeypatch):
         "job_id": "job_B",
         "reason_code": None,
     }
+
+
+def test_reconcile_finished_cancels_chunk_job_once(monkeypatch):
+    chunk_manager = FakeChunkManager()
+    orca = _build_orca(
+        monkeypatch,
+        [],
+        job_statuses={"job_B": JobStatus.FINISHED},
+        finish_reasons={"job_B": ReasonCode.CANCELLED},
+        chunk_manager=chunk_manager,
+    )
+
+    assert orca.reconcile_finished("user_1") == 0
+    assert orca.reconcile_finished("user_1") == 0
+    assert chunk_manager.cancelled == ["job_B"]
 
 
 def test_preempt_tears_down_and_pauses(monkeypatch):
@@ -809,6 +965,30 @@ def test_preempt_tears_down_and_pauses(monkeypatch):
     }
 
 
+def test_preempt_drains_each_chain_association(monkeypatch):
+    rank = Rank(
+        rank_id=OLD_RANK_ID,
+        job_id="job_E",
+        plan_id="plan_prev",
+        role=RankRole.AGGREGATE,
+        status=RankStatus.RUNNING,
+        shape_json={"gpu": "L4", "count": 1},
+        n_replicas=2,
+    )
+    plan = Plan(
+        user_id="user_1",
+        actions=[PlanAction(job_id="job_E", type=ActionType.PREEMPT)],
+    )
+    chunk_manager = FakeChunkManager()
+    orca = _build_orca(monkeypatch, [plan], active=[rank], chunk_manager=chunk_manager)
+
+    assert orca.apply_pending("user_1") == 1
+    assert chunk_manager.drained == [
+        ("job_E", OLD_RANK_ID, 0),
+        ("job_E", OLD_RANK_ID, 1),
+    ]
+
+
 def test_bad_action_does_not_wedge_the_plan(monkeypatch):
     """An action that raises is logged and skipped; the plan is still applied."""
     good_ladder = [{**EXPLICIT_LADDER[0], "rank_id": NEW_RANK_ID}]
@@ -822,10 +1002,10 @@ def test_bad_action_does_not_wedge_the_plan(monkeypatch):
     orca = _build_orca(monkeypatch, [plan])
     original = orca._launcher.reconcile
 
-    def explode_for_bad_job(job_id, ranks):
+    def explode_for_bad_job(job_id, ranks, **kwargs):
         if job_id == "job_bad":
             raise RuntimeError("boom")
-        original(job_id, ranks)
+        original(job_id, ranks, **kwargs)
 
     orca._launcher.reconcile = explode_for_bad_job
 

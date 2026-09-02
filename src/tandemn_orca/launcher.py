@@ -20,8 +20,10 @@ from pathlib import Path
 from typing import Protocol
 
 from tandemn_system_data.clients import ModelCatalogStore
+from tandemn_system_data.models.enums import JobKind
 from tandemn_system_data.models.rank import Rank
 
+from tandemn_orca.batch_compiler import compile_batch_job
 from tandemn_orca.dynamo_compiler import (
     compile_job,
     pool_dgd_name,
@@ -41,7 +43,9 @@ logger = logging.getLogger(__name__)
 class Launcher(Protocol):
     """Reconciles job infrastructure to match Orca's Rank rows."""
 
-    def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
+    def reconcile(
+        self, job_id: str, ranks: list[Rank], *, job_kind: JobKind = JobKind.ONLINE
+    ) -> None:
         """Make infrastructure match the desired ranks for one job."""
         ...
 
@@ -77,7 +81,9 @@ class NoopLauncher:
     (tests, dry runs); production uses DynamoLauncher.
     """
 
-    def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
+    def reconcile(
+        self, job_id: str, ranks: list[Rank], *, job_kind: JobKind = JobKind.ONLINE
+    ) -> None:
         for rank in ranks:
             logger.info(
                 "noop reconcile: job=%s rank=%s role=%s shape=%s",
@@ -97,29 +103,61 @@ class DynamoLauncher:
         namespace: str = "default",
         k8s: DynamoKubernetesClient | None = None,
         context: str | None = None,
+        batch_chunk_manager_address: str | None = None,
+        batch_namespace: str | None = None,
+        batch_k8s: DynamoKubernetesClient | None = None,
+        batch_worker_secret: str | None = None,
+        batch_aws_region: str | None = None,
     ) -> None:
         self.namespace = namespace
         self.k8s = k8s or load_kube_client(namespace)
         self.context = context
+        self.batch_chunk_manager_address = batch_chunk_manager_address
+        self.batch_namespace = batch_namespace or namespace
+        self.batch_worker_secret = batch_worker_secret
+        self.batch_aws_region = batch_aws_region
+        self.batch_k8s = batch_k8s or (
+            self.k8s
+            if self.batch_namespace == namespace
+            else load_kube_client(self.batch_namespace, context=context)
+        )
 
-    def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
-        desired = compile_job(job_id, ranks, self.namespace)
+    def reconcile(
+        self, job_id: str, ranks: list[Rank], *, job_kind: JobKind = JobKind.ONLINE
+    ) -> None:
+        if job_kind is JobKind.BATCH:
+            desired = compile_batch_job(
+                job_id,
+                ranks,
+                self.batch_namespace,
+                self.batch_chunk_manager_address,
+                self.batch_worker_secret,
+                self.batch_aws_region,
+            )
+            k8s = self.batch_k8s
+        else:
+            desired = compile_job(job_id, ranks, self.namespace)
+            k8s = self.k8s
         desired_keys = {object_key(obj) for obj in desired}
-        stale = self.k8s.list_job_objects(job_id) - desired_keys
-        apply_error = _call(self.k8s.apply_many, desired)
+        stale = k8s.list_job_objects(job_id) - desired_keys
+        apply_error = _call(k8s.apply_many, desired)
         if apply_error:
             raise ReconcileError(apply_error, None)
-        self._delete_stale(stale)
+        self._delete_stale(k8s, stale)
 
     def teardown_job(self, job_id: str) -> None:
         self.k8s.delete_all_for_job(job_id)
+        if self.batch_k8s is not self.k8s:
+            self.batch_k8s.delete_all_for_job(job_id)
 
-    def k8s_for_rank(self, rank: Rank) -> DynamoKubernetesClient:
+    def k8s_for_rank(
+        self, rank: Rank, *, job_kind: JobKind = JobKind.ONLINE
+    ) -> DynamoKubernetesClient:
         """Cluster client that owns this rank's objects."""
-        return self.k8s
+        return self.batch_k8s if job_kind is JobKind.BATCH else self.k8s
 
-    def _delete_stale(self, stale: set[ObjectKey]) -> None:
-        delete_error = _call(self.k8s.delete_many, stale)
+    def _delete_stale(self, k8s: DynamoKubernetesClient, stale: set[ObjectKey]) -> None:
+        delete_error = _call(k8s.delete_many, stale)
         if delete_error:
             raise ReconcileError(None, delete_error)
 
@@ -150,7 +188,9 @@ class MultiClusterLauncher:
         self.tunnels = tunnels
         self.routers = routers
 
-    def reconcile(self, job_id: str, ranks: list[Rank]) -> None:
+    def reconcile(
+        self, job_id: str, ranks: list[Rank], *, job_kind: JobKind = JobKind.ONLINE
+    ) -> None:
         groups: dict[str, list[Rank]] = {key: [] for key in self.launchers}
         for rank in ranks:
             key = self.default_cluster or _rank_cluster_key(rank)
@@ -160,13 +200,13 @@ class MultiClusterLauncher:
 
         router_config = None
         ports: dict[str, int] = {}
-        if self.router_config_dir is not None:
+        if job_kind is JobKind.ONLINE and self.router_config_dir is not None:
             max_num_seq = _max_num_seq_by_rank(ranks, self.model_catalogs)
             ports = _ports_by_rank(ranks, self.router_port_base, self.router_port_span)
             router_config = render_router_config(job_id, ranks, max_num_seq, ports)
 
         for key, launcher in self.launchers.items():
-            launcher.reconcile(job_id, groups[key])
+            launcher.reconcile(job_id, groups[key], job_kind=job_kind)
 
         if router_config is not None:
             assert self.router_config_dir is not None
@@ -200,13 +240,15 @@ class MultiClusterLauncher:
                         ports[rank.rank_id],
                     )
 
-    def k8s_for_rank(self, rank: Rank) -> DynamoKubernetesClient:
+    def k8s_for_rank(
+        self, rank: Rank, *, job_kind: JobKind = JobKind.ONLINE
+    ) -> DynamoKubernetesClient:
         """Cluster client that owns this rank's objects."""
         key = self.default_cluster or _rank_cluster_key(rank)
         launcher = self.launchers.get(key)
         if launcher is None:
             raise ValueError(f"no kube context configured for rank environment {key!r}")
-        return launcher.k8s
+        return launcher.k8s_for_rank(rank, job_kind=job_kind)
 
     def teardown_job(self, job_id: str) -> None:
         for launcher in self.launchers.values():
