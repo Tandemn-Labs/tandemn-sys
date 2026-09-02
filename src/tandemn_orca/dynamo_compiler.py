@@ -29,9 +29,9 @@ from tandemn_orca.compiler_common import (
     workload_name,
 )
 
-FRONTEND_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.2.1"
-RUNTIME_IMAGE = "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1"
-PLANNER_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.1"
+FRONTEND_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.4.2"
+RUNTIME_IMAGE = "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.2"
+PLANNER_IMAGE = "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.4.2"
 
 # Per-job router listen ports live above the rank tunnel range
 # (launcher: 18000 + span 10000) so a router never collides with a tunnel.
@@ -241,10 +241,16 @@ def render_rank_dgd(job_id: str, rank: Rank, namespace: str) -> dict[str, Any]:
 
 
 def node_selector(shape: dict[str, Any]) -> dict[str, str]:
+    env = shape.get("env")
+    cloud = str(env[1]) if isinstance(env, (list, tuple)) and len(env) > 1 else ""
+    instance_type = required(shape, "instance_type")
+    if cloud == "gcp":
+        return {"cloud.google.com/gke-nodepool": instance_type}
+
     capacity_type = capacity_type_for(shape)
     selector = {
         # "tandemn.com/launch-class": "tdm-gpu-cr" if capacity_type == "reserved" else "tdm-gpu-flex",
-        "node.kubernetes.io/instance-type": required(shape, "instance_type"),
+        "node.kubernetes.io/instance-type": instance_type,
     }
     if capacity_type == "reserved":
         selector["karpenter.sh/capacity-type"] = "reserved"

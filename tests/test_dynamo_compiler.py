@@ -234,6 +234,13 @@ def test_pool_key_and_selector_are_from_rank_shape():
     }
 
 
+def test_gcp_node_selector_uses_gke_pool_without_karpenter_labels():
+    shape = dict(_rank("g2-standard-8", "L4").shape_json)
+    shape["env"] = ["on_demand", "gcp", "us-central1", "us-central1-c", "L4"]
+
+    assert node_selector(shape) == {"cloud.google.com/gke-nodepool": "g2-standard-8"}
+
+
 def test_worker_args_adds_quantization_and_spec_decoding_flags():
     shape = dict(_rank("p5.48xlarge", "H100").shape_json)
     shape.update(
