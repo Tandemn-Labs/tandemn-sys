@@ -238,7 +238,10 @@ def test_gcp_node_selector_uses_gke_pool_without_karpenter_labels():
     shape = dict(_rank("g2-standard-8", "L4").shape_json)
     shape["env"] = ["on_demand", "gcp", "us-central1", "us-central1-c", "L4"]
 
-    assert node_selector(shape) == {"cloud.google.com/gke-nodepool": "g2-standard-8"}
+    assert node_selector(shape) == {
+        "cloud.google.com/gke-nodepool": "g2-standard-8",
+        "node.kubernetes.io/instance-type": "g2-standard-8",
+    }
 
 
 def test_worker_args_adds_quantization_and_spec_decoding_flags():

@@ -241,11 +241,14 @@ def render_rank_dgd(job_id: str, rank: Rank, namespace: str) -> dict[str, Any]:
 
 
 def node_selector(shape: dict[str, Any]) -> dict[str, str]:
-    env = shape.get("env")
-    cloud = str(env[1]) if isinstance(env, (list, tuple)) and len(env) > 1 else ""
     instance_type = required(shape, "instance_type")
+    env = shape.get("env")
+    cloud = env[1] if isinstance(env, (list, tuple)) and len(env) > 1 else "aws"
     if cloud == "gcp":
-        return {"cloud.google.com/gke-nodepool": instance_type}
+        return {
+            "cloud.google.com/gke-nodepool": instance_type,
+            "node.kubernetes.io/instance-type": instance_type,
+        }
 
     capacity_type = capacity_type_for(shape)
     selector = {
