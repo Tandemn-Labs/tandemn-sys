@@ -29,7 +29,6 @@ def k8s_name(value: str) -> str:
 def labels(
     job_id: str,
     rank_id: str,
-    plan_id: str | None,
     resource_kind: str,
     pool: str | None = None,
 ) -> dict[str, str]:
@@ -39,8 +38,6 @@ def labels(
         "tandemn.com/rank-id": rank_id,
         "tandemn.com/resource-kind": resource_kind,
     }
-    if plan_id:
-        result["tandemn.com/plan-id"] = plan_id
     if pool:
         result["tandemn.com/pool-key"] = pool
     return result

@@ -57,12 +57,11 @@ def _dgd(
     }
 
 
-def _pod(chain: int, *, ready: bool = False, failed: bool = False, plan: str = "plan-1") -> dict:
+def _pod(chain: int, *, ready: bool = False, failed: bool = False) -> dict:
     return {
         "metadata": {
             "labels": {
                 "tandemn.com/chain-id": str(chain),
-                "tandemn.com/plan-id": plan,
             }
         },
         "status": {
@@ -198,24 +197,22 @@ def test_batch_counts_only_fully_ready_chains():
         [_pod(0, ready=True), _pod(0, ready=True), _pod(1, ready=True), _pod(1)],
         expected_replicas=2,
         nodes_per_chain=2,
-        plan_id="plan-1",
     )
 
     assert health.verdict is Verdict.SERVING
     assert health.serving_replicas == 1
 
 
-def test_batch_ignores_pods_from_old_plan():
+def test_batch_keeps_chains_from_prior_plan():
     health = batch_rank_health(
         JOB_ID,
         RANK_ID,
-        [_pod(0, ready=True, plan="old-plan")],
+        [_pod(0, ready=True)],
         expected_replicas=1,
         nodes_per_chain=1,
-        plan_id="plan-1",
     )
 
-    assert health.verdict is Verdict.UNKNOWN
+    assert health.verdict is Verdict.SERVING
 
 
 def test_batch_all_failed_is_down():
@@ -225,7 +222,6 @@ def test_batch_all_failed_is_down():
         [_pod(0, failed=True), _pod(1, failed=True)],
         expected_replicas=2,
         nodes_per_chain=1,
-        plan_id="plan-1",
     )
 
     assert health.verdict is Verdict.DOWN
@@ -239,7 +235,6 @@ def test_batch_zero_ready_after_serving_is_down():
         [_pod(0)],
         expected_replicas=1,
         nodes_per_chain=1,
-        plan_id="plan-1",
         ever_served=True,
     )
 
