@@ -153,6 +153,7 @@ def test_delete_many_supports_job_and_lws():
     client.delete_many({("Job", "batch"), ("LeaderWorkerSet", "multinode")})
 
     assert batch.deleted[0][0] == ("batch", "ns")
+    assert batch.deleted[0][1]["body"].propagation_policy == "Background"
     assert custom.deleted[0][0] == (
         LWS_GROUP,
         LWS_VERSION,

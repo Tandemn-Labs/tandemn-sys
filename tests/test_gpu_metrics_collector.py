@@ -34,7 +34,6 @@ def test_worker_index_uses_single_and_multinode_grove_indexes():
                 labels={
                     "tandemn.com/job-id": "job_1",
                     "tandemn.com/rank-id": "rank_0",
-                    "tandemn.com/plan-id": "plan_1",
                     "tandemn.com/pods-discovery": "dynamo-worker",
                     **labels,
                 },
@@ -71,7 +70,7 @@ def test_worker_index_uses_single_and_multinode_grove_indexes():
     workers = KubeWorkerIndex(core=core).by_pod()
 
     assert core.query == ("default", "tandemn.com/pods-discovery")
-    assert (workers["single"].plan_id, workers["single"].chain_index) == ("plan_1", 1)
+    assert workers["single"].chain_index == 1
     assert (
         workers["single"].member_index,
         workers["multi-leader"].member_index,
@@ -88,7 +87,6 @@ def test_worker_index_discovers_batch_jobs_and_lws_members():
                 labels={
                     "tandemn.com/job-id": "job_1",
                     "tandemn.com/rank-id": "rank_0",
-                    "tandemn.com/plan-id": "plan_1",
                     "tandemn.com/pods-discovery": "batch-worker",
                     "tandemn.com/chain-id": "3",
                     **labels,
@@ -179,7 +177,6 @@ def test_collect_once_attributes_owned_and_unowned_gpus():
         chain_index=1,
         role="decode",
         job_id="job_1",
-        plan_id="plan_1",
         model_name="Qwen/Qwen3-0.6B",
         ttft_target_ms=500.0,
     )
@@ -250,7 +247,6 @@ def test_collect_once_infers_owner_from_unique_worker_on_node():
         role=None,
         worker_kind="batch-worker",
         job_id="job_1",
-        plan_id="plan_1",
     )
 
     sample = collect_once(NodeProm(), {worker.worker_id: worker})[0]
@@ -284,7 +280,6 @@ def test_multinode_local_rank_and_cost_cover_the_full_chain():
             member_index=member,
             role="decode",
             job_id="job_1",
-            plan_id="plan_1",
         )
         for member in range(2)
     }
@@ -347,7 +342,6 @@ def test_batch_metrics_use_the_lws_leader_for_every_member():
             role=None,
             worker_kind="batch-worker",
             job_id="job_1",
-            plan_id="plan_1",
             model_name="microsoft/phi-4" if member == 0 else None,
         )
         for member, pod in enumerate(("batch-leader", "batch-worker"))
@@ -372,7 +366,6 @@ def _worker(
     chain_index: int | None,
     *,
     rank_id: str = "rank_0",
-    plan_id: str = "plan_1",
 ) -> WorkerInfo:
     return WorkerInfo(
         worker_id=pod,
@@ -381,7 +374,6 @@ def _worker(
         rank_id=rank_id,
         role="decode",
         job_id="job_1",
-        plan_id=plan_id,
         chain_index=chain_index,
     )
 
@@ -554,7 +546,7 @@ def test_validate_rank_identity_fails_closed():
         "missing": _worker("missing", None),
         "outside": _worker("outside", 9),
         "negative": _worker("negative", -1),
-        "old-plan": _worker("old-plan", 0, plan_id="plan_old"),
+        "old-plan": _worker("old-plan", 0),
         "wrong-rank": _worker("wrong-rank", 0, rank_id="rank_other"),
         "bad-member": _worker("bad-member", 0),
     }

@@ -228,12 +228,14 @@ def test_runner_logs_error_and_retries(monkeypatch):
 
     def stop_after_sleep(seconds):
         sleeps.append(seconds)
-        raise KeyboardInterrupt
+        if len(sleeps) == 2:
+            raise KeyboardInterrupt
 
     monkeypatch.setattr(mod.time, "sleep", stop_after_sleep)
 
     with pytest.raises(KeyboardInterrupt):
         mod.main(["--user-id", "default", "--interval-seconds", "3"])
 
-    assert FakeOrca.instances[0].applied_users == ["default"]
-    assert sleeps == [3]
+    assert FakeOrca.instances[0].applied_users == ["default", "default"]
+    assert FakeOrca.instances[0].reconciled_users == ["default", "default"]
+    assert sleeps == [3, 3]

@@ -201,7 +201,6 @@ def batch_rank_health(
     *,
     expected_replicas: int,
     nodes_per_chain: int,
-    plan_id: str | None,
     ever_served: bool = False,
 ) -> RankHealth:
     """Count batch chains whose pods are all ready."""
@@ -209,8 +208,6 @@ def batch_rank_health(
     for pod in pods:
         metadata = pod.get("metadata") or {}
         pod_labels = metadata.get("labels") or {}
-        if plan_id and pod_labels.get("tandemn.com/plan-id") != plan_id:
-            continue
         chain_id = pod_labels.get("tandemn.com/chain-id")
         if chain_id is not None:
             chains.setdefault(str(chain_id), []).append(pod)
