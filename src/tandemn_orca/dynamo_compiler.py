@@ -112,15 +112,11 @@ def pool_dgd_name(job_id: str, rank: Rank) -> str:
     return workload_name(job_id, rank.rank_id)
 
 
-def pod_metadata(
-    job_id: str, rank_id: str, plan_id: str | None, *, worker: bool = False
-) -> dict[str, Any]:
+def pod_metadata(job_id: str, rank_id: str, *, worker: bool = False) -> dict[str, Any]:
     pod_labels = {
         "tandemn.com/job-id": job_id,
         "tandemn.com/rank-id": rank_id,
     }
-    if plan_id:
-        pod_labels["tandemn.com/plan-id"] = plan_id
     if worker:
         pod_labels["tandemn.com/pods-discovery"] = "dynamo-worker"
     return {"labels": pod_labels}
@@ -135,7 +131,6 @@ def render_rank_dgd(job_id: str, rank: Rank, namespace: str) -> dict[str, Any]:
     name = pool_dgd_name(job_id, rank)
     shape = rank.shape_json
     rank_id = rank.rank_id
-    plan_id = rank.plan_id
     # gpu_count is one replica's world size (tp * pp, ... total GPUs); split
     # across node_count physical nodes for multinode TP/PP (default: one node,
     # gpus_per_node == gpu_count, byte-identical to the single-node DGD).
@@ -152,7 +147,7 @@ def render_rank_dgd(job_id: str, rank: Rank, namespace: str) -> dict[str, Any]:
         "kind": "DynamoGraphDeployment",
         "metadata": {
             "name": name,
-            "labels": labels(job_id, rank_id, plan_id, "pool", key),
+            "labels": labels(job_id, rank_id, "pool", key),
         },
         "spec": {
             "backendFramework": required(shape, "engine_name"),
@@ -160,7 +155,7 @@ def render_rank_dgd(job_id: str, rank: Rank, namespace: str) -> dict[str, Any]:
                 "Frontend": {
                     "componentType": "frontend",
                     "replicas": 1,
-                    "extraPodMetadata": pod_metadata(job_id, rank_id, plan_id),
+                    "extraPodMetadata": pod_metadata(job_id, rank_id),
                     "extraPodSpec": {
                         "mainContainer": {
                             "image": FRONTEND_IMAGE,
@@ -177,7 +172,7 @@ def render_rank_dgd(job_id: str, rank: Rank, namespace: str) -> dict[str, Any]:
                 "LocalRouter": {
                     "componentType": "default",
                     "replicas": 1,
-                    "extraPodMetadata": pod_metadata(job_id, rank_id, plan_id),
+                    "extraPodMetadata": pod_metadata(job_id, rank_id),
                     "extraPodSpec": {
                         "mainContainer": {
                             "image": RUNTIME_IMAGE,
@@ -201,7 +196,7 @@ def render_rank_dgd(job_id: str, rank: Rank, namespace: str) -> dict[str, Any]:
                     # would make every Orca re-apply fight the adapter (webhook
                     # rejection or a reset to the initial value).
                     "scalingAdapter": {"enabled": True},
-                    "extraPodMetadata": pod_metadata(job_id, rank_id, plan_id, worker=True),
+                    "extraPodMetadata": pod_metadata(job_id, rank_id, worker=True),
                     "resources": {
                         "requests": {"gpu": str(gpus_per_node)},
                         "limits": {"gpu": str(gpus_per_node)},
@@ -226,7 +221,7 @@ def render_rank_dgd(job_id: str, rank: Rank, namespace: str) -> dict[str, Any]:
                 "Planner": {
                     "componentType": "planner",
                     "replicas": 1,
-                    "extraPodMetadata": pod_metadata(job_id, rank_id, plan_id),
+                    "extraPodMetadata": pod_metadata(job_id, rank_id),
                     "extraPodSpec": {
                         "mainContainer": {
                             "image": PLANNER_IMAGE,

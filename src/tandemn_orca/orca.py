@@ -296,7 +296,6 @@ class Orca:
                                 pods,
                                 expected_replicas=rank.n_replicas,
                                 nodes_per_chain=rank_node_count(rank),
-                                plan_id=rank.plan_id,
                                 ever_served=(
                                     rank.status is RankStatus.RUNNING
                                     or rank.rank_id in self._served_rank_ids
@@ -1068,6 +1067,11 @@ def main(argv: list[str] | None = None) -> None:
                 logger.info("reconciled %s finished job(s)", reconciled)
             except Exception:
                 logger.exception("finished job reconciliation failed")
+            try:
+                reconciled = orca.reconcile_running(args.user_id)
+                logger.info("reconciled %s running job(s)", reconciled)
+            except Exception:
+                logger.exception("running job reconciliation failed")
             if args.rank_health:
                 try:
                     health = orca.reconcile_rank_health(args.user_id)

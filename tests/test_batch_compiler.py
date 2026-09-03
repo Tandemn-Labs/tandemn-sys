@@ -83,7 +83,7 @@ def test_compile_multinode_lws_per_chain():
     assert "--headless" in worker["args"][0]
 
 
-def test_batch_workload_name_changes_with_plan():
+def test_batch_workload_name_is_stable_across_plans():
     rank = _rank(replicas=1)
     first = compile_batch_job(JOB_ID, [rank], "ns", "chunk-manager:9090")[0]
     second = compile_batch_job(
@@ -93,7 +93,9 @@ def test_batch_workload_name_changes_with_plan():
         "chunk-manager:9090",
     )[0]
 
-    assert first["metadata"]["name"] != second["metadata"]["name"]
+    assert first["metadata"]["name"] == second["metadata"]["name"]
+    assert "tandemn.com/plan-id" not in first["metadata"]["labels"]
+    assert "tandemn.com/plan-id" not in first["spec"]["template"]["metadata"]["labels"]
 
 
 def test_batch_worker_accepts_secret_and_aws_region():

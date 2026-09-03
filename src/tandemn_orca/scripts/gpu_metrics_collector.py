@@ -290,7 +290,6 @@ _LABEL_DISCOVERY = "tandemn.com/pods-discovery"
 _LABEL_CHAIN = "tandemn.com/chain-id"
 _LABEL_JOB = "tandemn.com/job-id"
 _LABEL_RANK = "tandemn.com/rank-id"
-_LABEL_PLAN = "tandemn.com/plan-id"
 _LABEL_PCSG_INDEX = "grove.io/podcliquescalinggroup-replica-index"
 _LABEL_POD_CLIQUE = "grove.io/podclique"
 _LABEL_POD_INDEX = "grove.io/podclique-pod-index"
@@ -321,7 +320,6 @@ class WorkerInfo:
         role: str | None,
         worker_kind: str = "dynamo-worker",
         job_id: str | None = None,
-        plan_id: str | None = None,
         chain_index: int | None = None,
         member_index: int | None = None,
         pod_index: int | None = None,
@@ -337,7 +335,6 @@ class WorkerInfo:
         self.role = role
         self.worker_kind = worker_kind
         self.job_id = job_id
-        self.plan_id = plan_id
         self.member_index = member_index
         self.pod_index = pod_index
         self.node_count = 1
@@ -453,7 +450,6 @@ class KubeWorkerIndex:
                 role=labels.get(_LABEL_SUBCOMPONENT),
                 worker_kind=worker_kind,
                 job_id=labels.get(_LABEL_JOB),
-                plan_id=labels.get(_LABEL_PLAN),
                 chain_index=chain_index,
                 member_index=member_index,
                 pod_index=pod_index,
@@ -488,7 +484,6 @@ def validate_rank_identity(workers_by_pod: dict[str, WorkerInfo], ranks: list[Ra
             or (worker.member_index is not None and worker.member_index >= node_count)
         ):
             worker.job_id = None
-            worker.plan_id = None
             worker.rank_id = None
             worker.chain_index = None
             worker.role = None
@@ -784,10 +779,7 @@ def collect_once(
     for target in targets:
         worker = workers_by_pod.get(target.get("owner_pod", ""))
         if worker is not None and (
-            not worker.job_id
-            or not worker.plan_id
-            or not worker.rank_id
-            or worker.chain_index is None
+            not worker.job_id or not worker.rank_id or worker.chain_index is None
         ):
             worker = None
 

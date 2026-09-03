@@ -102,7 +102,6 @@ def test_compile_job_renders_self_contained_dgd_for_each_gpu_pool():
         expected = {
             "tandemn.com/job-id": "job_online_001",
             "tandemn.com/rank-id": RANK_IDS[0],
-            "tandemn.com/plan-id": "plan_1",
         }
         if service_name == "VllmDecodeWorker":
             expected["tandemn.com/pods-discovery"] = "dynamo-worker"
@@ -137,6 +136,17 @@ def test_compile_job_renders_self_contained_dgd_for_each_gpu_pool():
         "--dtype",
         "bfloat16",
     ]
+
+
+def test_online_manifest_is_stable_across_plans():
+    rank = _rank("g5.4xlarge", "A10")
+
+    first = render_rank_dgd("job_online_001", rank, "default")
+    second = render_rank_dgd(
+        "job_online_001", rank.model_copy(update={"plan_id": "plan_2"}), "default"
+    )
+
+    assert first == second
 
 
 def test_one_rank_compiles_to_one_pool_with_replica_budget():

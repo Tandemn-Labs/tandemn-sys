@@ -208,6 +208,7 @@ class DynamoKubernetesClient:
                 self.batch.delete_namespaced_job(
                     name,
                     self.namespace,
+                    body=client.V1DeleteOptions(propagation_policy="Background"),
                     _request_timeout=REQUEST_TIMEOUT_SECONDS,
                 )
                 return

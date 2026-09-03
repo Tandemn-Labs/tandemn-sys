@@ -64,20 +64,19 @@ def render_chain(
             f"rank {rank.rank_id}: count={gpu_count} does not divide evenly "
             f"across node_count={node_count}"
         )
-    name = workload_name(job_id, f"{rank.rank_id}-{rank.plan_id or 'unplanned'}-{chain_id}")
+    name = workload_name(job_id, f"{rank.rank_id}-{chain_id}")
     pod_labels = {
         "tandemn.com/job-type": "batched-inference",
         "tandemn.com/pods-discovery": "batch-worker",
         "tandemn.com/job-id": job_id,
         "tandemn.com/rank-id": rank.rank_id,
         "tandemn.com/chain-id": str(chain_id),
-        **({"tandemn.com/plan-id": rank.plan_id} if rank.plan_id else {}),
     }
     metadata = {
         "name": name,
         "namespace": namespace,
         "labels": {
-            **labels(job_id, rank.rank_id, rank.plan_id, "batch-worker"),
+            **labels(job_id, rank.rank_id, "batch-worker"),
             "tandemn.com/chain-id": str(chain_id),
         },
     }
