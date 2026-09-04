@@ -149,6 +149,19 @@ def test_online_manifest_is_stable_across_plans():
     assert first == second
 
 
+def test_online_worker_accepts_secret():
+    dgd = compile_job(
+        "job_online_001",
+        [_rank("g5.4xlarge", "A10")],
+        worker_secret="tandemn-worker-secrets",
+    )[0]
+
+    worker = dgd["spec"]["services"]["VllmDecodeWorker"]["extraPodSpec"]["mainContainer"]
+    assert worker["envFrom"] == [
+        {"secretRef": {"name": "tandemn-worker-secrets", "optional": False}}
+    ]
+
+
 def test_one_rank_compiles_to_one_pool_with_replica_budget():
     objects = compile_job("job_online_001", [_rank("g6e.12xlarge", "L40S", n_replicas=3)])
     by_name = _objects_by_name(objects)

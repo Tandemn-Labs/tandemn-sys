@@ -136,7 +136,7 @@ class DynamoLauncher:
             )
             k8s = self.batch_k8s
         else:
-            desired = compile_job(job_id, ranks, self.namespace)
+            desired = compile_job(job_id, ranks, self.namespace, self.batch_worker_secret)
             k8s = self.k8s
         desired_keys = {object_key(obj) for obj in desired}
         stale = k8s.list_job_objects(job_id) - desired_keys
