@@ -45,9 +45,14 @@ def router_listen_port(job_id: str) -> int:
     return ROUTER_LISTEN_PORT_BASE + int.from_bytes(digest[:4], "big") % ROUTER_LISTEN_PORT_SPAN
 
 
-def compile_job(job_id: str, ranks: list[Rank], namespace: str = "default") -> list[dict[str, Any]]:
+def compile_job(
+    job_id: str,
+    ranks: list[Rank],
+    namespace: str = "default",
+    worker_secret: str | None = None,
+) -> list[dict[str, Any]]:
     validate_unique_ranks(ranks)
-    return [render_rank_dgd(job_id, rank, namespace) for rank in ranks]
+    return [render_rank_dgd(job_id, rank, namespace, worker_secret) for rank in ranks]
 
 
 def render_router_config(
@@ -126,7 +131,9 @@ def dynamo_namespace(namespace: str, name: str) -> str:
     return f"{namespace}-{name}"
 
 
-def render_rank_dgd(job_id: str, rank: Rank, namespace: str) -> dict[str, Any]:
+def render_rank_dgd(
+    job_id: str, rank: Rank, namespace: str, worker_secret: str | None = None
+) -> dict[str, Any]:
     key = pool_key(rank)
     name = pool_dgd_name(job_id, rank)
     shape = rank.shape_json
@@ -215,6 +222,15 @@ def render_rank_dgd(job_id: str, rank: Rank, namespace: str) -> dict[str, Any]:
                             "workingDir": "/workspace/examples/backends/vllm",
                             "command": ["python3", "-m", "dynamo.vllm"],
                             "args": worker_args(shape),
+                            **(
+                                {
+                                    "envFrom": [
+                                        {"secretRef": {"name": worker_secret, "optional": False}}
+                                    ]
+                                }
+                                if worker_secret
+                                else {}
+                            ),
                         },
                     },
                 },

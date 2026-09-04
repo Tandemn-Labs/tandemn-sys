@@ -862,7 +862,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--batch-worker-secret",
         default=os.getenv("TANDEMN_BATCH_WORKER_SECRET"),
-        help="optional Secret exposed to batch worker containers via envFrom",
+        help="optional Secret exposed to online and batch worker containers via envFrom",
     )
     parser.add_argument(
         "--batch-aws-region",
