@@ -855,6 +855,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--router-binary", default=os.getenv("TANDEMN_ROUTER_BINARY"))
     parser.add_argument("--cluster-contexts", default=os.getenv("TANDEMN_CLUSTER_CONTEXTS"))
     parser.add_argument(
+        "--online-worker-secret",
+        default=os.getenv("TANDEMN_ONLINE_WORKER_SECRET"),
+        help="optional Secret exposed to online vLLM workers via envFrom",
+    )
+    parser.add_argument(
         "--chunk-manager-target",
         default=os.getenv("TANDEMN_CHUNK_MANAGER_TARGET"),
         help="chunk-manager gRPC target, for example chunk-manager:9090",
@@ -862,7 +867,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--batch-worker-secret",
         default=os.getenv("TANDEMN_BATCH_WORKER_SECRET"),
-        help="optional Secret exposed to online and batch worker containers via envFrom",
+        help="optional Secret exposed to batch worker containers via envFrom",
     )
     parser.add_argument(
         "--batch-aws-region",
@@ -962,6 +967,7 @@ def main(argv: list[str] | None = None) -> None:
                 batch_chunk_manager_address=args.chunk_manager_target,
                 batch_namespace=batch_namespace,
                 batch_k8s=batch_k8s,
+                online_worker_secret=args.online_worker_secret,
                 batch_worker_secret=args.batch_worker_secret,
                 batch_aws_region=args.batch_aws_region,
             )
@@ -972,6 +978,7 @@ def main(argv: list[str] | None = None) -> None:
                 namespace=args.namespace,
                 batch_chunk_manager_address=args.chunk_manager_target,
                 batch_namespace=batch_namespace,
+                online_worker_secret=args.online_worker_secret,
                 batch_worker_secret=args.batch_worker_secret,
                 batch_aws_region=args.batch_aws_region,
             )

@@ -105,6 +105,20 @@ def test_dynamo_launcher_compiles_batch_jobs_per_chain():
     assert [obj["kind"] for obj in k8s.applied[0]] == ["Job", "Job"]
 
 
+def test_dynamo_launcher_uses_online_worker_secret():
+    k8s = FakeK8s()
+    DynamoLauncher(k8s=k8s, online_worker_secret="dynamo-worker-secrets").reconcile(
+        "job_online_001", [_rank()]
+    )
+
+    worker = k8s.applied[0][0]["spec"]["services"]["VllmDecodeWorker"]["extraPodSpec"][
+        "mainContainer"
+    ]
+    assert worker["envFrom"] == [
+        {"secretRef": {"name": "dynamo-worker-secrets", "optional": False}}
+    ]
+
+
 def test_dynamo_launcher_uses_separate_batch_namespace():
     online = FakeK8s(namespace="online")
     batch = FakeK8s(namespace="batch")

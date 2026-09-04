@@ -106,6 +106,7 @@ class DynamoLauncher:
         batch_chunk_manager_address: str | None = None,
         batch_namespace: str | None = None,
         batch_k8s: DynamoKubernetesClient | None = None,
+        online_worker_secret: str | None = None,
         batch_worker_secret: str | None = None,
         batch_aws_region: str | None = None,
     ) -> None:
@@ -114,6 +115,7 @@ class DynamoLauncher:
         self.context = context
         self.batch_chunk_manager_address = batch_chunk_manager_address
         self.batch_namespace = batch_namespace or namespace
+        self.online_worker_secret = online_worker_secret
         self.batch_worker_secret = batch_worker_secret
         self.batch_aws_region = batch_aws_region
         self.batch_k8s = batch_k8s or (
@@ -136,7 +138,7 @@ class DynamoLauncher:
             )
             k8s = self.batch_k8s
         else:
-            desired = compile_job(job_id, ranks, self.namespace, self.batch_worker_secret)
+            desired = compile_job(job_id, ranks, self.namespace, self.online_worker_secret)
             k8s = self.k8s
         desired_keys = {object_key(obj) for obj in desired}
         stale = k8s.list_job_objects(job_id) - desired_keys
