@@ -8,6 +8,9 @@ from tandemn_system_data.models.rank import Rank
 
 from tandemn_orca.compiler_common import (
     labels,
+    local_model_path,
+    model_weights_mount,
+    model_weights_volume,
     rank_node_count,
     required,
     validate_unique_ranks,
@@ -94,7 +97,10 @@ def render_chain(
             "periodSeconds": 10,
             "timeoutSeconds": 2,
         },
-        "volumeMounts": [{"name": "dshm", "mountPath": "/dev/shm"}],
+        "volumeMounts": [
+            {"name": "dshm", "mountPath": "/dev/shm"},
+            model_weights_mount(),
+        ],
     }
     if worker_secret:
         common["envFrom"] = [{"secretRef": {"name": worker_secret, "optional": False}}]
@@ -115,7 +121,7 @@ def render_chain(
                         "terminationGracePeriodSeconds": 90,
                         "nodeSelector": _node_selector(rank),
                         "containers": [common],
-                        "volumes": [_dshm("96Gi")],
+                        "volumes": [_dshm("96Gi"), model_weights_volume()],
                     },
                 },
             },
@@ -123,7 +129,7 @@ def render_chain(
 
     common["name"] = "tandemn-batched-leader"
     common["resources"] = _resources(gpus_per_node, memory=True)
-    model = required(rank.shape_json, "model_id")
+    model = local_model_path(rank.shape_json)
     parallel_args = _parallel_args(rank)
     distributed_args = (
         f"{parallel_args} --nnodes $(LWS_GROUP_SIZE) --node-rank $(LWS_WORKER_INDEX) "
@@ -144,7 +150,7 @@ def render_chain(
                         "terminationGracePeriodSeconds": 90,
                         "nodeSelector": _node_selector(rank),
                         "containers": [common],
-                        "volumes": [_dshm("16Gi")],
+                        "volumes": [_dshm("16Gi"), model_weights_volume()],
                     },
                 },
                 "workerTemplate": {
@@ -158,10 +164,13 @@ def render_chain(
                                 "command": ["sh", "-c"],
                                 "args": [f"vllm serve {model} {distributed_args} --headless"],
                                 "resources": _resources(gpus_per_node),
-                                "volumeMounts": [{"name": "dshm", "mountPath": "/dev/shm"}],
+                                "volumeMounts": [
+                                    {"name": "dshm", "mountPath": "/dev/shm"},
+                                    model_weights_mount(),
+                                ],
                             }
                         ],
-                        "volumes": [_dshm("16Gi")],
+                        "volumes": [_dshm("16Gi"), model_weights_volume()],
                     },
                 },
             },
@@ -183,7 +192,7 @@ def _leader_env(
             "--master-addr $(LWS_LEADER_ADDRESS)"
         )
     env = [
-        {"name": "TD_VLLM_MODEL", "value": required(rank.shape_json, "model_id")},
+        {"name": "TD_VLLM_MODEL", "value": local_model_path(rank.shape_json)},
         {"name": "TD_VLLM_HOST", "value": "0.0.0.0"},
         {"name": "TD_VLLM_EXTRA_ARGS", "value": args},
         {"name": "TD_CHUNK_MANAGER_ADDRESS", "value": chunk_manager_address},

@@ -112,9 +112,15 @@ def test_compile_job_renders_self_contained_dgd_for_each_gpu_pool():
         "karpenter.sh/capacity-type": "reserved",
     }
     assert worker["resources"] == {"requests": {"gpu": "1"}, "limits": {"gpu": "1"}}
+    assert worker["extraPodSpec"]["volumes"] == [
+        {"name": "model-weights", "persistentVolumeClaim": {"claimName": "model-weights"}}
+    ]
+    assert worker["extraPodSpec"]["mainContainer"]["volumeMounts"] == [
+        {"name": "model-weights", "mountPath": "/models", "readOnly": True}
+    ]
     assert worker["extraPodSpec"]["mainContainer"]["args"] == [
         "--model",
-        "meta-llama/Llama-3.1-8B-Instruct",
+        "/models/Llama-3.1-8B-Instruct",
         "--tensor-parallel-size",
         "1",
         "--max-num-seqs",
@@ -285,7 +291,7 @@ def test_worker_args_adds_quantization_and_spec_decoding_flags():
     assert args[args.index("--quantization") + 1] == "awq"
     assert "--spec-method" in args
     assert args[args.index("--spec-method") + 1] == "draft_model"
-    assert args[args.index("--spec-model") + 1] == "draft/model"
+    assert args[args.index("--spec-model") + 1] == "/models/model"
     assert args[args.index("--spec-tokens") + 1] == "4"
 
 

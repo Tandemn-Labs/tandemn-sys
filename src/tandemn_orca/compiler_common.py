@@ -50,6 +50,21 @@ def required(shape: dict[str, Any], key: str) -> str:
     return str(value)
 
 
+def local_model_path(shape: dict[str, Any]) -> str:
+    return f"/models/{required(shape, 'model_id').rsplit('/', 1)[-1]}"
+
+
+def model_weights_volume() -> dict[str, Any]:
+    return {
+        "name": "model-weights",
+        "persistentVolumeClaim": {"claimName": "model-weights"},
+    }
+
+
+def model_weights_mount() -> dict[str, str | bool]:
+    return {"name": "model-weights", "mountPath": "/models", "readOnly": True}
+
+
 def worker_gpu_count(rank: Rank) -> int:
     count = rank.shape_json.get("count")
     if type(count) is not int or count <= 0:

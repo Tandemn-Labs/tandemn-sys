@@ -49,7 +49,7 @@ def test_compile_single_node_job_per_chain():
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "4"
     assert container["readinessProbe"]["httpGet"] == {"path": "/health", "port": "vllm"}
     assert _env(container) == {
-        "TD_VLLM_MODEL": "microsoft/phi-4",
+        "TD_VLLM_MODEL": "/models/phi-4",
         "TD_VLLM_HOST": "0.0.0.0",
         "TD_VLLM_EXTRA_ARGS": "--pipeline-parallel-size=2 --tensor-parallel-size=2",
         "TD_CHUNK_MANAGER_ADDRESS": "chunk-manager:9090",
@@ -57,6 +57,14 @@ def test_compile_single_node_job_per_chain():
         "TD_RANK_ID": "01JBM30YQ7X3WQAR6HF8C2Q9T8",
         "TD_CHAIN_ID": "0",
     }
+    assert pod["volumes"] == [
+        {"name": "dshm", "emptyDir": {"medium": "Memory", "sizeLimit": "96Gi"}},
+        {"name": "model-weights", "persistentVolumeClaim": {"claimName": "model-weights"}},
+    ]
+    assert container["volumeMounts"] == [
+        {"name": "dshm", "mountPath": "/dev/shm"},
+        {"name": "model-weights", "mountPath": "/models", "readOnly": True},
+    ]
 
 
 def test_compile_multinode_lws_per_chain():
@@ -81,6 +89,14 @@ def test_compile_multinode_lws_per_chain():
     assert worker["resources"]["limits"]["nvidia.com/gpu"] == "2"
     assert "--nnodes $(LWS_GROUP_SIZE)" in _env(leader)["TD_VLLM_EXTRA_ARGS"]
     assert "--headless" in worker["args"][0]
+    assert _env(leader)["TD_VLLM_MODEL"] == "/models/phi-4"
+    assert "vllm serve /models/phi-4" in worker["args"][0]
+    assert leader["volumeMounts"][1] == {
+        "name": "model-weights",
+        "mountPath": "/models",
+        "readOnly": True,
+    }
+    assert worker["volumeMounts"][1] == leader["volumeMounts"][1]
 
 
 def test_batch_workload_name_is_stable_across_plans():
