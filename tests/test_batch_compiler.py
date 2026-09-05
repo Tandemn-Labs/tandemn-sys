@@ -51,6 +51,7 @@ def test_compile_single_node_job_per_chain():
     assert _env(container) == {
         "TD_VLLM_MODEL": "/models/phi-4",
         "TD_VLLM_HOST": "0.0.0.0",
+        "TD_VLLM_READY_TIMEOUT_SECONDS": "1800",
         "TD_VLLM_EXTRA_ARGS": "--pipeline-parallel-size=2 --tensor-parallel-size=2",
         "TD_CHUNK_MANAGER_ADDRESS": "chunk-manager:9090",
         "TD_JOB_ID": "01JBM2YQYZ1KQ9C8GZP1XB6V5T",
