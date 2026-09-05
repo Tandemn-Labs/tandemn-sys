@@ -22,6 +22,9 @@ from tandemn_system_data.models.rank import Rank
 from tandemn_orca.compiler_common import (
     k8s_name,
     labels,
+    local_model_path,
+    model_weights_mount,
+    model_weights_volume,
     rank_node_count,
     required,
     validate_unique_ranks,
@@ -214,6 +217,7 @@ def render_rank_dgd(
                     **({"multinode": {"nodeCount": node_count}} if node_count > 1 else {}),
                     "extraPodSpec": {
                         "nodeSelector": node_selector(shape),
+                        "volumes": [model_weights_volume()],
                         "tolerations": [
                             {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}
                         ],
@@ -222,6 +226,7 @@ def render_rank_dgd(
                             "workingDir": "/workspace/examples/backends/vllm",
                             "command": ["python3", "-m", "dynamo.vllm"],
                             "args": worker_args(shape),
+                            "volumeMounts": [model_weights_mount()],
                             **(
                                 {
                                     "envFrom": [
@@ -274,7 +279,7 @@ def node_selector(shape: dict[str, Any]) -> dict[str, str]:
 
 
 def worker_args(shape: dict[str, Any]) -> list[str]:
-    args = ["--model", required(shape, "model_id")]
+    args = ["--model", local_model_path(shape)]
     optional = {
         "tp": "--tensor-parallel-size",
         "pp": "--pipeline-parallel-size",
@@ -306,7 +311,7 @@ def worker_args(shape: dict[str, Any]) -> list[str]:
         if spec_method and str(spec_method).lower() != "none":
             args.extend(["--spec-method", str(spec_method)])
         if draft_model:
-            args.extend(["--spec-model", str(draft_model)])
+            args.extend(["--spec-model", f"/models/{str(draft_model).rsplit('/', 1)[-1]}"])
         if spec_tokens:
             args.extend(["--spec-tokens", str(spec_tokens)])
     return args
