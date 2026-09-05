@@ -194,6 +194,7 @@ def _leader_env(
     env = [
         {"name": "TD_VLLM_MODEL", "value": local_model_path(rank.shape_json)},
         {"name": "TD_VLLM_HOST", "value": "0.0.0.0"},
+        {"name": "TD_VLLM_READY_TIMEOUT_SECONDS", "value": "1800"},
         {"name": "TD_VLLM_EXTRA_ARGS", "value": args},
         {"name": "TD_CHUNK_MANAGER_ADDRESS", "value": chunk_manager_address},
         {"name": "TD_JOB_ID", "value": rank.job_id.removeprefix("job_")},
