@@ -279,7 +279,12 @@ def node_selector(shape: dict[str, Any]) -> dict[str, str]:
 
 
 def worker_args(shape: dict[str, Any]) -> list[str]:
-    args = ["--model", local_model_path(shape)]
+    args = [
+        "--model",
+        local_model_path(shape),
+        "--served-model-name",
+        required(shape, "model_id"),
+    ]
     optional = {
         "tp": "--tensor-parallel-size",
         "pp": "--pipeline-parallel-size",

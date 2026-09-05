@@ -121,6 +121,8 @@ def test_compile_job_renders_self_contained_dgd_for_each_gpu_pool():
     assert worker["extraPodSpec"]["mainContainer"]["args"] == [
         "--model",
         "/models/Llama-3.1-8B-Instruct",
+        "--served-model-name",
+        "meta-llama/Llama-3.1-8B-Instruct",
         "--tensor-parallel-size",
         "1",
         "--max-num-seqs",
