@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 from typing import Any
 
 from tandemn_system_data.models.rank import Rank
@@ -152,6 +153,21 @@ def render_rank_dgd(
             f"evenly across node_count={node_count}"
         )
     gpus_per_node = gpu_count // node_count
+    worker_command = ["python3", "-m", "dynamo.vllm"]
+    worker_arguments = worker_args(shape)
+    env = shape.get("env")
+    if isinstance(env, (list, tuple)) and len(env) > 1 and env[1] == "gcp":
+        worker_command = ["sh", "-c"]
+        worker_arguments = [
+            "\n".join(
+                [
+                    "export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:$LD_LIBRARY_PATH",
+                    "export PATH=$PATH:/usr/local/nvidia/bin:/usr/local/nvidia/lib64",
+                    "/sbin/ldconfig",
+                    f"exec {shlex.join(['python3', '-m', 'dynamo.vllm', *worker_arguments])}",
+                ]
+            )
+        ]
     return {
         "apiVersion": "nvidia.com/v1alpha1",
         "kind": "DynamoGraphDeployment",
@@ -224,8 +240,8 @@ def render_rank_dgd(
                         "mainContainer": {
                             "image": RUNTIME_IMAGE,
                             "workingDir": "/workspace/examples/backends/vllm",
-                            "command": ["python3", "-m", "dynamo.vllm"],
-                            "args": worker_args(shape),
+                            "command": worker_command,
+                            "args": worker_arguments,
                             "volumeMounts": [model_weights_mount()],
                             **(
                                 {

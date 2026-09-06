@@ -275,6 +275,29 @@ def test_gcp_selector_uses_node_pool_and_instance_type():
     }
 
 
+def test_gcp_worker_initializes_gpu_libraries_before_vllm():
+    rank = _rank("g2-standard-48", "L4")
+    rank.shape_json["env"] = ["on_demand", "gcp", "us-central1", "us-central1-a", "L4"]
+
+    container = render_rank_dgd("job_1", rank, "default")["spec"]["services"]["VllmDecodeWorker"][
+        "extraPodSpec"
+    ]["mainContainer"]
+
+    assert container["command"] == ["sh", "-c"]
+    assert container["args"] == [
+        "export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:$LD_LIBRARY_PATH\n"
+        "export PATH=$PATH:/usr/local/nvidia/bin:/usr/local/nvidia/lib64\n"
+        "/sbin/ldconfig\n"
+        "exec python3 -m dynamo.vllm --model /models/Llama-3.1-8B-Instruct "
+        "--served-model-name meta-llama/Llama-3.1-8B-Instruct "
+        "--tensor-parallel-size 1 --max-num-seqs 64 "
+        "--max-num-batched-tokens 32768 --gpu-memory-utilization 0.9 "
+        "--max-model-len 8192 --block-size 16 --kv-cache-dtype auto "
+        "--scheduling-policy fcfs --enable-prefix-caching --enable-chunked-prefill "
+        "--dtype bfloat16"
+    ]
+
+
 def test_worker_args_adds_quantization_and_spec_decoding_flags():
     shape = dict(_rank("p5.48xlarge", "H100").shape_json)
     shape.update(

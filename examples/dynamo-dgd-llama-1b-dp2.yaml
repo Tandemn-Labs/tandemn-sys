@@ -1,0 +1,114 @@
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: tdm-ama-1b-dp2-e60f1b2e
+  labels:
+    tandemn.com/managed-by: orca
+    tandemn.com/job-id: job_example_llama_1b_dp2
+    tandemn.com/rank-id: rank_example_llama_1b_dp2
+    tandemn.com/resource-kind: pool
+    tandemn.com/pool-key: rank-example-llama-1b-dp2-g2-standard-24-l4
+spec:
+  backendFramework: vllm
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          tandemn.com/job-id: job_example_llama_1b_dp2
+          tandemn.com/rank-id: rank_example_llama_1b_dp2
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.4.2
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-mode
+            - round-robin
+            - --model-name
+            - meta-llama/Llama-3.2-1B-Instruct
+    LocalRouter:
+      componentType: default
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          tandemn.com/job-id: job_example_llama_1b_dp2
+          tandemn.com/rank-id: rank_example_llama_1b_dp2
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.2
+          env:
+            - name: DYN_SYSTEM_PORT
+              value: "9090"
+          command:
+            - python3
+            - -m
+            - dynamo.router
+          args:
+            - --endpoint
+            - dynamo-system-tdm-ama-1b-dp2-e60f1b2e.router.generate
+            - --router-block-size
+            - "16"
+    VllmDecodeWorker:
+      componentType: worker
+      subComponentType: decode
+      scalingAdapter:
+        enabled: true
+      extraPodMetadata:
+        labels:
+          tandemn.com/job-id: job_example_llama_1b_dp2
+          tandemn.com/rank-id: rank_example_llama_1b_dp2
+          tandemn.com/pods-discovery: dynamo-worker
+      resources:
+        requests:
+          gpu: "1"
+        limits:
+          gpu: "1"
+      extraPodSpec:
+        nodeSelector:
+          cloud.google.com/gke-nodepool: g2-standard-24
+          node.kubernetes.io/instance-type: g2-standard-24
+        volumes:
+          - name: model-weights
+            persistentVolumeClaim:
+              claimName: model-weights
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.2
+          workingDir: /workspace/examples/backends/vllm
+          command:
+            - sh
+            - -c
+          args:
+            - |-
+              export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:$LD_LIBRARY_PATH
+              export PATH=$PATH:/usr/local/nvidia/bin:/usr/local/nvidia/lib64
+              /sbin/ldconfig
+              exec python3 -m dynamo.vllm --model /models/Llama-3.2-1B-Instruct --served-model-name meta-llama/Llama-3.2-1B-Instruct --tensor-parallel-size 1
+          volumeMounts:
+            - name: model-weights
+              mountPath: /models
+              readOnly: true
+    Planner:
+      componentType: planner
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          tandemn.com/job-id: job_example_llama_1b_dp2
+          tandemn.com/rank-id: rank_example_llama_1b_dp2
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.4.2
+          command:
+            - python3
+            - -m
+            - dynamo.planner
+          args:
+            - --config
+            - '{"mode":"agg","backend":"vllm","environment":"kubernetes","optimization_target":"sla","enable_throughput_scaling":false,"enable_load_scaling":true,"pre_deployment_sweeping_mode":"none","load_predictor":"prophet","load_adjustment_interval_seconds":5,"min_endpoint":1,"max_gpu_budget":2,"ttft_ms":500.0,"itl_ms":50.0}'
