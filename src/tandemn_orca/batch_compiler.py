@@ -112,7 +112,6 @@ def render_chain(
             "kind": "Job",
             "metadata": metadata,
             "spec": {
-                "backoffLimit": 0,
                 "ttlSecondsAfterFinished": 86400,
                 "template": {
                     "metadata": {"labels": pod_labels},
