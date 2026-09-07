@@ -11,6 +11,7 @@ from tandemn_system_data.models import Rank, RankRole, ResourceMap
 
 from tandemn_orca.dynamo_compiler import router_listen_port
 from tandemn_orca.scripts.gpu_metrics_collector import (
+    GPU_QUERIES,
     KubeWorkerIndex,
     PrometheusClient,
     RankTelemetrySnapshot,
@@ -24,6 +25,16 @@ from tandemn_orca.scripts.gpu_metrics_collector import (
     resolve_instance_price_per_hour,
     validate_rank_identity,
 )
+
+
+def test_gpu_memory_fraction_uses_available_dcgm_fields():
+    query = GPU_QUERIES["gpu_mem_used_fraction"]
+
+    assert query == (
+        "DCGM_FI_DEV_FB_USED{{{gpu}}} / "
+        "(DCGM_FI_DEV_FB_USED{{{gpu}}} + DCGM_FI_DEV_FB_FREE{{{gpu}}})"
+    )
+    assert "DCGM_FI_DEV_FB_RESERVED" not in query
 
 
 def test_worker_index_uses_single_and_multinode_grove_indexes():

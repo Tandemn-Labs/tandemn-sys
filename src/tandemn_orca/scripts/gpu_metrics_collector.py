@@ -77,8 +77,7 @@ COLLECT_INTERVAL_SECONDS = 5
 GPU_QUERIES: dict[str, str] = {
     "gpu_mem_used_fraction": (
         "DCGM_FI_DEV_FB_USED{{{gpu}}} / "
-        "(DCGM_FI_DEV_FB_USED{{{gpu}}} + DCGM_FI_DEV_FB_FREE{{{gpu}}} "
-        "+ DCGM_FI_DEV_FB_RESERVED{{{gpu}}})"
+        "(DCGM_FI_DEV_FB_USED{{{gpu}}} + DCGM_FI_DEV_FB_FREE{{{gpu}}})"
     ),
     "vram_headroom_gb": "DCGM_FI_DEV_FB_FREE{{{gpu}}} / 1024",
     "sm_utilization": "DCGM_FI_PROF_SM_ACTIVE{{{gpu}}}",
