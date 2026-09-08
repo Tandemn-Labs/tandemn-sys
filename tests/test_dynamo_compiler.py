@@ -83,7 +83,7 @@ def test_compile_job_renders_self_contained_dgd_for_each_gpu_pool():
     h100 = next(
         obj for obj in objects if obj["metadata"]["labels"]["tandemn.com/rank-id"] == RANK_IDS[0]
     )
-    assert h100["apiVersion"] == "nvidia.com/v1beta1"
+    assert h100["apiVersion"] == "nvidia.com/v1alpha1"
     assert list(h100["spec"]["services"]) == [
         "Frontend",
         "LocalRouter",

@@ -78,6 +78,7 @@ from tandemn_orca.rank_health import (
     batch_rank_health,
     dgd_by_rank_id,
     rank_health,
+    startup_failure_reason_code,
     termination_reason_code,
 )
 from tandemn_orca.router_health import RankHealthPublisher
@@ -321,7 +322,7 @@ class Orca:
                     )
                     if health.verdict is Verdict.UNKNOWN and not ever_served:
                         try:
-                            cause = termination_reason_code(k8s.rank_pods(job_id, rank.rank_id))
+                            cause = startup_failure_reason_code(k8s.rank_pods(job_id, rank.rank_id))
                         except Exception:
                             logger.exception(
                                 "startup pod status read failed for rank %s", rank.rank_id

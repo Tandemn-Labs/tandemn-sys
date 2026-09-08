@@ -15,6 +15,7 @@ from tandemn_orca.rank_health import (
     dgd_by_rank_id,
     rank_health,
     serving_replicas,
+    startup_failure_reason_code,
     termination_reason_code,
 )
 
@@ -293,3 +294,68 @@ def test_termination_reason_maps_crash_loop():
 
 def test_termination_reason_absent_for_healthy_pods():
     assert termination_reason_code([{"metadata": {"name": "w"}, "status": {}}]) is None
+
+
+def test_startup_failure_ignores_historical_error_after_recovery():
+    pods = [
+        {
+            "metadata": {"name": "worker-0"},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                    {
+                        "name": "main",
+                        "state": {"running": {"startedAt": "now"}},
+                        "lastState": {"terminated": {"reason": "Error"}},
+                    }
+                ],
+            },
+        }
+    ]
+
+    assert startup_failure_reason_code(pods) is None
+
+
+def test_startup_failure_maps_crash_loop_oom():
+    pods = [
+        {
+            "metadata": {"name": "worker-0"},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                    {
+                        "name": "main",
+                        "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                        "lastState": {"terminated": {"reason": "OOMKilled"}},
+                    }
+                ],
+            },
+        }
+    ]
+
+    assert startup_failure_reason_code(pods) == (
+        ReasonCode.OOM,
+        "worker-0/main in CrashLoopBackOff after OOMKilled",
+    )
+
+
+def test_startup_failure_maps_current_nonzero_exit():
+    pods = [
+        {
+            "metadata": {"name": "worker-0"},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                    {
+                        "name": "main",
+                        "state": {"terminated": {"reason": "Error", "exitCode": 1}},
+                    }
+                ],
+            },
+        }
+    ]
+
+    assert startup_failure_reason_code(pods) == (
+        ReasonCode.PROCESS_CRASH,
+        "worker-0/main terminated: Error",
+    )

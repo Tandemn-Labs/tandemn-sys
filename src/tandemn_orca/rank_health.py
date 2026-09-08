@@ -71,6 +71,15 @@ _TERMINATION_REASONS = {
     "ContainerCannotRun": ReasonCode.PROCESS_CRASH,
     "DeadlineExceeded": ReasonCode.PROCESS_CRASH,
 }
+_STARTUP_WAITING_REASONS = {
+    "ContainerCannotRun": ReasonCode.PROCESS_CRASH,
+    "CreateContainerConfigError": ReasonCode.LAUNCH_FAILED,
+    "CreateContainerError": ReasonCode.LAUNCH_FAILED,
+    "ErrImagePull": ReasonCode.LAUNCH_FAILED,
+    "ImagePullBackOff": ReasonCode.LAUNCH_FAILED,
+    "InvalidImageName": ReasonCode.LAUNCH_FAILED,
+    "RunContainerError": ReasonCode.LAUNCH_FAILED,
+}
 
 
 class Verdict(StrEnum):
@@ -318,6 +327,48 @@ def termination_reason_code(pods: list[dict[str, Any]]) -> tuple[str, str] | Non
             if str(waiting.get("reason")) == "CrashLoopBackOff":
                 name = (pod.get("metadata") or {}).get("name", "?")
                 return ReasonCode.PROCESS_CRASH, f"{name} in CrashLoopBackOff"
+    return None
+
+
+def startup_failure_reason_code(pods: list[dict[str, Any]]) -> tuple[str, str] | None:
+    """Return a failure only while a Pod is currently in a failed startup state."""
+    for pod in pods:
+        status = pod.get("status") or {}
+        pod_failed = status.get("phase") == "Failed"
+        for container in status.get("containerStatuses") or []:
+            if not isinstance(container, dict):
+                continue
+            name = (pod.get("metadata") or {}).get("name", "?")
+            container_name = container.get("name", "?")
+            state = container.get("state") or {}
+            waiting = state.get("waiting") or {}
+            waiting_reason = str(waiting.get("reason") or "")
+            last_terminated = (container.get("lastState") or {}).get("terminated") or {}
+
+            if waiting_reason == "CrashLoopBackOff":
+                last_reason = str(last_terminated.get("reason") or "")
+                code = _TERMINATION_REASONS.get(last_reason, ReasonCode.PROCESS_CRASH)
+                detail = f"{name}/{container_name} in CrashLoopBackOff"
+                if last_reason:
+                    detail += f" after {last_reason}"
+                return code, detail
+
+            code = _STARTUP_WAITING_REASONS.get(waiting_reason)
+            if code is not None:
+                return code, f"{name}/{container_name} waiting: {waiting_reason}"
+
+            current_terminated = state.get("terminated") or {}
+            exit_code = current_terminated.get("exitCode")
+            if current_terminated and exit_code != 0:
+                reason = str(current_terminated.get("reason") or "")
+                code = _TERMINATION_REASONS.get(reason, ReasonCode.PROCESS_CRASH)
+                return code, f"{name}/{container_name} terminated: {reason or exit_code}"
+
+            if pod_failed:
+                terminated = current_terminated or last_terminated
+                reason = str(terminated.get("reason") or "")
+                code = _TERMINATION_REASONS.get(reason, ReasonCode.PROCESS_CRASH)
+                return code, f"{name}/{container_name} terminated: {reason or 'unknown'}"
     return None
 
 

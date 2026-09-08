@@ -23,7 +23,7 @@ from tandemn_orca.dynamo_kubernetes import (
 
 def _dgd(name: str = "pool") -> dict:
     return {
-        "apiVersion": "nvidia.com/v1beta1",
+        "apiVersion": "nvidia.com/v1alpha1",
         "kind": "DynamoGraphDeployment",
         "metadata": {"name": name},
     }

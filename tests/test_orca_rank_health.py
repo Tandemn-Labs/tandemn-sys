@@ -299,6 +299,32 @@ def test_launching_crash_loop_fails_after_debounce(monkeypatch):
     )
 
 
+def test_launching_recovered_container_stays_unknown(monkeypatch):
+    pods = [
+        {
+            "metadata": {"name": "worker-0"},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                    {
+                        "name": "main",
+                        "state": {"running": {"startedAt": "now"}},
+                        "lastState": {"terminated": {"reason": "Error"}},
+                    }
+                ],
+            },
+        }
+    ]
+    store = FakeJobStore(_rank(RankStatus.LAUNCHING))
+    orca = _orca(monkeypatch, store, FakeK8s([_dgd(worker=0, state="pending")], pods))
+
+    for _ in range(5):
+        health = orca.reconcile_rank_health(USER_ID)
+
+    assert health[0].verdict is Verdict.UNKNOWN
+    assert store.writes == []
+
+
 def test_zero_replicas_after_serving_fails_even_while_pending(monkeypatch):
     store = FakeJobStore(_rank())
     k8s = FakeK8s([_dgd(worker=2)])
