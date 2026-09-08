@@ -47,7 +47,7 @@ def _dgd(worker: int, *, state: str = "successful", router: int = 1) -> dict:
         "status": {
             "state": state,
             "observedGeneration": 1,
-            "services": {"VllmDecodeWorker": service(worker), "LocalRouter": service(router)},
+            "components": {"VllmDecodeWorker": service(worker), "LocalRouter": service(router)},
         },
     }
 
@@ -267,6 +267,36 @@ def test_zero_replicas_while_pending_never_fails_a_new_rank(monkeypatch):
 
     assert health[0].verdict is Verdict.UNKNOWN
     assert store.writes == []
+
+
+def test_launching_crash_loop_fails_after_debounce(monkeypatch):
+    pods = [
+        {
+            "metadata": {"name": "worker-0"},
+            "status": {
+                "containerStatuses": [
+                    {
+                        "name": "main",
+                        "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                        "lastState": {"terminated": {"reason": "Error"}},
+                    }
+                ]
+            },
+        }
+    ]
+    store = FakeJobStore(_rank(RankStatus.LAUNCHING))
+    orca = _orca(monkeypatch, store, FakeK8s([_dgd(worker=0, state="pending")], pods))
+
+    orca.reconcile_rank_health(USER_ID)
+    health = orca.reconcile_rank_health(USER_ID)
+
+    assert health[0].verdict is Verdict.DOWN
+    assert store.writes[-1] == (
+        RANK_ID,
+        RankStatus.FAILED,
+        [RankStatus.LAUNCHING, RankStatus.RUNNING],
+        ReasonCode.PROCESS_CRASH,
+    )
 
 
 def test_zero_replicas_after_serving_fails_even_while_pending(monkeypatch):

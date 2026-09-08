@@ -169,7 +169,7 @@ def render_rank_dgd(
             )
         ]
     return {
-        "apiVersion": "nvidia.com/v1alpha1",
+        "apiVersion": "nvidia.com/v1beta1",
         "kind": "DynamoGraphDeployment",
         "metadata": {
             "name": name,

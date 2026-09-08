@@ -7,7 +7,7 @@ against the worker's own ``/health`` on ``DYN_SYSTEM_PORT``, with
 ``DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS=["generate"]``. That endpoint answers
 503 until the generate endpoint is actually served and 200 afterwards, so a
 replica counted ready by kubelet is one whose serving path works -- not merely a
-live process. The operator aggregates those counts onto ``.status.services``,
+live process. The operator aggregates those counts onto ``.status.components``,
 which makes the DGD a strictly stronger signal than either the Prometheus
 scrape (which lags service discovery on cold start) or the frontend's own
 ``/health`` (whose instance list is a lease-based etcd registration that
@@ -23,9 +23,9 @@ Two traps this module exists to avoid:
    Orca inserts the LocalRouter hop, so workers alone serving nothing is a
    reachable state the operator reports as partially available.
 
-Version note: the platform install is Dynamo 1.0.x, whose DGD CRD serves only
-``nvidia.com/v1alpha1``. The status map there is ``.status.services``;
-``.status.components`` and ``v1beta1`` first appear in 1.2.0 and would 404.
+Version note: Dynamo 1.4.2 serves ``nvidia.com/v1beta1`` with component status
+in ``.status.components``. ``.status.services`` remains a read-only fallback
+for existing alpha objects during migration.
 """
 
 from __future__ import annotations
@@ -41,11 +41,11 @@ from tandemn_system_data.models.enums import ReasonCode
 logger = logging.getLogger(__name__)
 
 # Service keys rendered by dynamo_compiler.render_rank_dgd. The operator copies
-# spec.services keys verbatim into status.services.
+# their names verbatim into status.components.
 WORKER_SERVICE = "VllmDecodeWorker"
 ROUTER_SERVICE = "LocalRouter"
 
-# Which .status.services[*] field carries the ready count, per workload kind the
+# Which .status.components[*] field carries the ready count, per workload kind the
 # operator chose. The other field is absent from the JSON, never zero, so this
 # must be a dispatch and not a `ready or available` fallback.
 #   Deployment           readyReplicas    counts pods
@@ -59,7 +59,7 @@ SERVING_REPLICA_FIELD = {
     "PodCliqueScalingGroup": "availableReplicas",
 }
 
-# DGD lifecycle states (v1alpha1 DGDState).
+# DGD lifecycle states.
 STATE_FAILED = "failed"
 STATE_SUCCESSFUL = "successful"
 PENDING_STATES = frozenset({"initializing", "pending", ""})
@@ -142,8 +142,10 @@ def rank_health(
             f"DGD state=failed: {_condition_detail(status)}",
         )
 
-    services = status.get("services")
-    if not isinstance(services, dict) or WORKER_SERVICE not in services:
+    components = status.get("components")
+    if not isinstance(components, dict):
+        components = status.get("services")
+    if not isinstance(components, dict) or WORKER_SERVICE not in components:
         if ever_served:
             return RankHealth(
                 rank_id,
@@ -155,7 +157,7 @@ def rank_health(
             )
         return _unknown(job_id, rank_id, f"DGD state={state or 'unset'}, no worker status yet")
 
-    workers = serving_replicas(services[WORKER_SERVICE])
+    workers = serving_replicas(components[WORKER_SERVICE])
     if workers is None:
         return _unknown(job_id, rank_id, "worker service reports no recognized replica field")
     if workers == 0:
@@ -172,7 +174,7 @@ def rank_health(
 
     # Orca inserts a LocalRouter between the frontend and the workers, so ready
     # workers alone do not make the rank routable.
-    router_status = services.get(ROUTER_SERVICE)
+    router_status = components.get(ROUTER_SERVICE)
     if router_status is not None:
         routers = serving_replicas(router_status)
         if routers == 0:

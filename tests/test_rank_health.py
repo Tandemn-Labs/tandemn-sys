@@ -36,13 +36,14 @@ def _dgd(
     generation: int = 4,
     observed: int | None = 4,
     conditions: list[dict] | None = None,
+    status_key: str = "services",
 ) -> dict:
     services = {}
     if worker is not None:
         services["VllmDecodeWorker"] = _service(worker_kind, worker)
     if router is not None:
         services["LocalRouter"] = _service("Deployment", router)
-    status: dict = {"state": state, "services": services}
+    status: dict = {"state": state, status_key: services}
     if observed is not None:
         status["observedGeneration"] = observed
     if conditions is not None:
@@ -95,6 +96,13 @@ def test_scaling_group_reads_available_replicas():
 
 def test_scaling_group_is_not_read_as_zero_by_the_ready_field():
     health = rank_health(JOB_ID, RANK_ID, _dgd(worker=2, worker_kind="PodCliqueScalingGroup"))
+    assert health.verdict is Verdict.SERVING
+    assert health.serving_replicas == 2
+
+
+def test_beta_components_read_ready_replicas():
+    health = rank_health(JOB_ID, RANK_ID, _dgd(worker=2, status_key="components"))
+
     assert health.verdict is Verdict.SERVING
     assert health.serving_replicas == 2
 

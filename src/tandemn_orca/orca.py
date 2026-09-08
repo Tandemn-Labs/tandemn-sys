@@ -310,20 +310,38 @@ class Orca:
                     continue
                 for rank in ranks:
                     active_rank_ids.add(rank.rank_id)
+                    ever_served = (
+                        rank.status is RankStatus.RUNNING or rank.rank_id in self._served_rank_ids
+                    )
+                    health = rank_health(
+                        job_id,
+                        rank.rank_id,
+                        deployments.get(rank.rank_id),
+                        ever_served=ever_served,
+                    )
+                    if health.verdict is Verdict.UNKNOWN and not ever_served:
+                        try:
+                            cause = termination_reason_code(k8s.rank_pods(job_id, rank.rank_id))
+                        except Exception:
+                            logger.exception(
+                                "startup pod status read failed for rank %s", rank.rank_id
+                            )
+                            cause = None
+                        if cause is not None:
+                            health = RankHealth(
+                                rank.rank_id,
+                                job_id,
+                                Verdict.DOWN,
+                                0,
+                                cause[0],
+                                cause[1],
+                            )
                     results.append(
                         self._apply_rank_health(
                             user_id,
                             k8s,
                             rank,
-                            rank_health(
-                                job_id,
-                                rank.rank_id,
-                                deployments.get(rank.rank_id),
-                                ever_served=(
-                                    rank.status is RankStatus.RUNNING
-                                    or rank.rank_id in self._served_rank_ids
-                                ),
-                            ),
+                            health,
                         )
                     )
 
