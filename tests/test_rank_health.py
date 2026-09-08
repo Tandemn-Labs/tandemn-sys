@@ -15,6 +15,7 @@ from tandemn_orca.rank_health import (
     dgd_by_rank_id,
     rank_health,
     serving_replicas,
+    startup_failure_reason_code,
     termination_reason_code,
 )
 
@@ -36,13 +37,14 @@ def _dgd(
     generation: int = 4,
     observed: int | None = 4,
     conditions: list[dict] | None = None,
+    status_key: str = "services",
 ) -> dict:
     services = {}
     if worker is not None:
         services["VllmDecodeWorker"] = _service(worker_kind, worker)
     if router is not None:
         services["LocalRouter"] = _service("Deployment", router)
-    status: dict = {"state": state, "services": services}
+    status: dict = {"state": state, status_key: services}
     if observed is not None:
         status["observedGeneration"] = observed
     if conditions is not None:
@@ -95,6 +97,13 @@ def test_scaling_group_reads_available_replicas():
 
 def test_scaling_group_is_not_read_as_zero_by_the_ready_field():
     health = rank_health(JOB_ID, RANK_ID, _dgd(worker=2, worker_kind="PodCliqueScalingGroup"))
+    assert health.verdict is Verdict.SERVING
+    assert health.serving_replicas == 2
+
+
+def test_beta_components_read_ready_replicas():
+    health = rank_health(JOB_ID, RANK_ID, _dgd(worker=2, status_key="components"))
+
     assert health.verdict is Verdict.SERVING
     assert health.serving_replicas == 2
 
@@ -285,3 +294,68 @@ def test_termination_reason_maps_crash_loop():
 
 def test_termination_reason_absent_for_healthy_pods():
     assert termination_reason_code([{"metadata": {"name": "w"}, "status": {}}]) is None
+
+
+def test_startup_failure_ignores_historical_error_after_recovery():
+    pods = [
+        {
+            "metadata": {"name": "worker-0"},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                    {
+                        "name": "main",
+                        "state": {"running": {"startedAt": "now"}},
+                        "lastState": {"terminated": {"reason": "Error"}},
+                    }
+                ],
+            },
+        }
+    ]
+
+    assert startup_failure_reason_code(pods) is None
+
+
+def test_startup_failure_maps_crash_loop_oom():
+    pods = [
+        {
+            "metadata": {"name": "worker-0"},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                    {
+                        "name": "main",
+                        "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                        "lastState": {"terminated": {"reason": "OOMKilled"}},
+                    }
+                ],
+            },
+        }
+    ]
+
+    assert startup_failure_reason_code(pods) == (
+        ReasonCode.OOM,
+        "worker-0/main in CrashLoopBackOff after OOMKilled",
+    )
+
+
+def test_startup_failure_maps_current_nonzero_exit():
+    pods = [
+        {
+            "metadata": {"name": "worker-0"},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                    {
+                        "name": "main",
+                        "state": {"terminated": {"reason": "Error", "exitCode": 1}},
+                    }
+                ],
+            },
+        }
+    ]
+
+    assert startup_failure_reason_code(pods) == (
+        ReasonCode.PROCESS_CRASH,
+        "worker-0/main terminated: Error",
+    )

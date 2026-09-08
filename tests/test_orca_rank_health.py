@@ -10,7 +10,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from tandemn_system_data.models.enums import JobKind, RankRole, RankStatus, ReasonCode
+from tandemn_system_data.models.enums import JobKind, JobStatus, RankRole, RankStatus, ReasonCode
 from tandemn_system_data.models.rank import Rank
 
 import tandemn_orca.orca as orca_mod
@@ -47,7 +47,7 @@ def _dgd(worker: int, *, state: str = "successful", router: int = 1) -> dict:
         "status": {
             "state": state,
             "observedGeneration": 1,
-            "services": {"VllmDecodeWorker": service(worker), "LocalRouter": service(router)},
+            "components": {"VllmDecodeWorker": service(worker), "LocalRouter": service(router)},
         },
     }
 
@@ -71,14 +71,37 @@ def _batch_pod(chain: int, *, ready: bool = True) -> dict:
 class FakeJobStore:
     def __init__(self, rank: Rank) -> None:
         self.rank = rank
+        self.job_status = JobStatus.RUNNING
         self.writes: list[tuple[str, RankStatus, list[RankStatus], str | None]] = []
+        self.job_transitions = []
+        self.errors = []
 
     def running_jobs(self, user_id):
+        if self.job_status is not JobStatus.RUNNING:
+            return []
+        ranks = (
+            [self.rank] if self.rank.status in (RankStatus.LAUNCHING, RankStatus.RUNNING) else []
+        )
         return [
-            SimpleNamespace(
-                job=SimpleNamespace(job_id=JOB_ID, kind=JobKind.ONLINE), ranks=[self.rank]
-            )
+            SimpleNamespace(job=SimpleNamespace(job_id=JOB_ID, kind=JobKind.ONLINE), ranks=ranks)
         ]
+
+    def ranks(self, job_id):
+        return [self.rank]
+
+    def get(self, job_id):
+        return SimpleNamespace(job_id=job_id, kind=JobKind.ONLINE)
+
+    def transition(self, job_id, to, expected, *, finish_reason=None):
+        self.job_transitions.append((job_id, to, list(expected), finish_reason))
+        if self.job_status not in expected:
+            return False
+        self.job_status = to
+        return True
+
+    def set_error(self, job_id, error_message):
+        self.errors.append((job_id, error_message))
+        return True
 
     def set_rank_status(self, rank_id, to, expected, *, reason_code=None):
         self.writes.append((rank_id, to, list(expected), reason_code))
@@ -114,18 +137,19 @@ class FakeK8s:
 class FakeLauncher:
     def __init__(self, k8s: FakeK8s) -> None:
         self.k8s = k8s
-
         self.job_kinds = []
+        self.reconciled = []
+        self.torn_down = []
 
     def k8s_for_rank(self, rank, *, job_kind=JobKind.ONLINE):
         self.job_kinds.append(job_kind)
         return self.k8s
 
-    def reconcile(self, job_id, ranks, **kwargs):  # pragma: no cover - unused here
-        pass
+    def reconcile(self, job_id, ranks, **kwargs):
+        self.reconciled.append((job_id, ranks, kwargs))
 
-    def teardown_job(self, job_id):  # pragma: no cover - unused here
-        pass
+    def teardown_job(self, job_id):
+        self.torn_down.append(job_id)
 
 
 def _orca(monkeypatch, store: FakeJobStore, k8s: FakeK8s, *, polls: int = 2) -> Orca:
@@ -267,6 +291,134 @@ def test_zero_replicas_while_pending_never_fails_a_new_rank(monkeypatch):
 
     assert health[0].verdict is Verdict.UNKNOWN
     assert store.writes == []
+
+
+def test_launching_crash_loop_fails_after_debounce(monkeypatch):
+    pods = [
+        {
+            "metadata": {"name": "worker-0"},
+            "status": {
+                "containerStatuses": [
+                    {
+                        "name": "main",
+                        "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                        "lastState": {"terminated": {"reason": "Error"}},
+                    }
+                ]
+            },
+        }
+    ]
+    store = FakeJobStore(_rank(RankStatus.LAUNCHING))
+    orca = _orca(monkeypatch, store, FakeK8s([_dgd(worker=0, state="pending")], pods))
+
+    orca.reconcile_rank_health(USER_ID)
+    health = orca.reconcile_rank_health(USER_ID)
+
+    assert health[0].verdict is Verdict.DOWN
+    assert store.writes[-1] == (
+        RANK_ID,
+        RankStatus.FAILED,
+        [RankStatus.LAUNCHING, RankStatus.RUNNING],
+        ReasonCode.PROCESS_CRASH,
+    )
+
+
+def test_launching_recovered_container_stays_unknown(monkeypatch):
+    pods = [
+        {
+            "metadata": {"name": "worker-0"},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                    {
+                        "name": "main",
+                        "state": {"running": {"startedAt": "now"}},
+                        "lastState": {"terminated": {"reason": "Error"}},
+                    }
+                ],
+            },
+        }
+    ]
+    store = FakeJobStore(_rank(RankStatus.LAUNCHING))
+    orca = _orca(monkeypatch, store, FakeK8s([_dgd(worker=0, state="pending")], pods))
+
+    for _ in range(5):
+        health = orca.reconcile_rank_health(USER_ID)
+
+    assert health[0].verdict is Verdict.UNKNOWN
+    assert store.writes == []
+
+
+def test_all_failed_ranks_are_torn_down_and_job_requeued(monkeypatch):
+    store = FakeJobStore(
+        _rank(RankStatus.FAILED).model_copy(update={"reason_code": ReasonCode.PROCESS_CRASH})
+    )
+    orca = _orca(monkeypatch, store, FakeK8s([]))
+
+    assert orca.reconcile_running(USER_ID) == 1
+
+    assert orca._launcher.torn_down == [JOB_ID]
+    assert store.job_status is JobStatus.WAITING
+    assert store.rank.status is RankStatus.FAILED
+    assert store.errors == [
+        (JOB_ID, f"all active ranks failed: {RANK_ID} ({ReasonCode.PROCESS_CRASH})")
+    ]
+
+
+def test_surviving_rank_keeps_multirank_job_running(monkeypatch):
+    failed = _rank(RankStatus.FAILED).model_copy(update={"reason_code": ReasonCode.PROCESS_CRASH})
+    survivor = _rank(RankStatus.RUNNING).model_copy(
+        update={"rank_id": "rank_01JBM30YQ7X3WQAR6HF8C2Q9T8"}
+    )
+
+    class MultiRankStore(FakeJobStore):
+        def __init__(self):
+            super().__init__(failed)
+
+        def running_jobs(self, user_id):
+            return [
+                SimpleNamespace(
+                    job=SimpleNamespace(job_id=JOB_ID, kind=JobKind.ONLINE),
+                    ranks=[survivor],
+                )
+            ]
+
+        def ranks(self, job_id):
+            return [failed, survivor]
+
+    store = MultiRankStore()
+    orca = _orca(monkeypatch, store, FakeK8s([]))
+
+    assert orca.reconcile_running(USER_ID) == 1
+
+    assert store.job_status is JobStatus.RUNNING
+    assert orca._launcher.torn_down == []
+    desired = orca._launcher.reconciled[0][1]
+    assert len(desired) == 1
+    assert desired[0].rank_id == survivor.rank_id
+
+
+def test_failed_rank_teardown_error_keeps_job_running_for_retry(monkeypatch):
+    store = FakeJobStore(_rank(RankStatus.FAILED))
+    orca = _orca(monkeypatch, store, FakeK8s([]))
+
+    def fail(_job_id):
+        raise RuntimeError("cluster unavailable")
+
+    orca._launcher.teardown_job = fail
+
+    assert orca.reconcile_running(USER_ID) == 0
+    assert store.job_status is JobStatus.RUNNING
+    assert store.job_transitions == []
+
+
+def test_running_job_without_rank_failure_is_not_requeued(monkeypatch):
+    store = FakeJobStore(_rank(RankStatus.STOPPED))
+    orca = _orca(monkeypatch, store, FakeK8s([]))
+
+    assert orca.reconcile_running(USER_ID) == 0
+    assert store.job_status is JobStatus.RUNNING
+    assert orca._launcher.torn_down == []
 
 
 def test_zero_replicas_after_serving_fails_even_while_pending(monkeypatch):
