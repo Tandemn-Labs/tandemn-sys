@@ -514,7 +514,7 @@ class Orca:
         return reconciled
 
     def reconcile_running(self, user_id: str) -> int:
-        """Restore infrastructure, local configs, and tunnels after Orca restarts."""
+        """Restore active ranks or requeue jobs whose ranks all failed."""
         reconciled = 0
         for running in self._jobs.running_jobs(user_id):
             ranks = [
@@ -534,6 +534,36 @@ class Orca:
                 self._add_chain_associations(ranks)
                 self._launcher.reconcile(running.job.job_id, ranks, job_kind=running.job.kind)
                 reconciled += 1
+                continue
+
+            failed_ranks = [
+                rank
+                for rank in self._jobs.ranks(running.job.job_id)
+                if rank.status is RankStatus.FAILED
+            ]
+            if not failed_ranks:
+                continue
+
+            try:
+                self._drain_chain_associations(failed_ranks)
+                self._launcher.teardown_job(running.job.job_id)
+            except Exception:
+                logger.exception("failed-rank teardown failed for job %s", running.job.job_id)
+                continue
+
+            moved = self._jobs.transition(
+                running.job.job_id,
+                JobStatus.WAITING,
+                [JobStatus.RUNNING],
+            )
+            if not moved:
+                continue
+            detail = "all active ranks failed: " + ", ".join(
+                f"{rank.rank_id} ({rank.reason_code or ReasonCode.FAILED})" for rank in failed_ranks
+            )
+            self._jobs.set_error(running.job.job_id, detail)
+            logger.warning("requeued job %s after all ranks failed", running.job.job_id)
+            reconciled += 1
         return reconciled
 
     def _apply_plan(self, plan: Plan) -> None:
